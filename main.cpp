@@ -36,7 +36,7 @@ static const char* kRepo = "lanaryy-hash/glass";  // versions publiées par GitH
 // ---------- données ----------
 struct Track { std::string uri, title, artist, album, image; int ms = 0; bool local = false; };
 // custom : playlist Spotify ajoutée par lien ; own : playlist créée dans Glass (uri "glass:...")
-struct List { std::string uri, name, image; std::vector<Track> tracks; bool requested = false, loaded = false, custom = false, own = false; };
+struct List { std::string uri, name, image; std::vector<Track> tracks; bool requested = false, loaded = false, custom = false, own = false, hidden = false; };
 struct LyricLine { int t; std::string w; };
 
 struct Settings {
@@ -367,12 +367,104 @@ static void loadApple(const std::string& url) {
     }).detach();
 }
 
+// ---------- catalogue : artistes, leurs titres et albums ----------
+// Spotify (Web API, si le lecteur officiel est connecté), sinon le catalogue public d'Apple / iTunes (sans compte ;
+// mêmes titres qu'Apple Music, donc lus par le lecteur Apple si connecté, sinon via YouTube).
+struct Card { std::string uri, name, image; };          // artiste ou album à afficher
+static std::vector<Card> g_artists;                       // artistes trouvés par la recherche
+static std::map<std::string, std::vector<Card>> g_albums; // albums d'un artiste (clé : uri de l'artiste)
+
+static std::string itArt(const json& j) {  // pochette iTunes en 300 px
+    std::string u = jstr(j, "artworkUrl100");
+    if (size_t p = u.find("100x100"); p != std::string::npos) u.replace(p, 7, "300x300");
+    return u;
+}
+static Track itTrack(const json& r) {
+    Track t{"apple:song:" + std::to_string((long long)jnum(r, "trackId")), jstr(r, "trackName"), jstr(r, "artistName"), jstr(r, "collectionName"), itArt(r), (int)jnum(r, "trackTimeMillis")};
+    return t;
+}
+static json itunes(const std::string& q) {  // catalogue français (comme les comptes Apple Music d'ici)
+    json r = json::parse(plat::httpGet("https://itunes.apple.com/" + q + "&country=FR"), nullptr, false);
+    return r.is_object() && r["results"].is_array() ? r["results"] : json::array();
+}
+static std::string spImage(const json& imgs) {  // la plus petite image d'au moins 160 px
+    std::string best;
+    int bw = 1 << 30;
+    if (imgs.is_array()) for (auto& i : imgs) { int w = (int)jnum(i, "width"); if (w >= 160 && w < bw) { bw = w; best = jstr(i, "url"); } }
+    return best.empty() && imgs.is_array() && !imgs.empty() ? jstr(imgs[0], "url") : best;
+}
+static Track spTrack(json t) {  // copie : champs absents = null
+    std::string artists;
+    if (t["artists"].is_array()) for (auto& a : t["artists"]) artists += (artists.empty() ? "" : ", ") + jstr(a, "name");
+    return Track{jstr(t, "uri"), jstr(t, "name"), artists, jstr(t["album"], "name"), spImage(t["album"]["images"]), (int)jnum(t, "duration_ms")};
+}
+
+static void openCard(const Card& c) {  // g_mx tenu : page d'artiste ou album
+    if (!findList(c.uri)) { List l{c.uri, c.name, c.image}; l.hidden = true; g_lists.push_back(l); }
+    g_view = c.uri; g_lyricsOpen = false;
+}
+
+static void send(const json& j);
+static std::string urlEnc(const std::string& s);
+
+static void searchCatalog(const std::string& q) {  // g_mx tenu
+    g_artists.clear();
+    if (g_webOk) {
+        send({{"cmd", "search"}, {"q", q}});
+        send({{"cmd", "get"}, {"id", "artists:" + q}, {"path", "/v1/search?type=artist&limit=8&q=" + urlEnc(q)}});
+        return;
+    }
+    std::thread([q] {
+        std::vector<Card> artists;
+        for (auto& a : itunes("search?entity=musicArtist&limit=8&term=" + urlEnc(q))) {
+            std::string id = std::to_string((long long)jnum(a, "artistId"));
+            json alb = itunes("lookup?entity=album&limit=1&id=" + id);  // photo : la pochette de son dernier album
+            artists.push_back({"artist:it:" + id, jstr(a, "artistName"), alb.size() > 1 ? itArt(alb[1]) : ""});
+        }
+        std::vector<Track> songs;
+        for (auto& r : itunes("search?entity=song&limit=30&term=" + urlEnc(q))) songs.push_back(itTrack(r));
+        std::lock_guard lk(g_mx);
+        if (q != g_searchSent) return;
+        g_artists = std::move(artists);
+        for (auto& t : songs)
+            if (std::none_of(g_search.tracks.begin(), g_search.tracks.end(), [&](const Track& y) { return y.uri == t.uri; })) g_search.tracks.push_back(t);
+        wake();
+    }).detach();
+}
+
+static void loadCatalogList(List& l) {  // g_mx tenu : titres d'une page d'artiste ou d'un album iTunes
+    if (l.uri.rfind("artist:sp:", 0) == 0) {
+        std::string id = l.uri.substr(10);
+        send({{"cmd", "get"}, {"id", "top:" + l.uri}, {"path", "/v1/artists/" + id + "/top-tracks?market=from_token"}});
+        send({{"cmd", "get"}, {"id", "albums:" + l.uri}, {"path", "/v1/artists/" + id + "/albums?include_groups=album,single&limit=30"}});
+        return;
+    }
+    std::thread([uri = l.uri] {
+        bool artist = uri.rfind("artist:it:", 0) == 0;
+        std::string id = uri.substr(artist ? 10 : 13);
+        std::vector<Track> tracks;
+        std::vector<Card> albums;
+        for (auto& r : itunes("lookup?entity=song&limit=100&id=" + id)) if (jstr(r, "wrapperType") == "track") tracks.push_back(itTrack(r));
+        if (artist)
+            for (auto& r : itunes("lookup?entity=album&limit=50&id=" + id))
+                if (jstr(r, "wrapperType") == "collection") albums.push_back({"itunes:album:" + std::to_string((long long)jnum(r, "collectionId")), jstr(r, "collectionName"), itArt(r)});
+        std::lock_guard lk(g_mx);
+        if (List* l = findList(uri)) {
+            l->tracks = std::move(tracks); l->loaded = true;
+            if (l->image.empty() && !l->tracks.empty()) l->image = l->tracks[0].image;
+        }
+        if (artist) g_albums[uri] = std::move(albums);
+        wake();
+    }).detach();
+}
+
 // ---------- moteur Spotify (glass-engine : bibliothèque, paroles, Web API) ----------
 static void send(const json& j) { plat::engineSend(j.dump() + "\n"); }
 static void amPost(const json& j);
 
 static void requestTracks(List& l) {
     if (l.requested || l.own || l.uri == "local" || l.uri == "search") return;
+    if (l.uri.rfind("artist:", 0) == 0 || l.uri.rfind("itunes:album:", 0) == 0) { l.requested = true; loadCatalogList(l); return; }
     if (l.uri.rfind("am:", 0) == 0) { if (g_amAuth) { l.requested = true; amPost({{"cmd", "list"}, {"id", l.uri.substr(3)}}); } return; }
     if (isApple(l.uri)) { l.requested = true; loadApple(l.uri); return; }
     if (!g_spReady) return;
@@ -404,7 +496,7 @@ static void onEngine(const std::string& line) try {
             next.push_back(std::move(l));
         }
         for (auto& l : g_lists)
-            if ((l.custom || l.own || l.uri == "local" || isApple(l.uri)) && std::none_of(next.begin(), next.end(), [&](const List& x) { return x.uri == l.uri; })) next.push_back(std::move(l));
+            if ((l.custom || l.own || l.hidden || l.uri == "local" || isApple(l.uri)) && std::none_of(next.begin(), next.end(), [&](const List& x) { return x.uri == l.uri; })) next.push_back(std::move(l));
         g_lists = std::move(next);
     } else if (ev == "tracks") {
         if (List* l = findList(jstr(j, "uri"))) {
@@ -421,6 +513,22 @@ static void onEngine(const std::string& line) try {
         g_lyrSynced = j.value("synced", false);
         g_lyrSrc = jstr(j, "src");
         g_lyrState = g_lyr.empty() ? 3 : 2;
+    } else if (ev == "get") {
+        std::string id = jstr(j, "id");
+        json d = j.contains("data") ? j["data"] : json();  // copie : les champs absents deviennent null au lieu de planter
+        if (id == "artists:" + g_searchSent && d.is_object()) {
+            g_artists.clear();
+            for (auto& a : d["artists"]["items"]) g_artists.push_back({"artist:sp:" + jstr(a, "id"), jstr(a, "name"), spImage(a["images"])});
+        } else if (id.rfind("top:", 0) == 0 && d.is_object()) {
+            if (List* l = findList(id.substr(4))) {
+                l->tracks.clear(); l->loaded = true;
+                for (auto& t : d["tracks"]) l->tracks.push_back(spTrack(t));
+            }
+        } else if (id.rfind("albums:", 0) == 0 && d.is_object()) {
+            auto& v = g_albums[id.substr(7)];
+            v.clear();
+            for (auto& a : d["items"]) v.push_back({jstr(a, "uri"), jstr(a, "name"), spImage(a["images"])});
+        }
     } else if (ev == "search" && jstr(j, "q") == g_searchSent) {
         // résultats du catalogue ajoutés après ceux de ta bibliothèque
         for (auto& t : j["items"]) if (Track x = trackFrom(t); !x.uri.empty() &&
@@ -1776,9 +1884,9 @@ static void sidebar() {
     ImGui::SetNextItemWidth(-1);
     if (g_focusSearch) { ImGui::SetKeyboardFocusHere(); g_focusSearch = false; }
     if (ImGui::InputTextWithHint("##search", u8"Rechercher  (Ctrl+F)", g_searchBuf, sizeof g_searchBuf)) { g_view = "search"; g_lyricsOpen = false; updateSearch(); }
-    if (g_view == "search" && g_webOk && g_searchBuf[0] && g_searchSent != g_searchBuf && now() - g_searchT > 0.5) {
+    if (g_view == "search" && g_searchBuf[0] && g_searchSent != g_searchBuf && now() - g_searchT > 0.5) {
         g_searchSent = g_searchBuf;
-        send({{"cmd", "search"}, {"q", g_searchSent}});
+        searchCatalog(g_searchSent);
     }
     if (!g_engineOk) ImGui::TextDisabled("Spotify : moteur arrêté");
     else if (!g_spReady) ImGui::TextDisabled("Spotify : connexion...");
@@ -1792,8 +1900,8 @@ static void sidebar() {
     if (std::any_of(g_lists.begin(), g_lists.end(), pinned)) header("ÉPINGLÉES");
     for (auto& u : pins) for (int i = 0; i < (int)g_lists.size(); i++) if (g_lists[i].uri == u) { sidebarItem(g_lists[i], i); break; }
     auto mine = [&](const List& l) { return (l.uri == "local" || l.own) && !pinned(l); };
-    auto spot = [&](const List& l) { return l.uri != "local" && !l.own && !isApple(l.uri) && !pinned(l); };
-    auto apple = [&](const List& l) { return isApple(l.uri) && !pinned(l); };
+    auto spot = [&](const List& l) { return l.uri != "local" && !l.own && !l.hidden && !isApple(l.uri) && !pinned(l); };
+    auto apple = [&](const List& l) { return isApple(l.uri) && !l.hidden && !pinned(l); };
     if (std::any_of(g_lists.begin(), g_lists.end(), mine)) header("TES PLAYLISTS");
     for (int i = 0; i < (int)g_lists.size(); i++) if (mine(g_lists[i])) sidebarItem(g_lists[i], i);
     if (std::any_of(g_lists.begin(), g_lists.end(), spot)) header("SPOTIFY");
@@ -2383,12 +2491,40 @@ static void queueView() {
     }
 }
 
+// Rangée de cartes (artistes ronds ou albums carrés) ; un clic ouvre la page.
+static void cardRow(const std::vector<Card>& cards, bool round) {
+    float cs = 112 * S, cw = cs + 16 * S, avail = ImGui::GetContentRegionAvail().x;
+    int n = std::min((int)cards.size(), std::max(1, (int)(avail / cw)));
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    Card open;
+    for (int i = 0; i < n; i++) {
+        const Card& c = cards[i];
+        if (i) ImGui::SameLine(0, 0);
+        ImGui::PushID(i);
+        ImVec2 p = ImGui::GetCursorScreenPos();
+        if (ImGui::InvisibleButton("##c", {cw, cs + 42 * S})) open = c;
+        bool hov = ImGui::IsItemHovered();
+        ImVec2 a = p + ImVec2{8 * S, 4 * S};
+        float k = animTo(ImGui::GetID("##k"), hov ? 1.04f : 1.f, 16), d = cs * (k - 1) * 0.5f;
+        if (ImTextureID t = tex(c.image, 300)) dl->AddImageRounded(t, a - ImVec2{d, d}, a + ImVec2{cs + d, cs + d}, {0, 0}, {1, 1}, IM_COL32_WHITE, round ? cs : 10 * S);
+        else dl->AddRectFilled(a, a + ImVec2{cs, cs}, col(1, 1, 1, 0.08f), round ? cs : 10 * S);
+        if (hov && g_set.neon > 0) neonRect(dl, a - ImVec2{d, d}, a + ImVec2{cs + d, cs + d}, round ? cs : 10 * S, g_set.neon * 0.6f);
+        float tw = ImGui::CalcTextSize(c.name.c_str()).x;
+        textAt(dl, {a.x + std::max(0.f, (cs - tw) * 0.5f), a.y + cs + 8 * S}, cs, hov ? accU() : col(1, 1, 1, 0.9f), c.name);
+        ImGui::PopID();
+    }
+    if (!open.uri.empty()) openCard(open);
+}
+
 static void searchView() {
     ImGui::PushFont(g_bold, 34); ImGui::TextUnformatted("Recherche"); ImGui::PopFont();
     if (!g_searchBuf[0]) { ImGui::TextDisabled("Tape un titre, un artiste ou un album dans la barre à gauche."); return; }
-    ImGui::TextDisabled(g_webOk ? "Dans ta bibliothèque + le catalogue Spotify (%d résultats)" : "Dans ta bibliothèque (%d résultats) - connecte le lecteur Spotify pour chercher tout le catalogue",
-                        (int)g_search.tracks.size());
+    if (!g_artists.empty()) {  // artistes : photo ronde + nom, un clic ouvre sa page
+        ImGui::Spacing(); ImGui::TextDisabled("ARTISTES");
+        cardRow(g_artists, true);
+    }
     ImGui::Spacing();
+    ImGui::TextDisabled(g_webOk ? "TITRES (ta bibliothèque + catalogue Spotify, %d)" : "TITRES (ta bibliothèque + catalogue Apple Music, %d)", (int)g_search.tracks.size());
     trackTable(g_search, nullptr);
 }
 
@@ -2400,7 +2536,7 @@ static void mainView() {
     if (g_view == "search") { searchView(); return; }
     List* l = findList(g_view);
     if (!l) { if (g_lists.empty()) return; l = &g_lists[0]; g_view = l->uri; }
-    if (l->uri != "local" && !l->own && !isApple(l->uri) && !g_spReady) { loginPanel(); return; }
+    if (l->uri.rfind("spotify:", 0) == 0 && !g_spReady) { loginPanel(); return; }
     requestTracks(*l);
     ImDrawList* dl = ImGui::GetWindowDrawList();
     bool local = l->uri == "local";
@@ -2408,8 +2544,10 @@ static void mainView() {
     // --- en-tête ---
     float hero = 200 * S, w = ImGui::GetContentRegionAvail().x;
     ImVec2 p = ImGui::GetCursorScreenPos();
-    dl->AddRectFilled(p + ImVec2{4 * S, 8 * S}, p + ImVec2{hero + 4 * S, hero + 8 * S}, col(0, 0, 0, 0.35f), 16 * S);  // ombre
-    coverAt(dl, l->image, l->uri, p, hero, 14 * S);
+    bool artist = l->uri.rfind("artist:", 0) == 0;
+    dl->AddRectFilled(p + ImVec2{4 * S, 8 * S}, p + ImVec2{hero + 4 * S, hero + 8 * S}, col(0, 0, 0, 0.35f), artist ? hero : 16 * S);  // ombre (ronde pour un artiste)
+    if (ImTextureID t = artist ? tex(l->image, 300) : 0) dl->AddImageRounded(t, p, p + ImVec2{hero, hero}, {0, 0}, {1, 1}, IM_COL32_WHITE, hero);
+    else coverAt(dl, l->image, l->uri, p, hero, 14 * S);
     ImGui::Dummy({hero, hero});
     ImGui::SameLine(0, 28 * S);
     ImGui::BeginGroup();
@@ -2417,7 +2555,8 @@ static void mainView() {
     long long total = 0;
     for (auto& t : l->tracks) total += t.ms;
     ImVec2 q = ImGui::GetCursorScreenPos();
-    const char* kind = local ? "TES MUSIQUES" : l->own ? "PLAYLIST GLASS" : isAlbum(l->uri) ? (isApple(l->uri) ? "ALBUM APPLE MUSIC" : "ALBUM") : isApple(l->uri) ? "PLAYLIST APPLE MUSIC" : "PLAYLIST";
+    const char* kind = local ? "TES MUSIQUES" : l->own ? "PLAYLIST GLASS" : artist ? "ARTISTE · TITRES LES PLUS ÉCOUTÉS" : l->uri.rfind("itunes:album:", 0) == 0 ? "ALBUM"
+                     : isAlbum(l->uri) ? (isApple(l->uri) ? "ALBUM APPLE MUSIC" : "ALBUM") : isApple(l->uri) ? "PLAYLIST APPLE MUSIC" : "PLAYLIST";
     dl->AddText(g_bold, 12 * S, q + ImVec2{0, 26 * S}, col(1, 1, 1, 0.7f), kind);
     textAt(dl, q + ImVec2{0, 40 * S}, tx, col(1, 1, 1), l->name, g_bold, 46);
     char meta[96];
@@ -2452,6 +2591,27 @@ static void mainView() {
     ImGui::EndGroup();
     ImGui::SetCursorScreenPos(p + ImVec2{0, hero + 18 * S});
     ImGui::Dummy({0, 0});  // ImGui exige un élément après un déplacement du curseur
+    if (artist) if (auto it = g_albums.find(l->uri); it != g_albums.end() && !it->second.empty()) {  // ses albums
+        ImGui::TextDisabled("ALBUMS (%d)", (int)it->second.size());
+        ImGui::BeginChild("albums", {0, 170 * S}, 0, ImGuiWindowFlags_NoBackground | ImGuiWindowFlags_HorizontalScrollbar);
+        std::vector<Card> albums = it->second;  // copie : un clic ajoute une liste
+        float cw = 128 * S;
+        ImGui::Dummy({cw * albums.size(), 0});
+        ImGui::SetCursorPos({0, 0});
+        for (size_t i = 0; i < albums.size(); i++) {
+            if (i) ImGui::SameLine(0, 0);
+            ImGui::PushID((int)i);
+            ImVec2 a = ImGui::GetCursorScreenPos();
+            if (ImGui::InvisibleButton("##a", {cw, 160 * S})) { openCard(albums[i]); ImGui::PopID(); break; }
+            bool hov = ImGui::IsItemHovered();
+            ImDrawList* adl = ImGui::GetWindowDrawList();
+            coverAt(adl, albums[i].image, "", a + ImVec2{6 * S, 0}, 112 * S, 10 * S);
+            textAt(adl, a + ImVec2{6 * S, 118 * S}, 112 * S, hov ? accU() : col(1, 1, 1, 0.85f), albums[i].name);
+            ImGui::PopID();
+        }
+        ImGui::EndChild();
+        ImGui::TextDisabled("TITRES");
+    }
 
     if (l->tracks.empty() && l->loaded) {
         if (!local && !l->own) ImGui::TextDisabled("Aucun titre dans cette liste.");

@@ -30,6 +30,9 @@ UTILISER
   - Roue : reglages (9 themes, couleurs, verre, texte, densite, son
     Auto / Spotify / YouTube, fenetre toujours devant, icone pres de
     l'horloge, demarrage avec Windows...).
+  - Recherche (Ctrl+F) : tes listes + le catalogue (Spotify si connecte,
+    sinon Apple Music). Les ARTISTES apparaissent en haut : un clic ouvre
+    leur page (titres les plus ecoutes + albums).
   - Raccourcis : Espace, Ctrl+fleches, Ctrl+F (recherche), Ctrl+L (paroles),
     Ctrl+Q (file), Ctrl+M (mini-lecteur), touches multimedia.
 

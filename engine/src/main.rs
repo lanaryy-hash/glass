@@ -398,6 +398,15 @@ async fn main() {
                     emit(json!({"ev": "api", "id": id, "status": st, "msg": msg}));
                 });
             }
+            "get" => {  // lecture dans la Web API (artistes, albums...) : la réponse complète revient à Glass
+                let (web, path, id) = (web.clone(), s("path"), v["id"].clone());
+                tokio::spawn(async move {
+                    match web.call("GET", &path, &Value::Null).await {
+                        Ok((st, d)) => emit(json!({"ev": "get", "id": id, "status": st, "data": d})),
+                        Err(e) => emit(json!({"ev": "get", "id": id, "status": 0, "msg": e})),
+                    }
+                });
+            }
             "webauth" => {
                 let (web, cid) = (web.clone(), s("client_id"));
                 tokio::spawn(async move {
