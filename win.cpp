@@ -210,65 +210,110 @@ struct Notify : IMFMediaEngineNotify {  // fin de piste / erreur : on réveille 
     }
 } g_notify;
 
-// ---------- lecteur Spotify officiel : Web Playback SDK dans un WebView2 ----------
-static ICoreWebView2Controller* g_wvc;
-static ICoreWebView2* g_wv;
-static HWND g_wvHost;  // fenêtre hors écran qui porte le lecteur
-static bool g_wvOn = false;
+// ---------- lecteurs officiels (Spotify, Apple Music) : pages web dans des WebView2 ----------
+// Masqué, un lecteur web ne joue rien (il reste « loading ») : il doit être affiché.
+// On l'affiche donc dans une petite fenêtre hors de l'écran, absente de la barre des tâches et d'Alt+Tab ;
+// pour se connecter à un compte, la même fenêtre vient au centre de l'écran.
+struct Web { ICoreWebView2Controller* c = nullptr; ICoreWebView2* wv = nullptr; HWND host = nullptr; bool on = false; };
+static Web g_webs[2];
 
-void plat::webStop() {
-    if (g_wvc) { g_wvc->Close(); g_wvc->Release(); }
-    if (g_wv) g_wv->Release();
-    if (g_wvHost) DestroyWindow(g_wvHost);
-    g_wvc = nullptr; g_wv = nullptr; g_wvHost = nullptr; g_wvOn = false;
+static void fitWeb(int id) {
+    RECT r; GetClientRect(g_webs[id].host, &r);
+    if (g_webs[id].c) g_webs[id].c->put_Bounds(r);
 }
 
-void plat::webPost(const std::string& json) { if (g_wv) g_wv->PostWebMessageAsJson(widen(json).c_str()); }
+static LRESULT WINAPI webProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
+    int id = (int)GetWindowLongPtrW(h, GWLP_USERDATA);
+    if (msg == WM_SIZE) { fitWeb(id); return 0; }
+    if (msg == WM_CLOSE) { plat::webShow(id, false); app::onWeb(id, R"({"t":"hidden"})"); plat::wake(); return 0; }  // fermer = recacher
+    return DefWindowProcW(h, msg, wp, lp);
+}
 
-void plat::webStart(const std::string& html, float vol) {  // thread de la fenêtre uniquement
+void plat::webShow(int id, bool show) {
+    HWND h = g_webs[id].host;
+    if (!h) return;
+    if (show) {
+        SetWindowLongPtrW(h, GWL_STYLE, WS_OVERLAPPEDWINDOW | WS_VISIBLE);
+        SetWindowLongPtrW(h, GWL_EXSTYLE, 0);
+        MONITORINFO mi{sizeof mi}; GetMonitorInfoW(MonitorFromWindow(g_hwnd, MONITOR_DEFAULTTONEAREST), &mi);
+        int w = (int)(1000 * S), hh = (int)(760 * S);
+        SetWindowPos(h, HWND_TOP, (mi.rcWork.left + mi.rcWork.right - w) / 2, (mi.rcWork.top + mi.rcWork.bottom - hh) / 2, w, hh, SWP_FRAMECHANGED | SWP_SHOWWINDOW);
+        SetForegroundWindow(h);  // l'utilisateur vient de cliquer « Se connecter »
+    } else {
+        SetWindowLongPtrW(h, GWL_STYLE, WS_POPUP | WS_VISIBLE);
+        SetWindowLongPtrW(h, GWL_EXSTYLE, WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE);
+        SetWindowPos(h, HWND_BOTTOM, -4000, -4000, 320, 240, SWP_FRAMECHANGED | SWP_NOACTIVATE | SWP_SHOWWINDOW);
+    }
+    fitWeb(id);
+}
+
+void plat::webStop(int id) {
+    Web& w = g_webs[id];
+    if (w.c) { w.c->Close(); w.c->Release(); }
+    if (w.wv) w.wv->Release();
+    if (w.host) DestroyWindow(w.host);
+    w = Web{};
+}
+
+void plat::webPost(int id, const std::string& json) { if (g_webs[id].wv) g_webs[id].wv->PostWebMessageAsJson(widen(json).c_str()); }
+
+void plat::webStart(int id, const std::string& html, const std::string& url, const std::string& inject, float vol) {  // thread de la fenêtre uniquement
     using Microsoft::WRL::Callback;
-    g_wvOn = true;
+    static bool registered = false;
+    if (!registered) {
+        WNDCLASSEXW wc{sizeof wc, 0, webProc, 0, 0, GetModuleHandleW(nullptr), LoadIconW(GetModuleHandleW(nullptr), MAKEINTRESOURCEW(1)), LoadCursorW(nullptr, IDC_ARROW), nullptr, nullptr, L"GlassWeb"};
+        RegisterClassExW(&wc);
+        registered = true;
+    }
+    Web& w = g_webs[id];
+    w.on = true;
     std::wstring web = (g_dir / "web").wstring();
     CreateDirectoryW(web.c_str(), nullptr);
-    std::ofstream(web + L"\\player.html") << html;
+    std::wstring nav = widen(url);
+    if (!html.empty()) {  // page locale servie par un faux site (https://glass.player/)
+        std::ofstream(web + L"\\player.html") << html;
+        nav = L"https://glass.player/player.html?v=" + std::to_wstring(vol);  // volume dès le départ
+    }
+    w.host = CreateWindowExW(WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE, L"GlassWeb", id == 1 ? L"Apple Music - Glass" : L"Spotify - Glass", WS_POPUP,
+                             -4000, -4000, 320, 240, nullptr, nullptr, GetModuleHandleW(nullptr), nullptr);
+    SetWindowLongPtrW(w.host, GWLP_USERDATA, id);
+    ShowWindow(w.host, SW_SHOWNOACTIVATE);
     auto opts = Microsoft::WRL::Make<CoreWebView2EnvironmentOptions>();
-    // Masqué, le lecteur Spotify ne joue rien (il reste « loading ») : il doit être affiché.
-    // On l'affiche donc dans une petite fenêtre hors de l'écran, absente de la barre des tâches et d'Alt+Tab.
-    g_wvHost = CreateWindowExW(WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE, L"STATIC", L"Glass player", WS_POPUP, -4000, -4000, 320, 240, nullptr, nullptr, nullptr, nullptr);
-    ShowWindow(g_wvHost, SW_SHOWNOACTIVATE);
-    // Moins de processus et de mémoire : pas de GPU, un seul processus de rendu, pas d'isolation par site (une seule page de confiance).
+    // Moins de processus et de mémoire : pas de GPU, un seul processus de rendu, pas d'isolation par site.
     opts->put_AdditionalBrowserArguments(L"--autoplay-policy=no-user-gesture-required --disable-background-timer-throttling --disable-renderer-backgrounding "
                                          L"--disable-gpu --disable-gpu-compositing --renderer-process-limit=1 --disable-site-isolation-trials --disable-extensions --no-first-run "
                                          L"--disable-features=IsolateOrigins,site-per-process,SpareRendererForSitePerProcess,msSmartScreenProtection");
+    std::wstring winject = widen(inject);
     HRESULT hr = CreateCoreWebView2EnvironmentWithOptions(nullptr, (g_dir / "webview-data").c_str(), opts.Get(),
-        Callback<ICoreWebView2CreateCoreWebView2EnvironmentCompletedHandler>([web, vol](HRESULT hr, ICoreWebView2Environment* env) -> HRESULT {
-            if (FAILED(hr) || !env) { app::onWeb(R"({"t":"error","msg":"WebView2 indisponible : son via YouTube"})"); return S_OK; }
-            env->CreateCoreWebView2Controller(g_wvHost, Callback<ICoreWebView2CreateCoreWebView2ControllerCompletedHandler>(
-                [web, vol](HRESULT hr, ICoreWebView2Controller* c) -> HRESULT {
-                    if (FAILED(hr) || !c || !g_wvOn) return S_OK;
-                    g_wvc = c; g_wvc->AddRef();
-                    RECT bounds{0, 0, 320, 240};
-                    g_wvc->put_Bounds(bounds);
-                    g_wvc->put_IsVisible(TRUE);
-                    g_wvc->get_CoreWebView2(&g_wv);
+        Callback<ICoreWebView2CreateCoreWebView2EnvironmentCompletedHandler>([id, web, nav, winject](HRESULT hr, ICoreWebView2Environment* env) -> HRESULT {
+            if (FAILED(hr) || !env) { app::onWeb(id, R"({"t":"error","msg":"WebView2 indisponible : son via YouTube"})"); return S_OK; }
+            env->CreateCoreWebView2Controller(g_webs[id].host, Callback<ICoreWebView2CreateCoreWebView2ControllerCompletedHandler>(
+                [id, web, nav, winject](HRESULT hr, ICoreWebView2Controller* c) -> HRESULT {
+                    Web& w = g_webs[id];
+                    if (FAILED(hr) || !c || !w.on) return S_OK;
+                    w.c = c; w.c->AddRef();
+                    fitWeb(id);
+                    w.c->put_IsVisible(TRUE);
+                    w.c->get_CoreWebView2(&w.wv);
                     ICoreWebView2_3* wv3;
-                    if (SUCCEEDED(g_wv->QueryInterface(IID_PPV_ARGS(&wv3)))) {
+                    if (SUCCEEDED(w.wv->QueryInterface(IID_PPV_ARGS(&wv3)))) {
                         wv3->SetVirtualHostNameToFolderMapping(L"glass.player", web.c_str(), COREWEBVIEW2_HOST_RESOURCE_ACCESS_KIND_ALLOW);
                         wv3->Release();
                     }
+                    if (!winject.empty()) w.wv->AddScriptToExecuteOnDocumentCreated(winject.c_str(), nullptr);
                     EventRegistrationToken tok;
-                    g_wv->add_WebMessageReceived(Callback<ICoreWebView2WebMessageReceivedEventHandler>(
-                        [](ICoreWebView2*, ICoreWebView2WebMessageReceivedEventArgs* a) -> HRESULT {
+                    w.wv->add_WebMessageReceived(Callback<ICoreWebView2WebMessageReceivedEventHandler>(
+                        [id](ICoreWebView2*, ICoreWebView2WebMessageReceivedEventArgs* a) -> HRESULT {
                             LPWSTR s;
-                            if (SUCCEEDED(a->get_WebMessageAsJson(&s))) { app::onWeb(narrow(s)); CoTaskMemFree(s); plat::wake(); }
+                            if (SUCCEEDED(a->get_WebMessageAsJson(&s))) { app::onWeb(id, narrow(s)); CoTaskMemFree(s); plat::wake(); }
                             return S_OK;
                         }).Get(), &tok);
-                    g_wv->Navigate((L"https://glass.player/player.html?v=" + std::to_wstring(vol)).c_str());  // volume dès le départ
+                    w.wv->Navigate(nav.c_str());
                     return S_OK;
                 }).Get());
             return S_OK;
         }).Get());
-    if (FAILED(hr)) app::onWeb(R"({"t":"error","msg":"WebView2 indisponible : son via YouTube"})");
+    if (FAILED(hr)) app::onWeb(id, R"({"t":"error","msg":"WebView2 indisponible : son via YouTube"})");
 }
 
 // ---------- images : WIC ----------

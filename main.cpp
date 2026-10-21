@@ -43,6 +43,7 @@ struct Settings {
     float glass = 0.07f, dim = 0.45f, tintAmt = 0.15f, rounding = 20, textScale = 1, speed = 1, vol = 0.8f;
     bool mediaKeys = true, startup = false, animations = true, showAlbum = true, tray = false, topmost = false, lyricsCenter = false, stopAtEnd = false;
     bool accentAuto = false, autoLyrics = true;  // couleur prise sur la pochette ; paroles générées si introuvables
+    bool apple = false;                          // compte Apple Music connecté (page music.apple.com lancée au démarrage)
     std::vector<std::string> pinned = {"glass:favoris", "spotify:collection", "local", "glass:recent"};  // en haut de la bibliothèque
 };
 static Settings g_set;
@@ -89,11 +90,13 @@ static std::atomic<int> g_gen{0};       // invalide les téléchargements périm
 static std::set<std::string> g_inflight;
 static double g_sleepAt = 0;            // minuterie
 static bool g_sleepEnd = false;         // minuterie « à la fin du titre »
-// lecteur Spotify officiel (Web Playback SDK dans un WebView2 invisible)
+// lecteurs officiels dans des pages web invisibles : Spotify (Web Playback SDK) et Apple Music (music.apple.com)
 static bool g_webOk = false, g_sp = false, g_wvStarted = false, g_sdkReady = false, g_spPaused = true, g_spEnded = false;
+static bool g_spApple = false;                                                      // le lecteur officiel en cours est celui d'Apple
+static bool g_amStarted = false, g_amReady = false, g_amAuth = false, g_amLogin = false;  // Apple Music : page lancée, prête, connectée, fenêtre de connexion
 static std::string g_sdkDevice;
 static double g_spPos = 0, g_spT = 0, g_spDur = 0;
-static std::vector<std::string> g_wvOut;  // messages JSON pour la page (postés depuis le thread de la fenêtre)
+static std::vector<std::pair<int, std::string>> g_wvOut;  // messages JSON pour les pages (postés depuis le thread de la fenêtre)
 
 // interface
 static int g_pick = 0;                  // boîtes de dialogue (hors du verrou) : 1 fichiers, 2 dossier, 3 image de pochette
@@ -146,7 +149,8 @@ static std::string toUri(const std::string& s) {
     if (std::regex_search(s, m, std::regex(R"((playlist|album)[/:]([A-Za-z0-9]{22}))"))) return "spotify:" + m[1].str() + ":" + m[2].str();
     return "";
 }
-static bool isApple(const std::string& uri) { return uri.rfind("https://music.apple.com/", 0) == 0; }
+// Apple Music : lien public (https://music.apple.com/...) ou playlist de ton compte ("am:<id>")
+static bool isApple(const std::string& uri) { return uri.rfind("https://music.apple.com/", 0) == 0 || uri.rfind("am:", 0) == 0; }
 static bool isAlbum(const std::string& uri) { return uri.rfind("spotify:album", 0) == 0 || (isApple(uri) && uri.find("/album/") != std::string::npos); }
 
 // ---------- persistance ----------
@@ -157,7 +161,7 @@ static void saveSettings() {
               {"glass", s.glass}, {"dim", s.dim}, {"tintAmt", s.tintAmt}, {"rounding", s.rounding}, {"textScale", s.textScale}, {"speed", s.speed}, {"vol", s.vol},
               {"mediaKeys", s.mediaKeys}, {"startup", s.startup}, {"animations", s.animations}, {"showAlbum", s.showAlbum}, {"tray", s.tray},
               {"topmost", s.topmost}, {"lyricsCenter", s.lyricsCenter}, {"stopAtEnd", s.stopAtEnd},
-              {"neon", s.neon}, {"accentAuto", s.accentAuto}, {"autoLyrics", s.autoLyrics}, {"particles", s.particles}, {"pinned", s.pinned}};
+              {"neon", s.neon}, {"accentAuto", s.accentAuto}, {"autoLyrics", s.autoLyrics}, {"particles", s.particles}, {"pinned", s.pinned}, {"apple", s.apple}};
     std::ofstream((g_dir / "settings.json")) << j.dump(1);
 }
 static void loadSettings() {
@@ -170,7 +174,7 @@ static void loadSettings() {
     get("glass", s.glass); get("dim", s.dim); get("tintAmt", s.tintAmt); get("rounding", s.rounding); get("textScale", s.textScale); get("speed", s.speed); get("vol", s.vol);
     get("mediaKeys", s.mediaKeys); get("startup", s.startup); get("animations", s.animations); get("showAlbum", s.showAlbum); get("tray", s.tray);
     get("topmost", s.topmost); get("lyricsCenter", s.lyricsCenter); get("stopAtEnd", s.stopAtEnd);
-    get("neon", s.neon); get("accentAuto", s.accentAuto); get("autoLyrics", s.autoLyrics); get("particles", s.particles); get("pinned", s.pinned);
+    get("neon", s.neon); get("accentAuto", s.accentAuto); get("autoLyrics", s.autoLyrics); get("particles", s.particles); get("pinned", s.pinned); get("apple", s.apple);
     for (int i = 0; i < 3; i++) {
         if (j.contains("accentRGB") && j["accentRGB"].size() == 3) s.accent[i] = j["accentRGB"][i].get<float>();
         if (j.contains("tint") && j["tint"].size() == 3) s.tint[i] = j["tint"][i].get<float>();
@@ -358,9 +362,11 @@ static void loadApple(const std::string& url) {
 
 // ---------- moteur Spotify (glass-engine : bibliothèque, paroles, Web API) ----------
 static void send(const json& j) { plat::engineSend(j.dump() + "\n"); }
+static void amPost(const json& j);
 
 static void requestTracks(List& l) {
     if (l.requested || l.own || l.uri == "local" || l.uri == "search") return;
+    if (l.uri.rfind("am:", 0) == 0) { if (g_amAuth) { l.requested = true; amPost({{"cmd", "list"}, {"id", l.uri.substr(3)}}); } return; }
     if (isApple(l.uri)) { l.requested = true; loadApple(l.uri); return; }
     if (!g_spReady) return;
     l.requested = true;
@@ -391,7 +397,7 @@ static void onEngine(const std::string& line) try {
             next.push_back(std::move(l));
         }
         for (auto& l : g_lists)
-            if ((l.custom || l.own || l.uri == "local") && std::none_of(next.begin(), next.end(), [&](const List& x) { return x.uri == l.uri; })) next.push_back(std::move(l));
+            if ((l.custom || l.own || l.uri == "local" || isApple(l.uri)) && std::none_of(next.begin(), next.end(), [&](const List& x) { return x.uri == l.uri; })) next.push_back(std::move(l));
         g_lists = std::move(next);
     } else if (ev == "tracks") {
         if (List* l = findList(jstr(j, "uri"))) {
@@ -450,7 +456,7 @@ static void logout() {  // oublie le compte Spotify et redemande la connexion
     std::error_code ec;
     fs::remove(g_dir / "spotify-cache" / "credentials.json", ec);
     fs::remove(g_dir / "spotify-cache" / "webapi.json", ec);
-    g_lists.erase(std::remove_if(g_lists.begin(), g_lists.end(), [](const List& l) { return !l.custom && !l.own && l.uri != "local"; }), g_lists.end());
+    g_lists.erase(std::remove_if(g_lists.begin(), g_lists.end(), [](const List& l) { return !l.custom && !l.own && l.uri != "local" && !isApple(l.uri); }), g_lists.end());
     for (auto& l : g_lists) l.requested = false;
     g_spReady = g_webOk = false; g_user.clear();
     startEngine();
@@ -620,7 +626,9 @@ static void generateLyrics(const Track& t) {  // g_mx tenu
 }
 
 // ---------- lecture (appelé avec g_mx verrouillé) ----------
-static void wvPost(const json& j) { g_wvOut.push_back(j.dump()); wake(); }
+static void wvPost(const json& j) { g_wvOut.push_back({0, j.dump()}); wake(); }  // page Spotify
+static void amPost(const json& j) { g_wvOut.push_back({1, j.dump()}); wake(); }  // page Apple Music
+static void webCmd(const json& j) { if (g_spApple) amPost(j); else wvPost(j); }  // lecteur officiel en cours
 
 static void audioPlay(const fs::path& path) {
     plat::audioPlay(path);
@@ -643,12 +651,12 @@ static bool isPlaying() { return g_has && !g_loading && (g_sp ? !g_spPaused : !p
 
 static void stopSp() {
     if (!g_sp) return;
-    wvPost({{"cmd", "stop"}});
+    webCmd({{"cmd", "stop"}});
     g_sp = false;
 }
 
 static void pausePlayback() {
-    if (g_sp) { g_spPos = posMs(); g_spT = now(); g_spPaused = true; wvPost({{"cmd", "pause"}}); }
+    if (g_sp) { g_spPos = posMs(); g_spT = now(); g_spPaused = true; webCmd({{"cmd", "pause"}}); }
     else plat::audioPause();
 }
 
@@ -733,18 +741,24 @@ static void startTrack(const Track& t) {
     g_status.clear();
     addRecent(t);
     if (t.local) { stopSp(); audioPlay(upath(t.uri)); return; }
-    bool spotify = t.uri.rfind("spotify:", 0) == 0;  // Apple Music : toujours via YouTube
-    if (spotify && g_set.source != 2 && g_sdkReady) {  // lecteur officiel : la vraie version, Premium
+    bool spotify = t.uri.rfind("spotify:", 0) == 0, apple = t.uri.rfind("apple:song:", 0) == 0;
+    bool ready = spotify ? g_sdkReady : apple && g_amReady && g_amAuth;
+    if ((spotify || apple) && g_set.source != 2 && ready) {  // lecteur officiel : la vraie version (abonnement)
         plat::audioPause();
-        g_sp = true; g_loading = true; g_spPaused = false;
+        if (g_sp && g_spApple != apple) stopSp();  // on change de lecteur
+        g_sp = true; g_spApple = apple; g_loading = true; g_spPaused = false;
         g_spPos = 0; g_spDur = t.ms; g_spT = now();
-        wvPost({{"cmd", "expect"}, {"uri", t.uri}});
-        send({{"cmd", "api"}, {"id", "play"}, {"method", "PUT"}, {"path", "/v1/me/player/play?device_id=" + g_sdkDevice}, {"body", {{"uris", {t.uri}}}}});
+        if (apple) amPost({{"cmd", "play"}, {"id", t.uri.substr(11)}});
+        else {
+            wvPost({{"cmd", "expect"}, {"uri", t.uri}});
+            send({{"cmd", "api"}, {"id", "play"}, {"method", "PUT"}, {"path", "/v1/me/player/play?device_id=" + g_sdkDevice}, {"body", {{"uris", {t.uri}}}}});
+        }
         return;
     }
-    if (spotify && g_set.source == 1) {  // Spotify uniquement
+    if ((spotify || apple) && g_set.source == 1) {  // officiel uniquement
         stopSp(); plat::audioPause(); g_failed = true;
-        g_status = g_webOk ? "Lecteur Spotify pas encore prêt..." : "Spotify uniquement : connecte le lecteur officiel dans Réglages";
+        g_status = apple ? "Officiel uniquement : connecte Apple Music dans Réglages"
+                 : g_webOk ? "Lecteur Spotify pas encore prêt..." : "Officiel uniquement : connecte le lecteur Spotify dans Réglages";
         return;
     }
     ytPlay(t);
@@ -790,23 +804,26 @@ static void onTrackEnd() {
 
 static void togglePlay() {
     if (!g_has || g_loading) return;
-    if (g_sp) { g_spPos = posMs(); g_spT = now(); g_spPaused = !g_spPaused; wvPost({{"cmd", "toggle"}}); return; }
+    if (g_sp) { g_spPos = posMs(); g_spT = now(); g_spPaused = !g_spPaused; webCmd({{"cmd", "toggle"}}); return; }
     if (plat::audioPaused()) plat::audioResume(); else plat::audioPause();
 }
 
 static void seekMs(double ms) {
-    if (g_sp) {  // seek() du SDK est ignoré une fois la lecture lancée : on passe par la Web API
+    if (g_sp) {
         g_spPos = ms; g_spT = now();
-        send({{"cmd", "api"}, {"method", "PUT"}, {"path", "/v1/me/player/seek?position_ms=" + std::to_string((int)ms) + "&device_id=" + g_sdkDevice}});
+        if (g_spApple) amPost({{"cmd", "seek"}, {"ms", ms}});
+        else  // seek() du SDK Spotify est ignoré une fois la lecture lancée : on passe par la Web API
+            send({{"cmd", "api"}, {"method", "PUT"}, {"path", "/v1/me/player/seek?position_ms=" + std::to_string((int)ms) + "&device_id=" + g_sdkDevice}});
     }
     else if (g_has) plat::audioSeek(ms / 1000);
 }
 
 static void setVolume() {
     plat::audioVolume(g_set.vol * g_set.vol);
-    if (g_wvStarted) wvPost({{"cmd", "volume"}, {"v", std::max(g_set.vol * g_set.vol, 0.0001f)}});  // le SDK ignore 0
+    json v = {{"cmd", "volume"}, {"v", std::max(g_set.vol * g_set.vol, 0.0001f)}};  // le SDK Spotify ignore 0
+    if (g_wvStarted) wvPost(v);
+    if (g_amStarted) amPost(v);
 }
-
 
 // ---------- lecteur Spotify officiel : Web Playback SDK dans une page web invisible (WebView2 / WKWebView) ----------
 static const char* kPlayerHtml = R"HTML(<!doctype html><meta charset="utf-8"><title>Glass</title>
@@ -850,29 +867,146 @@ window.onSpotifyWebPlaybackSDKReady = () => {
 </script>
 <script src="https://sdk.scdn.co/spotify-player.js"></script>)HTML";
 
-static void onPlayer(const std::string& msg) try {  // messages de la page
-    json j = json::parse(msg);
-    std::lock_guard lk(g_mx);
+// ---------- Apple Music officiel : le vrai site music.apple.com, invisible, piloté par ce script (MusicKit du site) ----------
+// Même idée que Spotify : ton compte, ton abonnement, le lecteur d'Apple ; Glass ne fait qu'appuyer sur les boutons.
+static const char* kAppleJs = R"JS((() => {
+  if (window.top !== window || window.__glass) return;
+  window.__glass = true;
+  const wv = window.chrome && chrome.webview ? chrome.webview : {
+    postMessage: m => webkit.messageHandlers.glass.postMessage(JSON.stringify(m)),
+    addEventListener: (_, f) => { window.glassIn = d => f({data: d}); }
+  };
+  const post = m => wv.postMessage(m);
+  let mk = null, expect = '', auth = null;
+  const art = a => a && a.url ? a.url.replace('{w}', '300').replace('{h}', '300').replace('{c}', '').replace('{f}', 'jpg') : '';
+  const track = s => {
+    const a = s.attributes || {}, p = a.playParams || {};
+    return {uri: 'apple:song:' + (p.catalogId || p.id || s.id), title: a.name || '', artist: a.artistName || '', album: a.albumName || '',
+            ms: a.durationInMillis || 0, image: art(a.artwork)};
+  };
+  const all = async path => {  // toutes les pages d'une liste de l'API Apple Music
+    let out = [];
+    for (let off = 0; off < 5000; off += 100) {
+      const r = await mk.api.music(path, {limit: 100, offset: off});
+      const d = (r && r.data) || {};
+      out = out.concat(d.data || []);
+      if (!d.next) break;
+    }
+    return out;
+  };
+  wv.addEventListener('message', async e => {
+    const m = e.data;
+    if (!mk || !m) return;
+    try {
+      if (m.cmd === 'play') { expect = m.id; await mk.setQueue({song: m.id, startPlaying: true}); await mk.play(); }
+      else if (m.cmd === 'toggle') { if (mk.isPlaying) mk.pause(); else mk.play(); }
+      else if (m.cmd === 'pause') mk.pause();
+      else if (m.cmd === 'stop') { expect = ''; mk.pause(); }
+      else if (m.cmd === 'seek') mk.seekToTime(m.ms / 1000);
+      else if (m.cmd === 'volume') mk.volume = m.v;
+      else if (m.cmd === 'lib') {
+        const pl = await all('/v1/me/library/playlists');
+        post({t: 'lib', items: pl.map(p => ({id: p.id, name: (p.attributes || {}).name || 'Playlist', image: art((p.attributes || {}).artwork)}))});
+      } else if (m.cmd === 'list') {
+        const tr = await all('/v1/me/library/playlists/' + m.id + '/tracks');
+        post({t: 'tracks', id: m.id, items: tr.map(track)});
+      }
+    } catch (err) { post({t: 'error', cmd: m.cmd, msg: String((err && (err.message || err.errorCode || err.name)) || err)}); }
+  });
+  const tick = () => {
+    if (mk.isAuthorized !== auth) { auth = mk.isAuthorized; post({t: 'auth', ok: !!auth}); }
+    if (expect) post({t: 'state', paused: !mk.isPlaying, pos: (mk.currentPlaybackTime || 0) * 1000, dur: (mk.currentPlaybackDuration || 0) * 1000});
+  };
+  const find = () => {
+    try { mk = window.MusicKit && MusicKit.getInstance && MusicKit.getInstance(); } catch (e) { mk = null; }
+    if (!mk) return setTimeout(find, 500);
+    const PS = MusicKit.PlaybackStates || {ended: 5, completed: 10};
+    mk.addEventListener('playbackStateDidChange', ev => {
+      const s = ev && ev.state;
+      if (expect && (s === PS.ended || s === PS.completed)) { expect = ''; post({t: 'ended'}); }
+    });
+    auth = !!mk.isAuthorized;
+    post({t: 'ready', ok: auth});
+    setInterval(tick, 1000);
+  };
+  find();
+})();)JS";
+
+// Position, pause, durée envoyées chaque seconde par un lecteur officiel (Spotify ou Apple).
+static void webState(const json& j) {
+    if (j.value("none", false)) { g_spPaused = true; return; }
+    double pos = jnum(j, "pos"), dur = jnum(j, "dur");
+    bool paused = j.value("paused", true);
+    // filet de sécurité : arrêt à 0 juste après la fin du titre
+    if (paused && pos == 0 && g_spDur > 0 && posMs() > g_spDur - 4000 && !g_loading) { g_spEnded = true; return; }
+    g_spPaused = paused; g_spPos = pos; g_spT = now();
+    if (dur > 0) g_spDur = dur;
+    if ((!paused || pos > 0) && g_loading) { g_loading = false; setVolume(); }  // drapeau « loading » peu fiable ; volume réappliqué (ignoré avant la lecture)
+}
+
+static void onPlayer(const json& j) {  // messages de la page Spotify (g_mx tenu)
     std::string t = jstr(j, "t");
+    bool mine = g_sp && !g_spApple;
     if (t == "token") send({{"cmd", "token"}});
     else if (t == "ready") { g_sdkDevice = jstr(j, "id"); g_sdkReady = true; setVolume(); }
     else if (t == "notready") g_sdkReady = false;
     else if (t == "error") g_status = "Lecteur Spotify : " + jstr(j, "msg");
-    else if (t == "ended" && g_sp) g_spEnded = true;
-    else if (t == "state" && g_sp) {
-        if (j.value("none", false)) { g_spPaused = true; return; }
-        double pos = jnum(j, "pos"), dur = jnum(j, "dur");
-        bool paused = j.value("paused", true);
-        // filet de sécurité : arrêt à 0 juste après la fin du titre
-        if (paused && pos == 0 && g_spDur > 0 && posMs() > g_spDur - 4000 && !g_loading) { g_spEnded = true; return; }
-        g_spPaused = paused; g_spPos = pos; g_spT = now();
-        if (dur > 0) g_spDur = dur;
-        if ((!paused || pos > 0) && g_loading) { g_loading = false; setVolume(); }  // drapeau « loading » du SDK peu fiable ; volume réappliqué (ignoré avant la lecture)
-    }
-} catch (...) {}
+    else if (t == "ended" && mine) g_spEnded = true;
+    else if (t == "state" && mine) webState(j);
+}
 
-static void stopWebView() { plat::webStop(); g_wvStarted = g_sdkReady = g_sp = false; }
-static void startWebView() { g_wvStarted = true; plat::webStart(kPlayerHtml, g_set.vol * g_set.vol); }  // thread de la fenêtre
+static void onApple(const json& j) {  // messages de la page Apple Music (g_mx tenu)
+    std::string t = jstr(j, "t");
+    bool mine = g_sp && g_spApple;
+    if (t == "ready" || t == "auth") {
+        g_amReady = true;
+        bool was = g_amAuth;
+        g_amAuth = j.value("ok", false);
+        if (t == "ready") setVolume();
+        if (g_amAuth && !was) {  // connecté : on cache la fenêtre et on charge ses playlists
+            if (g_amLogin) { plat::webShow(1, false); g_amLogin = false; g_status = "Apple Music connecté"; }
+            amPost({{"cmd", "lib"}});
+        }
+    } else if (t == "hidden") g_amLogin = false;
+    else if (t == "lib") {
+        for (auto& it : j["items"]) {
+            std::string uri = "am:" + jstr(it, "id");
+            List* l = findList(uri);
+            if (!l) { g_lists.push_back(List{uri, jstr(it, "name"), jstr(it, "image")}); l = &g_lists.back(); }
+            else { l->name = jstr(it, "name"); if (l->image.empty()) l->image = jstr(it, "image"); }
+            applyOverride(*l);
+        }
+    } else if (t == "tracks") {
+        if (List* l = findList("am:" + jstr(j, "id"))) {
+            l->loaded = true; l->tracks.clear();
+            for (auto& it : j["items"]) if (Track x = trackFrom(it); !x.uri.empty()) l->tracks.push_back(x);
+            if (l->image.empty() && !l->tracks.empty()) l->image = l->tracks[0].image;
+            applyOverride(*l);
+        }
+    } else if (t == "error") {
+        g_status = "Apple Music : " + jstr(j, "msg");
+        if (jstr(j, "cmd") == "play" && mine) {  // le lecteur officiel refuse ce titre
+            g_sp = false; g_loading = false;
+            if (g_set.source == 0 && g_has) ytPlay(g_cur); else g_failed = true;
+        }
+    }
+    else if (t == "ended" && mine) g_spEnded = true;
+    else if (t == "state" && mine) webState(j);
+}
+
+static void stopWebView() { plat::webStop(0); g_wvStarted = g_sdkReady = false; if (!g_spApple) g_sp = false; }
+static void startWebView() { g_wvStarted = true; plat::webStart(0, kPlayerHtml, "", "", g_set.vol * g_set.vol); }  // thread de la fenêtre
+static void stopApple() {
+    plat::webStop(1);
+    g_amStarted = g_amReady = g_amAuth = g_amLogin = false;
+    if (g_spApple) g_sp = false;
+    g_lists.erase(std::remove_if(g_lists.begin(), g_lists.end(), [](const List& l) { return l.uri.rfind("am:", 0) == 0; }), g_lists.end());
+}
+static void startApple() {
+    g_amStarted = true;
+    plat::webStart(1, "", "https://music.apple.com/", kAppleJs, g_set.vol * g_set.vol);
+    if (g_amLogin) plat::webShow(1, true);
+}
 
 // ---------- images (pochettes, fond flouté) ----------
 // Couleurs d'une pochette (calculées sur sa version floutée) : 4 coins + la plus vive.
@@ -1712,8 +1846,8 @@ static void settingsView() {
     ImGui::SameLine(); ImGui::TextDisabled("(seulement quand tu ouvres les paroles d'un titre qui n'en a pas)");
 
     section("Lecture");
-    label("Son des titres Spotify");
-    changed |= ImGui::Combo("##src", &g_set.source, "Auto (Spotify, sinon YouTube)\0Spotify officiel uniquement\0YouTube uniquement\0");
+    label("Son des titres Spotify / Apple Music");
+    changed |= ImGui::Combo("##src", &g_set.source, "Auto (officiel, sinon YouTube)\0Officiel uniquement\0YouTube uniquement\0");
     if (g_set.source != 2) {
         ImGui::SameLine();
         if (!g_webOk) { if (ImGui::Button("Connecter Spotify")) ImGui::OpenPopup("websetup"); }
@@ -1767,6 +1901,17 @@ static void settingsView() {
     ImGui::Text("Glass %zu Mo + moteur %zu Mo", plat::memMB(false), plat::memMB(true));
     label("Dossier de Glass");
     if (ImGui::Button("Ouvrir")) plat::openUrl(ustr(g_dir));
+
+    section("Apple Music");
+    label(g_amAuth ? "Connecté" : g_set.apple && !g_amReady ? "Démarrage..." : "Non connecté");
+    if (!g_set.apple || !g_amAuth) {
+        if (ImGui::Button("Connecter Apple Music")) { g_set.apple = true; g_amLogin = true; changed = true; if (g_amStarted) plat::webShow(1, true); }
+    } else if (ImGui::Button("Afficher la page Apple Music")) { g_amLogin = true; plat::webShow(1, true); }
+    if (g_set.apple) { ImGui::SameLine(); if (ImGui::Button("Retirer de Glass##am")) { g_set.apple = false; changed = true; } }
+    label("");
+    ImGui::TextDisabled("Le vrai lecteur d'Apple, caché dans Glass. Abonnement requis pour les titres entiers (sinon extraits de 30 s).");
+    label("");
+    ImGui::TextDisabled("Tes playlists apparaissent à gauche. Sans compte, colle un lien Apple Music avec « + ».");
 
     section("Compte Spotify");
     label(g_spReady ? "Connecté" : "Non connecté");
@@ -2396,7 +2541,9 @@ bool app::tick() {
         if (g_sleepAt > 0 && now() >= g_sleepAt) { g_sleepAt = 0; pausePlayback(); g_status = "Minuterie : lecture arrêtée"; }
         if (g_webOk && g_set.source != 2 && !g_wvStarted) startWebView();  // lecteur officiel seulement s'il sert
         if (g_wvStarted && g_set.source == 2) stopWebView();
-        for (auto& m : g_wvOut) plat::webPost(m);
+        if (g_set.apple && !g_amStarted) startApple();
+        if (g_amStarted && !g_set.apple) stopApple();
+        for (auto& [id, m] : g_wvOut) plat::webPost(id, m);
         g_wvOut.clear();
         if (g_has) plat::nowPlaying(g_cur.title, g_cur.artist, isPlaying());
         pick = g_pick; g_pick = 0;
@@ -2425,7 +2572,12 @@ void app::dropped(const std::vector<fs::path>& paths) {
     g_view = "local"; g_lyricsOpen = false;
 }
 
-void app::onWeb(const std::string& msg) { onPlayer(msg); }
+void app::onWeb(int id, const std::string& msg) {
+    json j = json::parse(msg, nullptr, false);
+    if (!j.is_object()) return;
+    std::lock_guard lk(g_mx);
+    if (id == 1) onApple(j); else onPlayer(j);
+}
 
 void app::media(int cmd) {
     std::lock_guard lk(g_mx);

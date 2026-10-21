@@ -41,10 +41,12 @@ void audioSeek(double s);
 void audioVolume(float v);
 void audioRate(float r);
 
-// lecteur Spotify officiel : page web invisible ; ses messages vont à app::onWeb
-void webStart(const std::string& html, float vol);
-void webStop();
-void webPost(const std::string& json);  // thread de la fenêtre
+// lecteurs officiels dans des pages web invisibles ; leurs messages vont à app::onWeb
+// id 0 = Spotify (page locale html), id 1 = Apple Music (url + script injecté dans la page)
+void webStart(int id, const std::string& html, const std::string& url, const std::string& inject, float vol);
+void webStop(int id);
+void webPost(int id, const std::string& json);  // thread de la fenêtre
+void webShow(int id, bool show);                // fenêtre visible (connexion au compte) ou cachée
 
 // images RGBA (côté le plus long = size) : http..., fichier, "thumb:<audio>", "icon:"
 bool decodeImage(const std::string& src, int size, std::vector<uint8_t>& px, int& w, int& h);
@@ -78,7 +80,7 @@ int timeoutMs(bool visible, bool front);  // délai avant la prochaine image, -1
 bool tick();      // travail de la boucle (lecture, fin de titre...) ; true si une boîte de dialogue a été ouverte
 void frame();     // construit l'interface (entre NewFrame et Render)
 void dropped(const std::vector<fs::path>& paths);
-void onWeb(const std::string& msg);
+void onWeb(int id, const std::string& msg);  // msg {"t":"hidden"} : l'utilisateur a fermé la fenêtre de connexion
 void media(int cmd);  // 1 lecture/pause, 2 suivant, 3 précédent
 bool caption(float x, float y, float w, float h);  // zone qui déplace la fenêtre
 bool mini();

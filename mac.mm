@@ -234,48 +234,107 @@ void plat::audioSeek(double s) { g_ended = false; onMain(^{ [g_player seekToTime
 void plat::audioVolume(float v) { g_vol = v; onMain(^{ g_player.volume = v; }); }
 void plat::audioRate(float r) { g_rate = r; onMain(^{ if (g_player.rate != 0) g_player.rate = r; }); }
 
-// ---------- lecteur Spotify officiel : Web Playback SDK dans un WKWebView ----------
+// ---------- lecteurs officiels (Spotify, Apple Music) : pages web dans des WKWebView ----------
 // shortcut: dépend du DRM du WKWebView ; s'il refuse, le lecteur signale une erreur et Glass joue via YouTube (mode Auto).
-@interface GlassWeb : NSObject <WKScriptMessageHandler>
+@interface GlassWeb : NSObject <WKScriptMessageHandler, WKUIDelegate, NSWindowDelegate>
+@property int webId;
+@property(strong) NSMutableArray<NSWindow*>* popups;  // fenêtres ouvertes par la page (connexion au compte Apple)
 @end
+
+static void hideWeb(NSWindow* w);
+
 @implementation GlassWeb
 - (void)userContentController:(WKUserContentController*)c didReceiveScriptMessage:(WKScriptMessage*)m {
-    if ([m.body isKindOfClass:[NSString class]]) { app::onWeb([(NSString*)m.body UTF8String]); plat::wake(); }
+    if ([m.body isKindOfClass:[NSString class]]) { app::onWeb(self.webId, [(NSString*)m.body UTF8String]); plat::wake(); }
+}
+- (WKWebView*)webView:(WKWebView*)wv createWebViewWithConfiguration:(WKWebViewConfiguration*)cfg forNavigationAction:(WKNavigationAction*)a windowFeatures:(WKWindowFeatures*)f {
+    NSWindow* w = [[NSWindow alloc] initWithContentRect:NSMakeRect(0, 0, 520, 680) styleMask:NSWindowStyleMaskTitled | NSWindowStyleMaskClosable | NSWindowStyleMaskResizable
+                                                backing:NSBackingStoreBuffered defer:NO];
+    w.releasedWhenClosed = NO;
+    WKWebView* pop = [[WKWebView alloc] initWithFrame:w.contentView.bounds configuration:cfg];
+    pop.customUserAgent = wv.customUserAgent;
+    pop.UIDelegate = self;
+    w.contentView = pop;
+    [w center];
+    [w makeKeyAndOrderFront:nil];
+    if (!self.popups) self.popups = [NSMutableArray new];
+    [self.popups addObject:w];
+    return pop;
+}
+- (void)webViewDidClose:(WKWebView*)wv {  // la page de connexion se ferme d'elle-même
+    for (NSWindow* w in [self.popups copy]) if (w.contentView == wv) { [w orderOut:nil]; [self.popups removeObject:w]; }
+}
+- (BOOL)windowShouldClose:(NSWindow*)w {  // fermer = recacher (le lecteur continue)
+    hideWeb(w);
+    app::onWeb(self.webId, "{\"t\":\"hidden\"}");
+    plat::wake();
+    return NO;
 }
 @end
 
-static WKWebView* g_web;
-static NSWindow* g_webWin;
-static GlassWeb* g_webHandler;
+struct Web { WKWebView* view; NSWindow* win; GlassWeb* handler; };
+static Web g_webs[2];
 
-void plat::webStart(const std::string& html, float vol) {
+static void hideWeb(NSWindow* w) {  // minuscule et quasi transparente : la page se croit affichée, on ne la voit pas
+    w.styleMask = NSWindowStyleMaskBorderless;
+    w.ignoresMouseEvents = YES;
+    w.alphaValue = 0.01;
+    [w setFrame:NSMakeRect(0, 0, 2, 2) display:NO];
+    [w orderBack:nil];
+}
+
+void plat::webShow(int id, bool show) {
+    NSWindow* w = g_webs[id].win;
+    if (!w) return;
+    if (!show) { hideWeb(w); return; }
+    w.styleMask = NSWindowStyleMaskTitled | NSWindowStyleMaskClosable | NSWindowStyleMaskResizable | NSWindowStyleMaskMiniaturizable;
+    w.title = id == 1 ? @"Apple Music - Glass" : @"Spotify - Glass";
+    w.ignoresMouseEvents = NO;
+    w.alphaValue = 1;
+    [w setFrame:NSMakeRect(0, 0, 1000, 760) display:YES];
+    [w center];
+    [NSApp activateIgnoringOtherApps:YES];  // l'utilisateur vient de cliquer « Connecter »
+    [w makeKeyAndOrderFront:nil];
+}
+
+void plat::webStart(int id, const std::string& html, const std::string& url, const std::string& inject, float vol) {
     WKWebViewConfiguration* cfg = [WKWebViewConfiguration new];
-    g_webHandler = [GlassWeb new];
-    [cfg.userContentController addScriptMessageHandler:g_webHandler name:@"glass"];
+    GlassWeb* h = [GlassWeb new];
+    h.webId = id;
+    [cfg.userContentController addScriptMessageHandler:h name:@"glass"];
+    if (!inject.empty())
+        [cfg.userContentController addUserScript:[[WKUserScript alloc] initWithSource:ns(inject) injectionTime:WKUserScriptInjectionTimeAtDocumentStart forMainFrameOnly:YES]];
     cfg.mediaTypesRequiringUserActionForPlayback = WKAudiovisualMediaTypeNone;
-    // Comme sur Windows, le lecteur ne joue que s'il est « affiché » : minuscule fenêtre quasi transparente, jamais au premier plan.
-    NSRect r = NSMakeRect(0, 0, 2, 2);
-    g_webWin = [[NSWindow alloc] initWithContentRect:r styleMask:NSWindowStyleMaskBorderless backing:NSBackingStoreBuffered defer:NO];
-    g_webWin.releasedWhenClosed = NO;
-    g_webWin.ignoresMouseEvents = YES;
-    g_webWin.alphaValue = 0.01;
-    g_webWin.excludedFromWindowsMenu = YES;
-    g_webWin.collectionBehavior = NSWindowCollectionBehaviorCanJoinAllSpaces | NSWindowCollectionBehaviorStationary | NSWindowCollectionBehaviorIgnoresCycle;
-    g_web = [[WKWebView alloc] initWithFrame:r configuration:cfg];
-    g_webWin.contentView = g_web;
-    [g_webWin orderBack:nil];
-    NSString* base = [NSString stringWithFormat:@"https://glass.player/player.html?v=%f", vol];  // volume dès le départ (lu par la page)
-    [g_web loadHTMLString:ns(html) baseURL:[NSURL URLWithString:base]];
+    cfg.websiteDataStore = [WKWebsiteDataStore defaultDataStore];  // garde la connexion d'un lancement à l'autre
+    NSWindow* w = [[NSWindow alloc] initWithContentRect:NSMakeRect(0, 0, 2, 2) styleMask:NSWindowStyleMaskBorderless backing:NSBackingStoreBuffered defer:NO];
+    w.releasedWhenClosed = NO;
+    w.excludedFromWindowsMenu = YES;
+    w.collectionBehavior = NSWindowCollectionBehaviorCanJoinAllSpaces | NSWindowCollectionBehaviorIgnoresCycle;
+    w.delegate = h;
+    WKWebView* v = [[WKWebView alloc] initWithFrame:NSMakeRect(0, 0, 2, 2) configuration:cfg];
+    v.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
+    v.UIDelegate = h;
+    // les sites (music.apple.com) n'acceptent que les vrais navigateurs : on se présente comme Safari
+    v.customUserAgent = @"Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.6 Safari/605.1.15";
+    w.contentView = v;
+    hideWeb(w);
+    g_webs[id] = {v, w, h};
+    if (!html.empty()) {
+        NSString* base = [NSString stringWithFormat:@"https://glass.player/player.html?v=%f", vol];  // volume dès le départ (lu par la page)
+        [v loadHTMLString:ns(html) baseURL:[NSURL URLWithString:base]];
+    } else [v loadRequest:[NSURLRequest requestWithURL:[NSURL URLWithString:ns(url)]]];
 }
 
-void plat::webStop() {
-    [g_web.configuration.userContentController removeScriptMessageHandlerForName:@"glass"];
-    [g_webWin close];
-    g_web = nil; g_webWin = nil; g_webHandler = nil;
+void plat::webStop(int id) {
+    Web& w = g_webs[id];
+    [w.view.configuration.userContentController removeScriptMessageHandlerForName:@"glass"];
+    w.win.delegate = nil;
+    [w.win close];
+    w = Web{nil, nil, nil};
 }
 
-void plat::webPost(const std::string& json) {
-    [g_web evaluateJavaScript:ns("window.glassIn && glassIn(" + json + ")") completionHandler:nil];
+void plat::webPost(int id, const std::string& json) {
+    [g_webs[id].view evaluateJavaScript:ns("window.glassIn && glassIn(" + json + ")") completionHandler:nil];
 }
 
 // ---------- images : ImageIO ----------

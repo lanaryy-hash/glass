@@ -34,10 +34,14 @@ UTILISER
     Ctrl+Q (file), Ctrl+M (mini-lecteur), touches multimedia.
 
 APPLE MUSIC
-  + > colle le lien d'une playlist ou d'un album Apple Music (Partager >
-  Copier le lien). Pas besoin de compte : Glass lit la liste des titres sur
-  la page publique et le son vient de YouTube (comme le mode YouTube).
-  Paroles, favoris, hors ligne : tout marche pareil.
+  - Avec ton compte (abonnement) : Reglages > Apple Music > Connecter.
+    La vraie page music.apple.com s'ouvre : connecte-toi, elle se cache
+    toute seule. Tes playlists apparaissent a gauche (APPLE MUSIC) et le son
+    vient du lecteur officiel d'Apple, cache dans Glass (comme Spotify).
+    Sans abonnement : extraits de 90 s.
+  - Sans compte : + > colle le lien d'une playlist ou d'un album Apple Music
+    (Partager > Copier le lien) ; le son vient alors de YouTube si tu n'es
+    pas connecte.
 
 TES MUSIQUES A TOI
   Glisse des fichiers ou dossiers dans la fenetre, ou "Mes musiques" >
