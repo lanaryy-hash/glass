@@ -48,6 +48,8 @@ struct Settings {
     float glass = 0.07f, dim = 0.45f, tintAmt = 0.15f, rounding = 20, textScale = 1, speed = 1, vol = 0.8f;
     bool mediaKeys = true, startup = false, animations = true, showAlbum = true, tray = false, topmost = false, lyricsCenter = false, stopAtEnd = false;
     bool accentAuto = false, autoLyrics = true;  // couleur prise sur la pochette ; paroles générées si introuvables
+    bool alignLyrics = true;                     // l'IA écoute le titre une fois pour caler les paroles trouvées sur le son
+    int seenVersion = 0;                         // dernière version dont les nouveautés ont été montrées
     bool apple = false;                          // compte Apple Music connecté (page music.apple.com lancée au démarrage)
     std::string logo;                            // image choisie comme logo de Glass ("" = logo d'origine)
     std::vector<std::string> pinned = {"glass:favoris", "spotify:collection", "local", "glass:recent"};  // en haut de la bibliothèque
@@ -123,6 +125,7 @@ static std::string g_lyrKey, g_lyrSrc;
 static std::vector<LyricLine> g_lyr;
 static bool g_lyrSynced = false;
 static int g_lyrState = 0;              // 0 rien, 1 chargement, 2 trouvées, 3 introuvables
+static bool g_lyrAlign = false;         // les paroles affichées viennent d'Internet, pas encore calées sur le son
 
 static double now() { return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count(); }
 static void wake() { plat::wake(); }
@@ -168,7 +171,7 @@ static void saveSettings() {
               {"glass", s.glass}, {"dim", s.dim}, {"tintAmt", s.tintAmt}, {"rounding", s.rounding}, {"textScale", s.textScale}, {"speed", s.speed}, {"vol", s.vol},
               {"mediaKeys", s.mediaKeys}, {"startup", s.startup}, {"animations", s.animations}, {"showAlbum", s.showAlbum}, {"tray", s.tray},
               {"topmost", s.topmost}, {"lyricsCenter", s.lyricsCenter}, {"stopAtEnd", s.stopAtEnd},
-              {"neon", s.neon}, {"accentAuto", s.accentAuto}, {"autoLyrics", s.autoLyrics}, {"particles", s.particles}, {"pinned", s.pinned}, {"apple", s.apple}, {"logo", s.logo}};
+              {"neon", s.neon}, {"accentAuto", s.accentAuto}, {"autoLyrics", s.autoLyrics}, {"particles", s.particles}, {"pinned", s.pinned}, {"apple", s.apple}, {"logo", s.logo}, {"alignLyrics", s.alignLyrics}, {"seenVersion", s.seenVersion}};
     std::ofstream((g_dir / "settings.json")) << j.dump(1);
 }
 static void loadSettings() {
@@ -181,7 +184,7 @@ static void loadSettings() {
     get("glass", s.glass); get("dim", s.dim); get("tintAmt", s.tintAmt); get("rounding", s.rounding); get("textScale", s.textScale); get("speed", s.speed); get("vol", s.vol);
     get("mediaKeys", s.mediaKeys); get("startup", s.startup); get("animations", s.animations); get("showAlbum", s.showAlbum); get("tray", s.tray);
     get("topmost", s.topmost); get("lyricsCenter", s.lyricsCenter); get("stopAtEnd", s.stopAtEnd);
-    get("neon", s.neon); get("accentAuto", s.accentAuto); get("autoLyrics", s.autoLyrics); get("particles", s.particles); get("pinned", s.pinned); get("apple", s.apple); get("logo", s.logo);
+    get("neon", s.neon); get("accentAuto", s.accentAuto); get("autoLyrics", s.autoLyrics); get("particles", s.particles); get("pinned", s.pinned); get("apple", s.apple); get("logo", s.logo); get("alignLyrics", s.alignLyrics); get("seenVersion", s.seenVersion);
     for (int i = 0; i < 3; i++) {
         if (j.contains("accentRGB") && j["accentRGB"].size() == 3) s.accent[i] = j["accentRGB"][i].get<float>();
         if (j.contains("tint") && j["tint"].size() == 3) s.tint[i] = j["tint"][i].get<float>();
@@ -513,6 +516,7 @@ static void onEngine(const std::string& line) try {
         g_lyrSynced = j.value("synced", false);
         g_lyrSrc = jstr(j, "src");
         g_lyrState = g_lyr.empty() ? 3 : 2;
+        g_lyrAlign = !g_lyr.empty() && g_lyrSrc.rfind("LRCLIB", 0) == 0;  // les paroles de Spotify sont déjà calées
     } else if (ev == "get") {
         std::string id = jstr(j, "id");
         json d = j.contains("data") ? j["data"] : json();  // copie : les champs absents deviennent null au lieu de planter
@@ -739,39 +743,31 @@ static std::string baseTitle(const std::string& t) {  // sans « - Slowed », «
     return out;
 }
 
-static void lyricsWeb(const Track& t) {
-    std::thread([t] {
-        auto get = [](const std::string& q) { return json::parse(plat::httpGet("https://lrclib.net/api/" + q), nullptr, false); };
-        std::string artist = firstArtist(t.artist), base = baseTitle(t.title);
-        json found = json::array();
-        json exact = get("get?artist_name=" + urlEnc(artist) + "&track_name=" + urlEnc(t.title) + "&duration=" + std::to_string(t.ms / 1000));
-        if (exact.is_object() && (exact["syncedLyrics"].is_string() || exact["plainLyrics"].is_string())) found.push_back(exact);
-        else for (const std::string& q : {"search?track_name=" + urlEnc(base) + "&artist_name=" + urlEnc(artist), "search?q=" + urlEnc(artist + " " + base)}) {
-            json r = get(q);
-            if (r.is_array() && !r.empty()) { found = r; break; }
-        }
-        // des paroles synchronisées d'abord ; version accélérée / ralentie : temps étirés selon la durée
-        const json* pick = nullptr;
-        for (auto& d : found) if (d.is_object() && !jstr(d, "syncedLyrics").empty()) { pick = &d; break; }
-        if (!pick) for (auto& d : found) if (d.is_object() && !jstr(d, "plainLyrics").empty()) { pick = &d; break; }
-        std::vector<LyricLine> lines;
-        bool synced = false;
-        std::string src = "LRCLIB";
-        if (pick) {
-            double dur = jnum(*pick, "duration") * 1000, scale = dur > 0 && t.ms > 0 && std::fabs(t.ms / dur - 1) > 0.04 ? t.ms / dur : 1;
-            if (scale != 1) { char b[64]; snprintf(b, sizeof b, "LRCLIB (version originale, tempo ajusté x%.2f)", scale); src = b; }
-            if (synced = !jstr(*pick, "syncedLyrics").empty(); synced) lines = parseLrc(jstr(*pick, "syncedLyrics"), scale, false);
-            else { std::istringstream ps(jstr(*pick, "plainLyrics")); for (std::string l; std::getline(ps, l);) lines.push_back({0, l}); }
-        }
-        std::lock_guard lk(g_mx);
-        if (g_lyrKey != t.uri) return;
-        g_lyr = std::move(lines); g_lyrSynced = synced; g_lyrSrc = src;
-        g_lyrState = g_lyr.empty() ? 3 : 2;
-        wake();
-    }).detach();
+// LRCLIB : paroles (synchronisées si possible) ; false si rien.
+static bool lrclib(const Track& t, std::vector<LyricLine>& lines, bool& synced, std::string& src) {
+    auto get = [](const std::string& q) { return json::parse(plat::httpGet("https://lrclib.net/api/" + q), nullptr, false); };
+    std::string artist = firstArtist(t.artist), base = baseTitle(t.title);
+    json found = json::array();
+    json exact = get("get?artist_name=" + urlEnc(artist) + "&track_name=" + urlEnc(t.title) + "&duration=" + std::to_string(t.ms / 1000));
+    if (exact.is_object() && (exact["syncedLyrics"].is_string() || exact["plainLyrics"].is_string())) found.push_back(exact);
+    else for (const std::string& q : {"search?track_name=" + urlEnc(base) + "&artist_name=" + urlEnc(artist), "search?q=" + urlEnc(artist + " " + base)}) {
+        json r = get(q);
+        if (r.is_array() && !r.empty()) { found = r; break; }
+    }
+    // des paroles synchronisées d'abord ; version accélérée / ralentie : temps étirés selon la durée
+    const json* pick = nullptr;
+    for (auto& d : found) if (d.is_object() && !jstr(d, "syncedLyrics").empty()) { pick = &d; break; }
+    if (!pick) for (auto& d : found) if (d.is_object() && !jstr(d, "plainLyrics").empty()) { pick = &d; break; }
+    lines.clear(); synced = false; src = "LRCLIB";
+    if (!pick) return false;
+    double dur = jnum(*pick, "duration") * 1000, scale = dur > 0 && t.ms > 0 && std::fabs(t.ms / dur - 1) > 0.04 ? t.ms / dur : 1;
+    if (scale != 1) { char b[64]; snprintf(b, sizeof b, "LRCLIB (version originale, tempo ajusté x%.2f)", scale); src = b; }
+    if (synced = !jstr(*pick, "syncedLyrics").empty(); synced) lines = parseLrc(jstr(*pick, "syncedLyrics"), scale, false);
+    else { std::istringstream ps(jstr(*pick, "plainLyrics")); for (std::string l; std::getline(ps, l);) if (!l.empty() && l != "\r") lines.push_back({0, l}); }
+    return !lines.empty();
 }
 
-// ---------- base de paroles partagée (GitHub) : les paroles écrites par l'IA servent à tout le monde ----------
+// ---------- base de paroles partagée (GitHub) : les paroles de l'IA (écrites ou calées sur le son) servent à tout le monde ----------
 // Lecture publique ; envoi seulement depuis un ordinateur où l'outil « gh » est connecté au compte du dépôt.
 static const char* kLyricsRepo = "lanaryy-hash/glass-lyrics";
 
@@ -797,106 +793,289 @@ static std::string base64(const std::string& in) {
 
 static std::set<std::string> g_shared;  // déjà envoyées pendant cette session
 
-static void shareLyrics(const Track& t, const std::string& lrc) {  // g_mx tenu
+static void shareLyrics(const Track& t, const std::string& lrc, bool replace = false) {  // g_mx tenu
     fs::path gh = plat::findTool("gh");
-    if (gh.empty() || !g_shared.insert(t.uri).second) return;
-    std::thread([gh, t, lrc] {  // échoue sans rien casser si le fichier existe déjà ou si gh n'a pas les droits
-        plat::run({ustr(gh), "api", "-X", "PUT", std::string("repos/") + kLyricsRepo + "/contents/" + sharedKey(t) + ".lrc",
-                   "-f", "message=Paroles : " + t.artist + " - " + t.title, "-f", "content=" + base64(lrc)}, 30000);
+    if (gh.empty() || (!g_shared.insert(t.uri).second && !replace)) return;
+    std::thread([gh, t, lrc, replace] {  // sans droits ou sans gh : rien ne se passe
+        std::string path = std::string("repos/") + kLyricsRepo + "/contents/" + sharedKey(t) + ".lrc";
+        std::vector<std::string> args = {ustr(gh), "api", "-X", "PUT", path, "-f", "message=Paroles : " + t.artist + " - " + t.title, "-f", "content=" + base64(lrc)};
+        if (replace) {  // remplacer une version moins bonne : GitHub demande l'empreinte du fichier actuel
+            json cur = json::parse(plat::httpGet(std::string("https://api.github.com/") + path), nullptr, false);
+            if (cur.is_object() && !jstr(cur, "sha").empty()) args.insert(args.end(), {"-f", "sha=" + jstr(cur, "sha")});
+        }
+        plat::run(args, 30000);
     }).detach();
 }
 
-static std::string lrcHeader(const Track& t) {
+static std::string lrcHeader(const Track& t, const char* by = "Glass (IA Whisper)") {
     char len[32]; snprintf(len, sizeof len, "%02d:%05.2f", t.ms / 60000, (t.ms % 60000) / 1000.0);
-    return "[ar: " + t.artist + "]\n[ti: " + t.title + "]\n[length: " + len + "]\n[by: Glass (IA Whisper)]\n";
+    return "[ar: " + t.artist + "]\n[ti: " + t.title + "]\n[length: " + len + "]\n[by: " + by + "]\n";
+}
+static std::string lrcText(const Track& t, const std::vector<LyricLine>& lines, const char* by) {
+    std::string text = lrcHeader(t, by);
+    for (auto& l : lines) { char ts[16]; snprintf(ts, sizeof ts, "[%02d:%05.2f]", l.t / 60000, (l.t % 60000) / 1000.0); text += std::string(ts) + " " + l.w + "\n"; }
+    return text;
+}
+static const char* lrcSource(const std::string& text) {
+    return text.find("IA calée") != std::string::npos ? "trouvées sur Internet, calées sur le son par l'IA" : "écrites par l'IA (Whisper)";
 }
 
-static std::set<std::string> g_noShared;  // titres absents de la base partagée (pas de nouvelle demande pendant la session)
+static std::string fetchShared(const Track& t) {  // "" si le titre n'est pas dans la base
+    std::string s = plat::httpGet(std::string("https://raw.githubusercontent.com/") + kLyricsRepo + "/main/" + sharedKey(t) + ".lrc");
+    return parseLrc(s, 1).size() >= 2 ? s : "";
+}
 
-static void generateLyrics(const Track& t, bool ai) {  // g_mx tenu
+static double lrcScale(const Track& t, const std::string& text) {  // paroles d'une autre version (durée différente) : temps étirés
+    int len = lrcLength(text);
+    return len > 0 && t.ms > 0 && std::fabs((double)t.ms / len - 1) > 0.04 ? (double)t.ms / len : 1;
+}
+
+
+static std::set<std::string> g_listened;  // titres déjà écoutés par l'IA pendant la session
+
+static bool useShared(const Track& t) {  // base partagée : true si trouvées (g_mx NON tenu)
+    std::string shared = fetchShared(t);
+    if (shared.empty()) return false;
+    std::ofstream(lyricsFile(t, ".lrc"), std::ios::binary) << shared;
+    std::lock_guard lk(g_mx);
+    g_shared.insert(t.uri);
+    if (g_lyrKey == t.uri) { loadLrcInto(lyricsFile(t, ".lrc"), lrcScale(t, shared), lrcSource(shared)); g_lyrAlign = false; }
+    wake();
+    return true;
+}
+
+// Paroles sur Internet sans le moteur Spotify (Apple Music, fichiers, Spotify non connecté) : base Glass, puis LRCLIB.
+static void findLyrics(const Track& t) {
+    std::thread([t] {
+        if (useShared(t)) return;
+        std::vector<LyricLine> lines;
+        bool synced;
+        std::string src;
+        lrclib(t, lines, synced, src);
+        std::lock_guard lk(g_mx);
+        if (g_lyrKey != t.uri) return;
+        g_lyr = std::move(lines); g_lyrSynced = synced; g_lyrSrc = src;
+        g_lyrState = g_lyr.empty() ? 3 : 2;
+        g_lyrAlign = !g_lyr.empty();
+        wake();
+    }).detach();
+}
+
+// ---------- l'IA écoute le titre en entier (whisper.cpp) ----------
+struct Word { std::string w; int t; };  // mot entendu et moment où il est chanté (ms)
+
+static std::string normWord(const std::string& s) {  // minuscules, sans accents ni ponctuation (latin, cyrillique...)
+    std::string o;
+    for (size_t i = 0; i < s.size();) {
+        unsigned char c = s[i];
+        uint32_t cp; int n;
+        if (c < 0x80) { cp = c; n = 1; } else if ((c >> 5) == 6) { cp = c & 31; n = 2; } else if ((c >> 4) == 14) { cp = c & 15; n = 3; } else { cp = c & 7; n = 4; }
+        for (int k = 1; k < n && i + k < s.size(); k++) cp = cp << 6 | (s[i + k] & 63);
+        i += n;
+        if (cp < 0x80) { if (isalnum((int)cp)) o += (char)tolower((int)cp); continue; }
+        if (cp >= 0xC0 && cp <= 0xFF && cp != 0xD7 && cp != 0xF7) {  // lettres accentuées -> sans accent
+            static const char* m = "aaaaaaaceeeeiiiidnooooo/ouuuuyts" "aaaaaaaceeeeiiiidnooooo/ouuuuyty";
+            char r = m[cp - 0xC0];
+            if (r != '/') o += r;
+            continue;
+        }
+        if (cp >= 0x410 && cp <= 0x42F) cp += 0x20; else if (cp >= 0x400 && cp <= 0x40F) cp += 0x50;  // cyrillique en minuscules
+        if (cp == 0x2019 || cp == 0x2018 || cp == 0x2026 || cp == 0xAB || cp == 0xBB || (cp >= 0x2010 && cp <= 0x2015)) continue;  // ponctuation
+        if (cp < 0x800) { o += (char)(0xC0 | cp >> 6); o += (char)(0x80 | (cp & 63)); }
+        else { o += (char)(0xE0 | cp >> 12); o += (char)(0x80 | (cp >> 6 & 63)); o += (char)(0x80 | (cp & 63)); }
+    }
+    return o;
+}
+
+static bool sameWord(const std::string& a, const std::string& b) {  // égaux, ou presque pour les mots longs (fautes de l'IA)
+    if (a == b) return true;
+    size_t n = std::min(a.size(), b.size());
+    if (n < 4 || std::max(a.size(), b.size()) - n > 2) return false;
+    std::vector<int> d(b.size() + 1);
+    for (size_t j = 0; j <= b.size(); j++) d[j] = (int)j;
+    for (size_t i = 1; i <= a.size(); i++) {
+        int prev = d[0]; d[0] = (int)i;
+        for (size_t j = 1; j <= b.size(); j++) { int cur = d[j]; d[j] = std::min({d[j] + 1, d[j - 1] + 1, prev + (a[i - 1] != b[j - 1])}); prev = cur; }
+    }
+    return d[b.size()] <= (n >= 8 ? 2 : 1);
+}
+
+// Cale chaque ligne des paroles sur le moment où l'IA a entendu ses mots ; ratio = part des mots retrouvés.
+static std::vector<LyricLine> alignLines(std::vector<LyricLine> ref, const std::vector<Word>& heard, double& ratio, bool timed) {
+    std::vector<std::pair<std::string, int>> rw;  // mot normalisé, ligne
+    std::vector<int> firstWord(ref.size());
+    for (size_t i = 0; i < ref.size(); i++) {
+        firstWord[i] = (int)rw.size();
+        std::istringstream ws(ref[i].w);
+        for (std::string w; ws >> w;) if (auto n = normWord(w); !n.empty()) rw.push_back({n, (int)i});
+    }
+    size_t n = rw.size(), m = heard.size();
+    ratio = 0;
+    if (!n || !m) return {};
+    std::vector<std::vector<int>> dp(n + 1, std::vector<int>(m + 1));  // plus longue suite de mots communs (en tolérant les fautes)
+    for (size_t i = 1; i <= n; i++)
+        for (size_t j = 1; j <= m; j++)
+            dp[i][j] = std::max({dp[i - 1][j], dp[i][j - 1], sameWord(rw[i - 1].first, heard[j - 1].w) ? dp[i - 1][j - 1] + 1 : 0});
+    std::vector<int> wordT(n, -1);
+    for (size_t i = n, j = m; i && j;) {
+        if (sameWord(rw[i - 1].first, heard[j - 1].w) && dp[i][j] == dp[i - 1][j - 1] + 1) { wordT[i - 1] = heard[j - 1].t; i--; j--; }
+        else if (dp[i - 1][j] >= dp[i][j - 1]) i--; else j--;
+    }
+    ratio = (double)dp[n][m] / n;
+    // début de chaque ligne : médiane de ce qu'indique chaque mot retrouvé (son moment, moins ~0,35 s par mot avant lui dans la ligne) ;
+    // un mot isolé mal reconnu (ex. pendant l'intro) ne déplace pas la ligne
+    std::vector<int> start(ref.size(), -1);
+    std::vector<std::vector<int>> est(ref.size());
+    for (size_t k = 0; k < n; k++)
+        if (wordT[k] >= 0) est[rw[k].second].push_back(std::max(0, wordT[k] - (int)(k - firstWord[rw[k].second]) * 350));
+    for (size_t i = 0; i < ref.size(); i++)
+        if (!est[i].empty()) { std::nth_element(est[i].begin(), est[i].begin() + est[i].size() / 2, est[i].end()); start[i] = est[i][est[i].size() / 2]; }
+    if (timed) {
+        // Paroles déjà minutées : l'IA situe mal chaque mot chanté, mais très bien l'ensemble. On garde les écarts entre lignes
+        // et on corrige seulement le décalage et la vitesse (autre version, intro plus longue...) : temps = a * temps + b.
+        std::vector<std::pair<double, double>> pts;
+        for (size_t i = 0; i < ref.size(); i++) if (est[i].size() >= 2) pts.push_back({(double)ref[i].t, (double)start[i]});
+        if (pts.size() < 6) { ratio = std::min(ratio, 0.2); return {}; }  // trop peu de repères : paroles laissées telles quelles
+        std::vector<double> slopes, offs;
+        for (size_t i = 0; i < pts.size(); i++)
+            for (size_t j = i + 1; j < pts.size(); j++)
+                if (pts[j].first - pts[i].first > 5000) slopes.push_back((pts[j].second - pts[i].second) / (pts[j].first - pts[i].first));
+        auto median = [](std::vector<double>& v) { std::nth_element(v.begin(), v.begin() + v.size() / 2, v.end()); return v[v.size() / 2]; };
+        double a = slopes.empty() ? 1 : std::clamp(median(slopes), 0.8, 1.25);
+        if (std::fabs(a - 1) < 0.02) a = 1;
+        for (auto& [rt, ht] : pts) offs.push_back(ht - a * rt);
+        double b = median(offs);
+        if (a == 1 && std::fabs(b) < 1000) b = 0;  // moins d'une seconde : c'est l'imprécision de l'IA, les paroles sont déjà bien calées
+        for (auto& l : ref) l.t = std::max(0, (int)(a * l.t + b));
+        return ref;
+    }
+    // lignes sans mot retrouvé : entre leurs voisines, selon le nombre de mots
+    for (size_t i = 0; i < ref.size(); i++) {
+        if (start[i] >= 0) continue;
+        int a = (int)i - 1, b = (int)i + 1;
+        while (a >= 0 && start[a] < 0) a--;
+        while (b < (int)ref.size() && start[b] < 0) b++;
+        if (a >= 0 && b < (int)ref.size()) {
+            double f = firstWord[b] > firstWord[a] ? double(firstWord[i] - firstWord[a]) / (firstWord[b] - firstWord[a]) : 0.5;
+            start[i] = start[a] + (int)((start[b] - start[a]) * std::clamp(f, 0.05, 0.95));
+        } else if (a >= 0) start[i] = start[a] + 2500 * ((int)i - a);
+        else if (b < (int)ref.size()) start[i] = std::max(0, start[b] - 2500 * (b - (int)i));
+        else start[i] = 0;
+    }
+    for (size_t i = 0; i < ref.size(); i++) ref[i].t = i ? std::max(start[i], ref[i - 1].t + 100) : start[i];
+    return ref;
+}
+
+static std::vector<LyricLine> wordsToLines(const std::vector<Word>& heard, const std::vector<std::string>& raw) {  // paroles écrites par l'IA
+    std::string lrc;
+    for (size_t i = 0; i < heard.size();) {
+        size_t j = i;
+        std::string line;
+        while (j < heard.size() && (j == i || (heard[j].t - heard[j - 1].t < 1200 && j - i < 9 && !strchr(".?!", raw[j - 1].back())))) line += (line.empty() ? "" : " ") + raw[j++];
+        char ts[16]; snprintf(ts, sizeof ts, "[%02d:%05.2f]", heard[i].t / 60000, (heard[i].t % 60000) / 1000.0);
+        lrc += std::string(ts) + " " + line + "\n";
+        i = j;
+    }
+    return parseLrc(lrc, 1);  // + filtre des inventions de l'IA
+}
+
+// Écoute le titre une fois : cale les paroles trouvées (ref) sur le son, ou les écrit si ref est vide ou n'est pas ce titre.
+static void listenLyrics(const Track& t, std::vector<LyricLine> ref, bool ai, bool fresh = false) {  // g_mx tenu ; fresh : réécouter même si la base Glass a déjà une version
     if (g_genRunning) return;
-    g_genRunning = true; g_lyrState = 4;
-    std::thread([t, ai] {
+    g_genRunning = true;
+    g_listened.insert(t.uri);
+    bool shown = !ref.empty();  // des paroles sont déjà à l'écran : on travaille sans les cacher
+    if (!shown && g_lyrKey == t.uri) g_lyrState = 4;
+    bool timed = g_lyrSynced && std::any_of(ref.begin(), ref.end(), [](const LyricLine& l) { return l.t > 0; });  // paroles déjà minutées
+    for (auto it = ref.begin(); it != ref.end();) if (it->w.empty() && !timed) it = ref.erase(it); else ++it;
+    std::thread([t, ref, ai, shown, fresh, timed] {
         fs::path wdir = g_dir / "whisper", model = wdir / "ggml-small-q5_1.bin";
         std::error_code ec;
         fs::create_directories(wdir, ec);
         fs::create_directories(g_dir / "lyrics", ec);
-        auto fail = [&](const std::string& msg) {
+        auto fail = [&](const std::string& msg, bool none) {
             std::lock_guard lk(g_mx);
             g_genRunning = false; g_status = msg;
-            if (g_lyrKey == t.uri) g_lyrState = 5;
+            if (!shown && g_lyrKey == t.uri) g_lyrState = 5;
+            if (none) std::ofstream{lyricsFile(t, ".none")};  // ne pas réessayer à chaque ouverture
             wake();
         };
         { std::lock_guard lk(g_mx); g_status = "Recherche dans la base de paroles Glass..."; } wake();
-        std::string shared = plat::httpGet(std::string("https://raw.githubusercontent.com/") + kLyricsRepo + "/main/" + sharedKey(t) + ".lrc");
-        if (parseLrc(shared, 1).size() >= 2) {  // déjà écrites par l'IA chez quelqu'un d'autre
-            int len = lrcLength(shared);
-            double scale = len > 0 && t.ms > 0 && std::fabs((double)t.ms / len - 1) > 0.04 ? (double)t.ms / len : 1;
-            std::ofstream(lyricsFile(t, ".lrc"), std::ios::binary) << shared;
-            std::lock_guard lk(g_mx);
-            g_genRunning = false; g_status = "Paroles trouvées dans la base Glass";
-            g_shared.insert(t.uri);
-            if (g_lyrKey == t.uri) loadLrcInto(lyricsFile(t, ".lrc"), scale, "base de paroles Glass (écrites par l'IA)");
-            wake();
-            return;
-        }
-        if (!ai) {  // pas d'IA automatique : on s'arrête là (bouton « Générer » dans la vue paroles)
-            std::lock_guard lk(g_mx);
-            g_genRunning = false; g_status.clear(); g_noShared.insert(t.uri);
-            if (g_lyrKey == t.uri) g_lyrState = 3;
-            wake();
-            return;
-        }
+        if (!fresh && useShared(t)) { std::lock_guard lk(g_mx); g_genRunning = false; g_status = "Paroles trouvées dans la base Glass"; wake(); return; }
+        if (!ai) { std::lock_guard lk(g_mx); g_genRunning = false; g_status.clear(); if (!shown && g_lyrKey == t.uri) g_lyrState = 3; wake(); return; }
 #ifdef _WIN32
         fs::path exe = wdir / "Release" / "whisper-cli.exe";
         if (!fileExists(exe)) {  // première fois : le programme (8 Mo) puis le modèle multilingue (190 Mo)
             fs::path zip = wdir / "whisper.zip";
-            if (!httpDownload("https://github.com/ggml-org/whisper.cpp/releases/download/b5454/whisper-bin-x64.zip", zip, "Générateur de paroles")) return fail("Téléchargement du générateur impossible");
+            if (!httpDownload("https://github.com/ggml-org/whisper.cpp/releases/download/b5454/whisper-bin-x64.zip", zip, "IA des paroles")) return fail("Téléchargement de l'IA des paroles impossible", false);
             plat::run({"tar.exe", "-xf", ustr(zip), "-C", ustr(wdir)}, 60000);
             fs::remove(zip, ec);
-            if (!fileExists(exe)) return fail("Générateur de paroles : installation impossible");
+            if (!fileExists(exe)) return fail("IA des paroles : installation impossible", false);
         }
 #else
         fs::path exe = plat::findTool("whisper-cli");  // fourni avec Glass.app
-        if (exe.empty()) return fail("Générateur de paroles absent de Glass.app");
+        if (exe.empty()) return fail("IA des paroles absente de Glass.app", false);
 #endif
-        if (!fileExists(model) && !httpDownload("https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-small-q5_1.bin", model, "Modèle de paroles (190 Mo, une seule fois)"))
-            return fail("Téléchargement du modèle impossible");
-        { std::lock_guard lk(g_mx); g_status = "Écoute du titre pour écrire les paroles..."; } wake();
-        fs::path audio = t.local ? upath(t.uri) : ytDownload(t);  // le son du lecteur Spotify est protégé : on prend la copie YouTube
-        if (audio.empty()) return fail("Paroles : audio introuvable");
-        fs::path wav = g_dir / "lyrics" / "tmp.wav", out = lyricsFile(t, ""), lrc = lyricsFile(t, ".lrc"), none = lyricsFile(t, ".none");
+        if (!fileExists(model) && !httpDownload("https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-small-q5_1.bin", model, "Modèle de l'IA des paroles (190 Mo, une seule fois)"))
+            return fail("Téléchargement du modèle impossible", false);
+        { std::lock_guard lk(g_mx); g_status = shown ? "L'IA écoute le titre pour caler les paroles..." : "L'IA écoute le titre pour écrire les paroles..."; } wake();
+        fs::path audio = t.local ? upath(t.uri) : ytDownload(t);  // le son des lecteurs officiels est protégé : on prend la copie YouTube
+        if (audio.empty()) return fail("Paroles : audio introuvable", false);
+        fs::path wav = g_dir / "lyrics" / "tmp.wav", out = lyricsFile(t, ""), js = lyricsFile(t, ".json"), lrc = lyricsFile(t, ".lrc");
 #ifdef _WIN32
         if (!plat::run({"ffmpeg.exe", "-loglevel", "error", "-y", "-i", ustr(audio), "-ar", "16000", "-ac", "1", "-c:a", "pcm_s16le", ustr(wav)}, 120000))
-            return fail("Paroles : ffmpeg introuvable (winget install ffmpeg)");
+            return fail("Paroles : ffmpeg introuvable (winget install ffmpeg)", false);
 #else
         if (!plat::run({"/usr/bin/afconvert", "-f", "WAVE", "-d", "LEI16@16000", "-c", "1", ustr(audio), ustr(wav)}, 120000))
-            return fail("Paroles : conversion de l'audio impossible");
+            return fail("Paroles : conversion de l'audio impossible", false);
 #endif
         auto bytes = fs::file_size(wav, ec);
         double wavMs = ec || bytes < 44 ? 0 : (bytes - 44) / 32.0;  // 16 kHz, 16 bits, mono
-        if (t.ms > 0 && wavMs > 0 && std::fabs(t.ms / wavMs - 1) > 0.25) {  // autre morceau (remix, version longue...) : paroles fausses
+        if (t.ms > 0 && wavMs > 0 && std::fabs(t.ms / wavMs - 1) > 0.25) {  // autre morceau (remix, version longue...) : rien de fiable
             fs::remove(wav, ec);
-            std::ofstream{none};  // ne pas réessayer à chaque ouverture
-            return fail("Paroles : la copie YouTube n'est pas la même version, rien de fiable");
+            return fail("Paroles : la copie YouTube n'est pas la même version", !shown);
         }
+        // mot par mot, avec les paroles trouvées comme indice (l'IA reconnaît bien mieux des mots qu'elle attend)
         int threads = std::max(2, (int)std::thread::hardware_concurrency() / 2);  // la moitié du processeur, priorité basse
-        bool ok = plat::run({ustr(exe), "-m", ustr(model), "-f", ustr(wav), "-l", "auto", "-t", std::to_string(threads), "-olrc", "-of", ustr(out), "-np", "-sns"}, 600000);
+        std::vector<std::string> args = {ustr(exe), "-m", ustr(model), "-f", ustr(wav), "-l", "auto", "-t", std::to_string(threads),
+                                         "-oj", "-of", ustr(out), "-ml", "1", "-sow", "-np", "-sns"};
+        std::string prompt;
+        for (auto& l : ref) { if (prompt.size() > 600) break; prompt += l.w + " "; }
+        if (!prompt.empty()) args.insert(args.end(), {"--prompt", prompt});
+        bool ok = plat::run(args, 600000);
         fs::remove(wav, ec);
-        if (!ok || !fileExists(lrc)) return fail("Paroles : la génération a échoué");
-        double scale = t.ms > 0 && wavMs > 0 && std::fabs(t.ms / wavMs - 1) > 0.04 ? t.ms / wavMs : 1;  // version YouTube d'une autre durée
-        std::lock_guard lk(g_mx);
-        auto lines = cleanLrc(lrc, scale);
-        if (lines.size() < 2) fs::rename(lrc, none, ec);
-        else {  // on garde la version propre et déjà recalée, et on la partage
-            std::string text = lrcHeader(t);
-            for (auto& l : lines) { char ts[16]; snprintf(ts, sizeof ts, "[%02d:%05.2f]", l.t / 60000, (l.t % 60000) / 1000.0); text += std::string(ts) + " " + l.w + "\n"; }
-            std::ofstream(lrc, std::ios::binary) << text;
-            shareLyrics(t, text);
+        json r = json::parse(readFile(js), nullptr, false);
+        fs::remove(js, ec);
+        if (!ok || !r.is_object() || !r["transcription"].is_array()) return fail("Paroles : l'IA n'a pas pu écouter le titre", false);
+        double scale = t.ms > 0 && wavMs > 0 && std::fabs(t.ms / wavMs - 1) > 0.04 ? t.ms / wavMs : 1;  // copie YouTube d'une autre durée
+        std::vector<Word> heard;
+        std::vector<std::string> raw;
+        for (auto& seg : r["transcription"]) {
+            std::string text = jstr(seg, "text");
+            int t0 = (int)(jnum(seg["offsets"], "from") * scale);
+            std::istringstream ws(text);
+            for (std::string w; ws >> w;) {
+                if (w[0] == '[' || w[0] == '(' || w.find("♪") != std::string::npos) continue;
+                if (auto n = normWord(w); !n.empty()) { heard.push_back({n, t0}); raw.push_back(w); }
+            }
         }
-        g_genRunning = false;
-        g_status = lines.size() < 2 ? "Paroles : voix trop couverte par la musique, rien de fiable" : "Paroles générées";
-        if (g_lyrKey == t.uri) { if (lines.size() >= 2) loadLrcInto(lrc, 1); else g_lyrState = 5; }
+        double ratio = 0;
+        std::vector<LyricLine> lines = ref.empty() ? std::vector<LyricLine>() : alignLines(ref, heard, ratio, timed);
+        const char* by = "Glass (IA calée sur le son)";
+        std::string msg = "Paroles calées sur le son par l'IA";
+        if (!ref.empty() && ratio < 0.3) {
+            if (ratio >= 0.12) return fail("L'IA n'a pas assez reconnu les mots : paroles laissées telles quelles", false);
+            lines.clear();  // presque rien en commun : les paroles trouvées ne sont pas celles de ce titre
+            msg = "Les paroles trouvées n'étaient pas celles de ce titre : écrites par l'IA";
+        }
+        if (lines.empty()) { lines = wordsToLines(heard, raw); by = "Glass (IA Whisper)"; if (ref.empty()) msg = "Paroles écrites par l'IA"; }
+        if (lines.size() < 2) return fail("Paroles : voix trop couverte par la musique, rien de fiable", !shown);
+        std::string text = lrcText(t, lines, by);
+        std::ofstream(lrc, std::ios::binary) << text;
+        std::lock_guard lk(g_mx);
+        g_genRunning = false; g_status = msg;
+        shareLyrics(t, text, true);
+        if (g_lyrKey == t.uri) { loadLrcInto(lrc, 1, lrcSource(text)); g_lyrAlign = false; }
         wake();
     }).detach();
 }
@@ -1696,7 +1875,34 @@ static void applyLogo() {  // icône de la fenêtre / barre des tâches / Dock
 }
 
 // ---------- mise à jour automatique (versions publiées sur GitHub) ----------
-struct Update { int version = 0; std::string url; bool busy = false; };
+struct Update { int version = 0; std::string url, notes; bool busy = false; };
+static std::string g_newsText;  // « Nouveautés » à afficher (fenêtre)
+static int g_newsVersion = 0;
+static bool g_openNews = false, g_openUpdate = false;
+
+static std::string cleanNotes(const std::string& body) {  // texte de la version GitHub, sans les lignes techniques
+    std::istringstream in(body);
+    std::string out;
+    for (std::string l; std::getline(in, l);) {
+        if (!l.empty() && l.back() == '\r') l.pop_back();
+        if (l.find("Co-Authored-By") != std::string::npos) continue;
+        out += l + "\n";
+    }
+    while (!out.empty() && (out.back() == '\n' || out.back() == ' ')) out.pop_back();
+    return out;
+}
+
+static void showNews(int version) {  // g_mx tenu : nouveautés d'une version publiée
+    if (version <= 0) return;
+    std::thread([version] {
+        json r = json::parse(plat::httpGet(std::string("https://api.github.com/repos/") + kRepo + "/releases/tags/v" + std::to_string(version)), nullptr, false);
+        std::string notes = r.is_object() ? cleanNotes(jstr(r, "body")) : "";
+        std::lock_guard lk(g_mx);
+        g_newsText = notes;
+        g_newsVersion = version; g_openNews = true;
+        wake();
+    }).detach();
+}
 static Update g_update;
 static ImVec4 g_updRect;      // bouton « Mise à jour disponible » (la barre de titre ne doit pas le prendre pour une poignée)
 static double g_updT = -1e9;  // dernière vérification
@@ -1716,7 +1922,7 @@ static void checkUpdate(bool manual = false) {  // g_mx tenu
 #endif
         std::lock_guard lk(g_mx);
         if (v > GLASS_VERSION && r.is_object() && r["assets"].is_array())
-            for (auto& a : r["assets"]) if (jstr(a, "name") == want) { g_update.version = v; g_update.url = jstr(a, "browser_download_url"); }
+            for (auto& a : r["assets"]) if (jstr(a, "name") == want) { g_update.version = v; g_update.url = jstr(a, "browser_download_url"); g_update.notes = cleanNotes(jstr(r, "body")); }
         if (manual) {
             g_updMsg = v <= 0 ? "Impossible de vérifier (pas d'internet ?)"
                      : g_update.version > GLASS_VERSION ? "Version " + std::to_string(g_update.version) + " disponible !"
@@ -1765,13 +1971,13 @@ static void titleBar(ImGuiViewport* vp, float tb) {
     float bw = 46 * S;
     g_updRect = {};
     if (g_update.version > GLASS_VERSION) {  // une nouvelle version est publiée : un clic l'installe
-        const char* txt = g_update.busy ? "Mise à jour en cours..." : "Mise à jour disponible";
+        const char* txt = g_update.busy ? "Updating..." : "Update available";
         float w = ImGui::CalcTextSize(txt).x + 28 * S, h = 26 * S;
         ImVec2 p = o + ImVec2{vp->Size.x - bw * nb - w - 12 * S, (tb - h) * 0.5f};
         ImGui::SetCursorScreenPos(p);
-        if (ImGui::InvisibleButton("##upd", {w, h}) && !g_update.busy) installUpdate();
+        if (ImGui::InvisibleButton("##upd", {w, h}) && !g_update.busy) g_openUpdate = true;
         bool hov = ImGui::IsItemHovered();
-        ImGui::SetItemTooltip("Version %d disponible (tu as la %d) : clique pour l'installer, Glass redémarre tout seul", g_update.version, GLASS_VERSION);
+        ImGui::SetItemTooltip("Glass %d is out (you have %d) - click to see what's new", g_update.version, GLASS_VERSION);
         if (g_set.neon > 0) glow(dl, p + ImVec2{w, h} * 0.5f, w * 0.6f, acc(), 0.3f * g_set.neon);
         dl->AddRectFilled(p, p + ImVec2{w, h}, ImGui::GetColorU32(ImVec4{acc().x, acc().y, acc().z, hov ? 1.f : 0.8f}), h * 0.5f);
         dl->AddText(p + ImVec2{14 * S, (h - ImGui::GetFontSize()) * 0.5f}, col(0, 0, 0, 0.85f), txt);
@@ -1932,18 +2138,22 @@ static std::map<std::string, int> g_lyrOff;  // décalage des paroles par titre 
 static void ensureLyrics(const Track& t) {
     if (g_lyrKey != t.uri) {
         g_lyrKey = t.uri; g_lyr.clear(); g_lyrState = 1;
-        if (fileExists(lyricsFile(t, ".lrc"))) {  // déjà écrites (IA ou base partagée) : on les partage si ce n'est pas fait
-            loadLrcInto(lyricsFile(t, ".lrc"), 1);
+        g_lyrAlign = false;
+        if (fileExists(lyricsFile(t, ".lrc"))) {  // déjà écrites ou calées par l'IA : on les partage si ce n'est pas fait
             std::string text = readFile(lyricsFile(t, ".lrc"));
+            loadLrcInto(lyricsFile(t, ".lrc"), 1, lrcSource(text));
             if (text.find("[ar:") == std::string::npos) text = lrcHeader(t) + text;  // anciennes paroles sans en-tête
             if (g_lyrState == 2) shareLyrics(t, text);
         }
         else if (t.uri.rfind("spotify:", 0) == 0 && g_spReady)  // Spotify d'abord, puis LRCLIB
             send({{"cmd", "lyrics"}, {"key", t.uri}, {"uri", t.uri}, {"title", t.title}, {"artist", t.artist}, {"ms", t.ms}});
-        else lyricsWeb(t);  // Apple Music, fichiers, Spotify non connecté : directement sur LRCLIB
+        else findLyrics(t);  // Apple Music, fichiers, Spotify non connecté : base Glass puis LRCLIB
     }
-    // rien sur Internet : base de paroles Glass, puis l'IA (si activée)
-    if (g_lyrState == 3 && !g_genRunning && !fileExists(lyricsFile(t, ".none")) && !g_noShared.count(t.uri)) generateLyrics(t, g_set.autoLyrics);
+    if (g_genRunning || g_listened.count(t.uri)) return;
+    // trouvées sur Internet : l'IA écoute le titre une fois pour les caler sur le vrai son (base Glass d'abord)
+    if (g_lyrState == 2 && g_lyrAlign && g_set.alignLyrics) listenLyrics(t, g_lyr, true);
+    // rien trouvé : base Glass, puis l'IA les écrit (si activé)
+    else if (g_lyrState == 3 && !fileExists(lyricsFile(t, ".none"))) listenLyrics(t, {}, g_set.autoLyrics);
 }
 
 static void lyricsView() {
@@ -1966,10 +2176,10 @@ static void lyricsView() {
         if ((g_lyrState == 3 || g_lyrState == 5) && !g_genRunning) {
             float bw = 300 * S;
             ImGui::SetCursorPosX(ImGui::GetCursorPosX() + (ImGui::GetContentRegionAvail().x - bw) * 0.5f);
-            if (ImGui::Button(g_lyrState == 5 ? "Réessayer la génération" : "Générer les paroles avec l'IA", {bw, 0})) {
+            if (ImGui::Button(g_lyrState == 5 ? "Réessayer avec l'IA" : "Écrire les paroles avec l'IA", {bw, 0})) {
                 std::error_code ec;
                 fs::remove(lyricsFile(*t, ".none"), ec);
-                generateLyrics(*t, true);
+                listenLyrics(*t, {}, true);
             }
             centerText("Sur ton PC, ~10 s par titre. 1re fois : téléchargement de ~200 Mo.", ImGui::GetFont(), 14, col(1, 1, 1, 0.4f));
         }
@@ -1981,7 +2191,7 @@ static void lyricsView() {
     int curLine = -1;
     if (g_lyrSynced) for (int i = 0; i < (int)g_lyr.size(); i++) if (g_lyr[i].t <= pos + 120) curLine = i;
     if (g_lyrSynced) {  // petite barre : décalage
-        ImGui::SetCursorPos({ImGui::GetWindowContentRegionMax().x - 230 * S, ImGui::GetCursorPosY() - 64 * S});
+        ImGui::SetCursorPos({ImGui::GetWindowContentRegionMax().x - 330 * S, ImGui::GetCursorPosY() - 64 * S});
         ImGui::TextDisabled("Décalage %+.1f s", off / 1000.0);
         ImGui::SameLine();
         if (ImGui::SmallButton(" - ")) off -= 250;
@@ -1991,6 +2201,10 @@ static void lyricsView() {
         ImGui::SetItemTooltip("Paroles en retard : les avancer");
         ImGui::SameLine();
         if (off && ImGui::SmallButton("0")) off = 0;
+        ImGui::SameLine();
+        if (g_genRunning) ImGui::TextDisabled("l'IA écoute...");
+        else if (ImGui::SmallButton("Recaler (IA)")) { g_listened.erase(t->uri); listenLyrics(*t, g_lyr, true, true); }
+        ImGui::SetItemTooltip("L'IA écoute le titre en entier et cale chaque ligne sur le moment où elle est chantée");
         ImGui::Dummy({0, 34 * S});
     }
     ImGui::BeginChild("lyr", {0, 0}, 0, ImGuiWindowFlags_NoBackground | ImGuiWindowFlags_NoScrollbar);
@@ -2223,7 +2437,10 @@ static void settingsView() {
     changed |= ImGui::SliderInt("##ly", &g_set.lyricsSize, 18, 48);
     label("Paroles centrées");
     changed |= ImGui::Checkbox("##lyc", &g_set.lyricsCenter);
-    label("Générer les paroles manquantes (IA)");
+    label("Caler les paroles sur le son (IA)");
+    changed |= ImGui::Checkbox("##alg", &g_set.alignLyrics);
+    ImGui::SameLine(); ImGui::TextDisabled("(l'IA écoute chaque titre une fois quand tu ouvres ses paroles)");
+    label("Écrire les paroles manquantes (IA)");
     changed |= ImGui::Checkbox("##alyr", &g_set.autoLyrics);
     ImGui::SameLine(); ImGui::TextDisabled("(seulement quand tu ouvres les paroles d'un titre qui n'en a pas)");
 
@@ -2286,8 +2503,9 @@ static void settingsView() {
     else ImGui::Text("%d", GLASS_VERSION);
     ImGui::SameLine();
     if (g_update.version > GLASS_VERSION) {
-        if (ImGui::Button(g_update.busy ? "Installation..." : "Installer la mise à jour") && !g_update.busy) installUpdate();
+        if (ImGui::Button(g_update.busy ? "Installation..." : "Voir et installer la mise à jour") && !g_update.busy) g_openUpdate = true;
     } else if (ImGui::Button("Rechercher une mise à jour")) { g_updT = now(); checkUpdate(true); }
+    if (GLASS_VERSION > 0) { ImGui::SameLine(); if (ImGui::Button("Nouveautés de cette version")) showNews(GLASS_VERSION); }
     if (!g_updMsg.empty()) { ImGui::SameLine(); ImGui::TextDisabled("%s", g_updMsg.c_str()); }
     label("Dossier de Glass");
     if (ImGui::Button("Ouvrir")) plat::openUrl(ustr(g_dir));
@@ -2700,7 +2918,7 @@ static void playerBar() {
         if (ImGui::SliderFloat("##spd2", &g_set.speed, 0.5f, 2.0f, "x%.2f")) { plat::audioRate(g_set.speed); saveSettings(); }
         ImGui::Separator();
         if (ImGui::MenuItem("Mini-lecteur", "Ctrl+M")) toggleMini();
-        if (g_update.version > GLASS_VERSION) { if (ImGui::MenuItem("Installer la mise à jour")) installUpdate(); }
+        if (g_update.version > GLASS_VERSION) { if (ImGui::MenuItem("Mise à jour disponible...")) g_openUpdate = true; }
         else if (ImGui::MenuItem("Rechercher une mise à jour")) { g_updT = now(); checkUpdate(true); }
         ImGui::EndPopup();
     }
@@ -2804,11 +3022,94 @@ static void miniPlayer(ImGuiViewport* vp) {  // fenêtre compacte, toujours au p
     }
 }
 
+// Notes de version (texte des versions GitHub) : 1re ligne = titre, « ## New / Improved / Fixed » = sections, « - » = puces.
+static void notesText(const std::string& notes) {
+    std::istringstream in(notes);
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    bool first = true;
+    for (std::string l; std::getline(in, l);) {
+        if (l.empty()) continue;
+        if (first) { first = false; ImGui::PushFont(g_bold, 17); ImGui::TextWrapped("%s", l.c_str()); ImGui::PopFont(); ImGui::Spacing(); continue; }
+        if (l.rfind("## ", 0) == 0) {  // section : pastille colorée
+            std::string name = l.substr(3);
+            ImVec4 c = name == "Fixed" ? ImVec4{1.f, 0.55f, 0.35f, 1} : name == "Improved" ? ImVec4{0.35f, 0.75f, 1.f, 1} : acc();
+            ImGui::Dummy({0, 6 * S});
+            ImVec2 p = ImGui::GetCursorScreenPos(), ts = g_bold->CalcTextSizeA(12 * S, FLT_MAX, 0, name.c_str());
+            dl->AddRectFilled(p, p + ImVec2{ts.x + 20 * S, 22 * S}, ImGui::GetColorU32(ImVec4{c.x, c.y, c.z, 0.22f}), 11 * S);
+            dl->AddText(g_bold, 12 * S, p + ImVec2{10 * S, 11 * S - ts.y * 0.5f}, ImGui::GetColorU32(c), name.c_str());
+            ImGui::Dummy({ts.x + 20 * S, 26 * S});
+            continue;
+        }
+        bool bullet = l.rfind("- ", 0) == 0 || l.rfind("* ", 0) == 0;
+        ImVec2 p = ImGui::GetCursorScreenPos();
+        if (bullet) dl->AddCircleFilled(p + ImVec2{6 * S, ImGui::GetTextLineHeight() * 0.5f + 1 * S}, 3 * S, accU());
+        ImGui::Indent(18 * S);
+        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4{1, 1, 1, bullet ? 0.88f : 0.7f});
+        ImGui::TextWrapped("%s", l.c_str() + (bullet ? 2 : 0));
+        ImGui::PopStyleColor();
+        ImGui::Unindent(18 * S);
+        ImGui::Dummy({0, 2 * S});
+    }
+}
+
+// Fenêtre des nouveautés / de la mise à jour : bandeau aux couleurs du thème, notes, bouton principal.
+static bool newsWindow(const char* id, const char* heading, const std::string& sub, const std::string& notes, const char* primary, const char* secondary, bool& primaryClicked) {
+    primaryClicked = false;
+    ImGui::SetNextWindowSize({560 * S, 0});
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, {0, 0});
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 18 * S);
+    bool open = ImGui::BeginPopupModal(id, nullptr, ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove);
+    ImGui::PopStyleVar(2);
+    if (!open) return false;
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    ImVec2 p = ImGui::GetWindowPos(), sz = ImGui::GetWindowSize();
+    float hh = 96 * S;
+    ImVec4 a = acc();
+    // bandeau : dégradé de l'accent, halo, logo
+    dl->AddRectFilled(p, p + ImVec2{sz.x, hh}, ImGui::GetColorU32(ImVec4{a.x * 0.35f, a.y * 0.35f, a.z * 0.35f, 1}), 18 * S, ImDrawFlags_RoundCornersTop);
+    dl->PushClipRect(p, p + ImVec2{sz.x, hh}, true);
+    glow(dl, p + ImVec2{sz.x * 0.85f, hh * 0.2f}, hh * 1.6f, a, 0.55f);
+    glow(dl, p + ImVec2{sz.x * 0.15f, hh}, hh * 1.2f, ImVec4{0.55f, 0.3f, 1.f, 1}, 0.35f);
+    dl->PopClipRect();
+    if (ImTextureID logo = tex(logoSrc(), 64)) dl->AddImageRounded(logo, p + ImVec2{24 * S, hh * 0.5f - 24 * S}, p + ImVec2{72 * S, hh * 0.5f + 24 * S}, {0, 0}, {1, 1}, IM_COL32_WHITE, 12 * S);
+    dl->AddText(g_bold, 24 * S, p + ImVec2{88 * S, hh * 0.5f - 26 * S}, IM_COL32_WHITE, heading);
+    dl->AddText(ImGui::GetFont(), 14 * S, p + ImVec2{88 * S, hh * 0.5f + 4 * S}, col(1, 1, 1, 0.7f), sub.c_str());
+    ImGui::Dummy({sz.x, hh + 14 * S});
+    // notes
+    ImGui::SetCursorPosX(24 * S);
+    ImGui::BeginChild("notes", {sz.x - 48 * S, std::min(340 * S, ImGui::GetTextLineHeightWithSpacing() * 15)}, 0, ImGuiWindowFlags_NoBackground);
+    notesText(notes.empty() ? "No release notes for this version." : notes);
+    ImGui::EndChild();
+    // boutons
+    ImGui::Dummy({0, 10 * S});
+    float bw = 170 * S, sw = secondary ? 110 * S : 0, x = sz.x - 24 * S - bw - (secondary ? sw + 10 * S : 0);
+    ImGui::SetCursorPosX(x);
+    if (secondary) { if (ImGui::Button(secondary, {sw, 38 * S})) ImGui::CloseCurrentPopup(); ImGui::SameLine(0, 10 * S); }
+    ImGui::PushStyleColor(ImGuiCol_Button, a);
+    ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4{std::min(1.f, a.x * 1.15f), std::min(1.f, a.y * 1.15f), std::min(1.f, a.z * 1.15f), 1});
+    ImGui::PushStyleColor(ImGuiCol_ButtonActive, scale(a, 0.85f));
+    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4{0, 0, 0, 0.9f});
+    ImGui::PushFont(g_bold, 15);
+    if (ImGui::Button(primary, {bw, 38 * S})) { primaryClicked = true; ImGui::CloseCurrentPopup(); }
+    ImGui::PopFont();
+    ImGui::PopStyleColor(4);
+    ImGui::Dummy({0, 14 * S});
+    ImGui::EndPopup();
+    return true;
+}
+
 // Fenêtres « Personnaliser » et « Nouvelle playlist ».
 static void dialogs() {
     static char name[128];
     if (g_openPerso) { ImGui::OpenPopup("Personnaliser"); g_openPerso = false; if (List* l = findList(g_editUri)) snprintf(name, sizeof name, "%s", l->name.c_str()); }
     if (g_openNew) { ImGui::OpenPopup("Nouvelle playlist"); g_openNew = false; snprintf(name, sizeof name, "Ma playlist"); }
+    if (g_openUpdate) { ImGui::OpenPopup("Mise à jour"); g_openUpdate = false; }
+    if (g_openNews) { ImGui::OpenPopup("Nouveautés"); g_openNews = false; }
+    bool go;
+    newsWindow("Mise à jour", "Update available", "Glass " + std::to_string(g_update.version) + " is ready (you have " + std::to_string(GLASS_VERSION) + "). Glass restarts by itself.",
+               g_update.notes, g_update.busy ? "Installing..." : "Install & restart", "Later", go);
+    if (go && !g_update.busy) installUpdate();
+    newsWindow("Nouveautés", "What's new in Glass", "Version " + std::to_string(g_newsVersion), g_newsText, "Got it", nullptr, go);
     ImGui::SetNextWindowSize({460 * S, 0});
     if (ImGui::BeginPopupModal("Personnaliser", nullptr, ImGuiWindowFlags_NoResize)) {
         List* l = findList(g_editUri);
@@ -2965,6 +3266,11 @@ void app::initUI() {
     plat::setMediaKeys(g_set.mediaKeys);
     setTopmost();
     if (!g_set.logo.empty()) applyLogo();
+    if (GLASS_VERSION > 0 && g_set.seenVersion != GLASS_VERSION) {  // nouvelle version installée : on montre ce qui a changé
+        if (g_set.seenVersion > 0) showNews(GLASS_VERSION);
+        g_set.seenVersion = GLASS_VERSION;
+        saveSettings();
+    }
 }
 
 int app::timeoutMs(bool visible, bool front) {

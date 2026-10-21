@@ -51,6 +51,10 @@ TES MUSIQUES A TOI
   "+ Fichiers" / "+ Dossier". Clic droit sur un titre > Retirer.
 
 PAROLES
+  Calage par l'IA : quand tu ouvres les paroles d'un titre, l'IA l'ecoute une
+  fois et cale les paroles trouvees sur le vrai son (decalage, autre version,
+  paroles sans minutage). Bouton "Recaler (IA)" dans la vue paroles.
+  Desactivable : Reglages > Affichage > Caler les paroles sur le son.
   Spotify d'abord (si connecte), sinon LRCLIB sur Internet (marche aussi pour
   Apple Music et tes fichiers). Puis la base de paroles Glass partagee
   (https://github.com/lanaryy-hash/glass-lyrics : les paroles ecrites par
