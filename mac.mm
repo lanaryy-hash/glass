@@ -22,6 +22,7 @@
 #include <sys/stat.h>
 #include <sys/wait.h>
 #include <unistd.h>
+#include <objc/message.h>
 #include <atomic>
 #include <chrono>
 #include <cmath>
@@ -113,7 +114,7 @@ fs::path plat::findTool(const char* name) {
     return {};
 }
 
-static pid_t spawn(const std::vector<std::string>& args, int in, int out) {
+static pid_t spawn(const std::vector<std::string>& args, int in, int out, bool track = true) {
     posix_spawn_file_actions_t fa;
     posix_spawn_file_actions_init(&fa);
     int devnull = open("/dev/null", O_RDWR);
@@ -131,7 +132,7 @@ static pid_t spawn(const std::vector<std::string>& args, int in, int out) {
     posix_spawn_file_actions_destroy(&fa);
     posix_spawnattr_destroy(&at);
     ::close(devnull);
-    if (pid > 0) { setpriority(PRIO_PROCESS, pid, 10); std::lock_guard lk(g_pidMx); g_pids.insert(pid); }
+    if (pid > 0 && track) { setpriority(PRIO_PROCESS, pid, 10); std::lock_guard lk(g_pidMx); g_pids.insert(pid); }
     return pid;
 }
 
@@ -305,6 +306,11 @@ void plat::webStart(int id, const std::string& html, const std::string& url, con
     if (!inject.empty())
         [cfg.userContentController addUserScript:[[WKUserScript alloc] initWithSource:ns(inject) injectionTime:WKUserScriptInjectionTimeAtDocumentStart forMainFrameOnly:YES]];
     cfg.mediaTypesRequiringUserActionForPlayback = WKAudiovisualMediaTypeNone;
+    // Sans elle, le site d'Apple ne donne que des extraits de 30 s ; réglages internes (non publics) : appelés seulement s'ils existent.
+    for (const char* sel : {"_setEncryptedMediaAPIEnabled:", "_setLegacyEncryptedMediaAPIEnabled:", "_setMediaSourceEnabled:"}) {
+        SEL s = sel_registerName(sel);
+        if ([cfg.preferences respondsToSelector:s]) ((void (*)(id, SEL, BOOL))objc_msgSend)(cfg.preferences, s, YES);
+    }
     cfg.websiteDataStore = [WKWebsiteDataStore defaultDataStore];  // garde la connexion d'un lancement à l'autre
     NSWindow* w = [[NSWindow alloc] initWithContentRect:NSMakeRect(0, 0, 2, 2) styleMask:NSWindowStyleMaskBorderless backing:NSBackingStoreBuffered defer:NO];
     w.releasedWhenClosed = NO;
@@ -444,7 +450,7 @@ std::vector<fs::path> plat::pick(int kind) {
     p.canChooseDirectories = kind == 2;
     p.allowsMultipleSelection = kind == 1;
     if (kind == 1) p.allowedContentTypes = @[UTTypeAudio];
-    if (kind == 3) p.allowedContentTypes = @[UTTypeImage];
+    if (kind >= 3) p.allowedContentTypes = @[UTTypeImage];
     std::vector<fs::path> out;
     if ([p runModal] == NSModalResponseOK)
         for (NSURL* u in p.URLs) out.push_back(u.path.UTF8String);
@@ -508,6 +514,41 @@ bool plat::wallpaperUV(ImVec2& uv0, ImVec2& uv1) {  // shortcut: écran principa
 void plat::openUrl(const std::string& s) {
     NSString* str = ns(s);
     [[NSWorkspace sharedWorkspace] openURL:[str hasPrefix:@"http"] ? [NSURL URLWithString:str] : [NSURL fileURLWithPath:str]];
+}
+
+void plat::setAppIcon(const uint8_t* px, int w, int h) {
+    if (!px) { NSApp.applicationIconImage = nil; return; }  // nil = icône de Glass.app
+    NSBitmapImageRep* rep = [[NSBitmapImageRep alloc] initWithBitmapDataPlanes:nullptr pixelsWide:w pixelsHigh:h bitsPerSample:8 samplesPerPixel:4 hasAlpha:YES
+                                                                      isPlanar:NO colorSpaceName:NSDeviceRGBColorSpace bitmapFormat:NSBitmapFormatAlphaNonpremultiplied
+                                                                   bytesPerRow:w * 4 bitsPerPixel:32];
+    memcpy(rep.bitmapData, px, (size_t)w * h * 4);
+    NSImage* img = [[NSImage alloc] initWithSize:NSMakeSize(w, h)];
+    [img addRepresentation:rep];
+    NSApp.applicationIconImage = img;
+}
+
+// Mise à jour : nouvelle Glass.app à côté de l'ancienne, « xattr -cr » fait pour toi (sinon le Mac la bloque), échange, relance.
+std::string plat::installUpdate(const fs::path& zip) {
+    fs::path app = [NSBundle mainBundle].bundlePath.UTF8String, tmp = app.parent_path() / "Glass-update";
+    std::error_code ec;
+    fs::remove_all(tmp, ec);
+    if (!plat::run({"/usr/bin/ditto", "-x", "-k", zip.string(), tmp.string()}, 120000)) return "impossible d'écrire dans " + app.parent_path().string();
+    fs::path fresh = tmp / "Glass.app", old = app;
+    old += ".old";
+    if (!fs::exists(fresh)) return "archive invalide";
+    plat::run({"/usr/bin/xattr", "-cr", fresh.string()}, 60000);
+    fs::remove_all(old, ec);
+    fs::rename(app, old, ec);
+    if (ec) return "remplacement impossible : " + ec.message();
+    fs::rename(fresh, app, ec);
+    if (ec) { std::error_code e2; fs::rename(old, app, e2); return "remplacement impossible : " + ec.message(); }
+    fs::remove_all(old, ec);
+    fs::remove_all(tmp, ec);
+    fs::remove(zip, ec);
+    spawn({"/bin/sh", "-c", "sleep 1.5; /usr/bin/open \"$0\"", app.string()}, -1, -1, false);  // relance quand celle-ci est fermée
+    glfwSetWindowShouldClose(g_win, GLFW_TRUE);
+    plat::wake();
+    return "";
 }
 
 void plat::setMediaKeys(bool on) {  // touches du clavier, AirPods, Centre de contrôle

@@ -6,6 +6,8 @@ else()
   project(Glass CXX RC)
 endif()
 set(CMAKE_CXX_STANDARD 17)
+set(GLASS_VERSION 0 CACHE STRING "numéro de version (donné par GitHub ; 0 = compilé sur ce PC, sans mise à jour automatique)")
+add_compile_definitions(GLASS_VERSION=${GLASS_VERSION})
 
 include(FetchContent)
 FetchContent_Declare(imgui GIT_REPOSITORY https://github.com/ocornut/imgui.git GIT_TAG v1.92.9b GIT_SHALLOW TRUE)

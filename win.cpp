@@ -515,13 +515,14 @@ void plat::setStartup(bool on) {
 
 // ---------- icône près de l'horloge (option « fermer = réduire ») ----------
 static NOTIFYICONDATAW g_nid{sizeof g_nid};
+static HICON g_customIcon;  // logo choisi dans les réglages
 static bool g_trayShown = false, g_quitting = false;
 
 static void showTray(bool on) {
     if (on == g_trayShown) return;
     g_nid.hWnd = g_hwnd; g_nid.uID = 1; g_nid.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP;
     g_nid.uCallbackMessage = WM_APP + 1;
-    g_nid.hIcon = LoadIconW(GetModuleHandleW(nullptr), MAKEINTRESOURCEW(1));
+    g_nid.hIcon = g_customIcon ? g_customIcon : LoadIconW(GetModuleHandleW(nullptr), MAKEINTRESOURCEW(1));
     if (!g_nid.hIcon) g_nid.hIcon = LoadIconW(nullptr, IDI_APPLICATION);
     wcscpy_s(g_nid.szTip, L"Glass");
     Shell_NotifyIconW(on ? NIM_ADD : NIM_DELETE, &g_nid);
@@ -532,6 +533,64 @@ void plat::nowPlaying(const std::string& title, const std::string& artist, bool)
     if (!g_trayShown || title.empty()) return;
     std::wstring tip = widen(title + " - " + artist).substr(0, 120);
     if (tip != g_nid.szTip) { wcscpy_s(g_nid.szTip, tip.c_str()); Shell_NotifyIconW(NIM_MODIFY, &g_nid); }
+}
+
+void plat::setAppIcon(const uint8_t* px, int w, int h) {
+    HINSTANCE inst = GetModuleHandleW(nullptr);
+    HICON big = nullptr, smallIco = nullptr;
+    if (px) {  // image RGBA -> icône 32 bits avec transparence
+        BITMAPV5HEADER bi{};
+        bi.bV5Size = sizeof bi; bi.bV5Width = w; bi.bV5Height = -h; bi.bV5Planes = 1; bi.bV5BitCount = 32; bi.bV5Compression = BI_BITFIELDS;
+        bi.bV5RedMask = 0x00FF0000; bi.bV5GreenMask = 0x0000FF00; bi.bV5BlueMask = 0x000000FF; bi.bV5AlphaMask = 0xFF000000;
+        void* bits = nullptr;
+        HDC dc = GetDC(nullptr);
+        HBITMAP color = CreateDIBSection(dc, (BITMAPINFO*)&bi, DIB_RGB_COLORS, &bits, nullptr, 0);
+        ReleaseDC(nullptr, dc);
+        if (color && bits) {
+            auto* d = (uint8_t*)bits;
+            for (int i = 0; i < w * h; i++) { d[i * 4] = px[i * 4 + 2]; d[i * 4 + 1] = px[i * 4 + 1]; d[i * 4 + 2] = px[i * 4]; d[i * 4 + 3] = px[i * 4 + 3]; }
+            HBITMAP mask = CreateBitmap(w, h, 1, 1, nullptr);
+            ICONINFO ii{TRUE, 0, 0, mask, color};
+            big = smallIco = CreateIconIndirect(&ii);
+            DeleteObject(mask);
+        }
+        if (color) DeleteObject(color);
+    }
+    if (!big) {  // logo d'origine
+        big = LoadIconW(inst, MAKEINTRESOURCEW(1));
+        smallIco = (HICON)LoadImageW(inst, MAKEINTRESOURCEW(1), IMAGE_ICON, GetSystemMetrics(SM_CXSMICON), GetSystemMetrics(SM_CYSMICON), 0);
+    }
+    SendMessageW(g_hwnd, WM_SETICON, ICON_BIG, (LPARAM)big);
+    SendMessageW(g_hwnd, WM_SETICON, ICON_SMALL, (LPARAM)smallIco);
+    HICON old = g_customIcon;
+    g_customIcon = px ? big : nullptr;
+    if (g_trayShown) { g_nid.hIcon = big; Shell_NotifyIconW(NIM_MODIFY, &g_nid); }
+    if (old) DestroyIcon(old);
+}
+
+// Mise à jour : les nouveaux fichiers remplacent les anciens (un programme lancé peut être renommé, pas écrasé), puis Glass se relance.
+std::string plat::installUpdate(const fs::path& zip) {
+    fs::path tmp = g_bin / "update";
+    std::error_code ec;
+    fs::remove_all(tmp, ec);
+    fs::create_directories(tmp, ec);
+    if (!plat::run({"tar.exe", "-xf", zip.u8string(), "-C", tmp.u8string()}, 120000)) return "décompression impossible";
+    if (!fs::exists(tmp / "Glass.exe")) return "archive invalide";
+    for (auto& e : fs::directory_iterator(tmp, ec)) {
+        fs::path dst = g_bin / e.path().filename(), old = dst;
+        old += ".old";
+        fs::remove(old, ec);
+        if (fs::exists(dst)) { fs::rename(dst, old, ec); if (ec) return "impossible de remplacer " + dst.filename().u8string(); }
+        fs::copy_file(e.path(), dst, fs::copy_options::overwrite_existing, ec);
+        if (ec) { fs::rename(old, dst, ec); return "impossible de copier " + dst.filename().u8string(); }
+    }
+    fs::remove_all(tmp, ec);
+    fs::remove(zip, ec);
+    std::wstring cmd = L"\"" + (g_bin / "Glass.exe").wstring() + L"\" --after-update";
+    STARTUPINFOW si{sizeof si}; PROCESS_INFORMATION pi{};
+    if (CreateProcessW(nullptr, cmd.data(), nullptr, nullptr, FALSE, 0, nullptr, g_bin.c_str(), &si, &pi)) { CloseHandle(pi.hThread); CloseHandle(pi.hProcess); }
+    PostMessageW(g_hwnd, WM_APP + 2, 0, 0);  // on quitte pour de bon (même si « fermer = réduire »)
+    return "";
 }
 
 static void showWindowAgain() {
@@ -558,6 +617,7 @@ static LRESULT WINAPI wndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     if (ImGui_ImplWin32_WndProcHandler(hwnd, msg, wp, lp)) return true;
     switch (msg) {
     case WM_APP: g_wakePending = false; return 0;
+    case WM_APP + 2: g_quitting = true; DestroyWindow(hwnd); return 0;  // après une mise à jour
     case WM_APP + 1:  // clic sur l'icône près de l'horloge
         if (LOWORD(lp) == WM_LBUTTONUP) showWindowAgain();
         else if (LOWORD(lp) == WM_RBUTTONUP) {
@@ -668,6 +728,8 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
 
     wchar_t exe[MAX_PATH]; GetModuleFileNameW(nullptr, exe, MAX_PATH);
     g_dir = g_bin = fs::path(exe).parent_path();
+    if (wcsstr(GetCommandLineW(), L"--after-update")) Sleep(1500);  // laisse l'ancienne version se fermer
+    for (const char* f : {"Glass.exe.old", "glass-engine.exe.old", "Glass.pdb.old"}) { std::error_code ec; fs::remove(g_bin / f, ec); }
     refreshPath();
 
     g_job = CreateJobObjectW(nullptr, nullptr);  // le moteur et yt-dlp meurent avec Glass

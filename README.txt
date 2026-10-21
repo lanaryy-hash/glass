@@ -66,10 +66,22 @@ PERFS
 SI CA PLANTE
   Envoie le fichier build\Release\crash.txt.
 
+MISES A JOUR
+  Chaque envoi du code sur GitHub fabrique Glass pour Windows ET pour Mac et
+  publie une version (https://github.com/lanaryy-hash/glass/releases).
+  Les Glass installees depuis ces versions affichent "Mise a jour disponible"
+  en haut : un clic telecharge, remplace et relance Glass (sur Mac, la
+  commande xattr est faite automatiquement). Une Glass compilee sur ce PC
+  (build.bat) n'a pas de numero de version : pas de mise a jour auto.
+
+LOGO
+  Reglages > Couleurs > Logo de Glass > Choisir une image : barre de titre,
+  barre des taches (Windows) et Dock (Mac). "Logo d'origine" pour revenir.
+
 VERSION MAC
-  Fabriquee automatiquement par GitHub : onglet Actions du depot > derniere
-  execution reussie > Glass-mac. Sur le Mac : dezipper, glisser Glass dans
-  Applications, puis la 1re fois CLIC DROIT > Ouvrir (app non signee par Apple).
+  Telecharger Glass-mac.zip dans https://github.com/lanaryy-hash/glass/releases.
+  Sur le Mac : dezipper, glisser Glass dans Applications, puis 1re fois
+  Terminal : xattr -cr /Applications/Glass.app (app non signee par Apple).
   Donnees : ~/Library/Application Support/Glass. yt-dlp s'installe tout seul.
   Lecteur Spotify officiel : peut ne pas marcher sur Mac (protection du son),
   Glass passe alors par YouTube. Raccourcis : Cmd au lieu de Ctrl (sauf

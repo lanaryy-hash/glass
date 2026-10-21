@@ -28,6 +28,11 @@
 
 using json = nlohmann::json;
 
+#ifndef GLASS_VERSION
+#define GLASS_VERSION 0  // compilé sur ce PC : pas de mise à jour automatique (les versions de GitHub ont un numéro)
+#endif
+static const char* kRepo = "lanaryy-hash/glass";  // versions publiées par GitHub (.github/workflows/build.yml)
+
 // ---------- données ----------
 struct Track { std::string uri, title, artist, album, image; int ms = 0; bool local = false; };
 // custom : playlist Spotify ajoutée par lien ; own : playlist créée dans Glass (uri "glass:...")
@@ -44,6 +49,7 @@ struct Settings {
     bool mediaKeys = true, startup = false, animations = true, showAlbum = true, tray = false, topmost = false, lyricsCenter = false, stopAtEnd = false;
     bool accentAuto = false, autoLyrics = true;  // couleur prise sur la pochette ; paroles générées si introuvables
     bool apple = false;                          // compte Apple Music connecté (page music.apple.com lancée au démarrage)
+    std::string logo;                            // image choisie comme logo de Glass ("" = logo d'origine)
     std::vector<std::string> pinned = {"glass:favoris", "spotify:collection", "local", "glass:recent"};  // en haut de la bibliothèque
 };
 static Settings g_set;
@@ -94,6 +100,7 @@ static bool g_sleepEnd = false;         // minuterie « à la fin du titre »
 static bool g_webOk = false, g_sp = false, g_wvStarted = false, g_sdkReady = false, g_spPaused = true, g_spEnded = false;
 static bool g_spApple = false;                                                      // le lecteur officiel en cours est celui d'Apple
 static bool g_amStarted = false, g_amReady = false, g_amAuth = false, g_amLogin = false;  // Apple Music : page lancée, prête, connectée, fenêtre de connexion
+static std::string g_amDiag;  // ce que le lecteur d'Apple peut faire ici (titres entiers ou extraits)
 static std::string g_sdkDevice;
 static double g_spPos = 0, g_spT = 0, g_spDur = 0;
 static std::vector<std::pair<int, std::string>> g_wvOut;  // messages JSON pour les pages (postés depuis le thread de la fenêtre)
@@ -161,7 +168,7 @@ static void saveSettings() {
               {"glass", s.glass}, {"dim", s.dim}, {"tintAmt", s.tintAmt}, {"rounding", s.rounding}, {"textScale", s.textScale}, {"speed", s.speed}, {"vol", s.vol},
               {"mediaKeys", s.mediaKeys}, {"startup", s.startup}, {"animations", s.animations}, {"showAlbum", s.showAlbum}, {"tray", s.tray},
               {"topmost", s.topmost}, {"lyricsCenter", s.lyricsCenter}, {"stopAtEnd", s.stopAtEnd},
-              {"neon", s.neon}, {"accentAuto", s.accentAuto}, {"autoLyrics", s.autoLyrics}, {"particles", s.particles}, {"pinned", s.pinned}, {"apple", s.apple}};
+              {"neon", s.neon}, {"accentAuto", s.accentAuto}, {"autoLyrics", s.autoLyrics}, {"particles", s.particles}, {"pinned", s.pinned}, {"apple", s.apple}, {"logo", s.logo}};
     std::ofstream((g_dir / "settings.json")) << j.dump(1);
 }
 static void loadSettings() {
@@ -174,7 +181,7 @@ static void loadSettings() {
     get("glass", s.glass); get("dim", s.dim); get("tintAmt", s.tintAmt); get("rounding", s.rounding); get("textScale", s.textScale); get("speed", s.speed); get("vol", s.vol);
     get("mediaKeys", s.mediaKeys); get("startup", s.startup); get("animations", s.animations); get("showAlbum", s.showAlbum); get("tray", s.tray);
     get("topmost", s.topmost); get("lyricsCenter", s.lyricsCenter); get("stopAtEnd", s.stopAtEnd);
-    get("neon", s.neon); get("accentAuto", s.accentAuto); get("autoLyrics", s.autoLyrics); get("particles", s.particles); get("pinned", s.pinned); get("apple", s.apple);
+    get("neon", s.neon); get("accentAuto", s.accentAuto); get("autoLyrics", s.autoLyrics); get("particles", s.particles); get("pinned", s.pinned); get("apple", s.apple); get("logo", s.logo);
     for (int i = 0; i < 3; i++) {
         if (j.contains("accentRGB") && j["accentRGB"].size() == 3) s.accent[i] = j["accentRGB"][i].get<float>();
         if (j.contains("tint") && j["tint"].size() == 3) s.tint[i] = j["tint"][i].get<float>();
@@ -914,7 +921,7 @@ static const char* kAppleJs = R"JS((() => {
     } catch (err) { post({t: 'error', cmd: m.cmd, msg: String((err && (err.message || err.errorCode || err.name)) || err)}); }
   });
   const tick = () => {
-    if (mk.isAuthorized !== auth) { auth = mk.isAuthorized; post({t: 'auth', ok: !!auth}); }
+    if (mk.isAuthorized !== auth) { auth = mk.isAuthorized; post({t: 'auth', ok: !!auth}); if (window.__glassDiag) __glassDiag(); }
     if (expect) post({t: 'state', paused: !mk.isPlaying, pos: (mk.currentPlaybackTime || 0) * 1000, dur: (mk.currentPlaybackDuration || 0) * 1000});
   };
   const find = () => {
@@ -928,6 +935,20 @@ static const char* kAppleJs = R"JS((() => {
     auth = !!mk.isAuthorized;
     post({t: 'ready', ok: auth});
     setInterval(tick, 1000);
+    const diag = async () => {
+      const ks = {fairplay: 'com.apple.fps', 'fairplay 1': 'com.apple.fps.1_0', widevine: 'com.widevine.alpha', playready: 'com.microsoft.playready'};
+      const ok = [];
+      for (const [n, k] of Object.entries(ks)) {
+        try {
+          await navigator.requestMediaKeySystemAccess(k, [{initDataTypes: ['cenc', 'sinf', 'skd'], audioCapabilities: [{contentType: 'audio/mp4; codecs="mp4a.40.2"'}]}]);
+          ok.push(n);
+        } catch (e) {}
+      }
+      if (window.WebKitMediaKeys) ok.push('webkit');
+      post({t: 'diag', msg: 'connecté ' + (mk.isAuthorized ? 'oui' : 'non') + ' · extraits seulement ' + (mk.previewOnly ? 'OUI' : 'non') + ' · protection ' + (ok.join(', ') || 'AUCUNE')});
+    };
+    window.__glassDiag = diag;
+    diag();
   };
   find();
 })();)JS";
@@ -968,6 +989,7 @@ static void onApple(const json& j) {  // messages de la page Apple Music (g_mx t
             amPost({{"cmd", "lib"}});
         }
     } else if (t == "hidden") g_amLogin = false;
+    else if (t == "diag") g_amDiag = jstr(j, "msg");
     else if (t == "lib") {
         for (auto& it : j["items"]) {
             std::string uri = "am:" + jstr(it, "id");
@@ -1017,6 +1039,7 @@ static std::deque<TexJob> g_jobs;
 static std::vector<TexReady> g_texReady;  // décodées par les threads, envoyées à la carte graphique par la fenêtre
 static std::condition_variable g_jobCv;
 static std::map<std::string, ImTextureID> g_tex;
+static std::map<std::string, ImVec2> g_texDim;  // taille en pixels de chaque texture chargée
 static std::map<std::string, Palette> g_pal;
 
 static void boxBlur(std::vector<uint8_t>& p, int w, int h, int r) {
@@ -1076,6 +1099,7 @@ static void uploadTextures() {  // g_mx tenu, thread de la fenêtre
     for (auto& r : g_texReady) {
         if (r.px.empty()) continue;  // échec : reste à 0 (pochette par défaut)
         g_tex[r.key] = plat::makeTexture(r.px.data(), r.w, r.h);
+        g_texDim[r.key] = {(float)r.w, (float)r.h};
         if (r.blur) g_pal[r.src] = r.pal;
     }
     g_texReady.clear();
@@ -1389,6 +1413,55 @@ static void toggleMiniLyrics() {  // agrandit le mini-lecteur vers le haut pour 
     plat::setMiniHeight(miniHeight());
 }
 
+// ---------- logo (choisi dans les réglages) ----------
+static std::string logoSrc() { return g_set.logo.empty() ? std::string("icon:") : g_set.logo; }
+
+static void applyLogo() {  // icône de la fenêtre / barre des tâches / Dock
+    std::vector<uint8_t> px;
+    int w = 0, h = 0;
+    if (g_set.logo.empty() || !plat::decodeImage(g_set.logo, 256, px, w, h)) { plat::setAppIcon(nullptr, 0, 0); return; }
+    int n = std::min(w, h), x0 = (w - n) / 2, y0 = (h - n) / 2;  // carré, centré
+    std::vector<uint8_t> sq((size_t)n * n * 4);
+    for (int y = 0; y < n; y++) std::copy_n(&px[((size_t)(y + y0) * w + x0) * 4], n * 4, &sq[(size_t)y * n * 4]);
+    plat::setAppIcon(sq.data(), n, n);
+}
+
+// ---------- mise à jour automatique (versions publiées sur GitHub) ----------
+struct Update { int version = 0; std::string url; bool busy = false; };
+static Update g_update;
+static ImVec4 g_updRect;      // bouton « Mise à jour disponible » (la barre de titre ne doit pas le prendre pour une poignée)
+static double g_updT = -1e9;  // dernière vérification
+
+static void checkUpdate() {
+    if (GLASS_VERSION <= 0) return;
+    std::thread([] {
+        json r = json::parse(plat::httpGet(std::string("https://api.github.com/repos/") + kRepo + "/releases/latest"), nullptr, false);
+        int v = atoi(jstr(r, "tag_name").c_str() + 1);  // "v12" -> 12
+#ifdef _WIN32
+        const char* want = "Glass-windows.zip";
+#else
+        const char* want = "Glass-mac.zip";
+#endif
+        if (v <= GLASS_VERSION || !r.contains("assets") || !r["assets"].is_array()) return;
+        for (auto& a : r["assets"])
+            if (jstr(a, "name") == want) { std::lock_guard lk(g_mx); g_update.version = v; g_update.url = jstr(a, "browser_download_url"); }
+        wake();
+    }).detach();
+}
+
+static void installUpdate() {  // g_mx tenu
+    if (g_update.busy || g_update.url.empty()) return;
+    g_update.busy = true;
+    std::thread([url = g_update.url] {
+        fs::path zip = g_dir / "update.zip";
+        std::string err = httpDownload(url, zip, "Mise à jour") ? plat::installUpdate(zip) : "téléchargement impossible";
+        std::lock_guard lk(g_mx);
+        g_update.busy = false;
+        g_status = err.empty() ? "Mise à jour installée : Glass redémarre..." : "Mise à jour : " + err;
+        wake();
+    }).detach();
+}
+
 static void titleBar(ImGuiViewport* vp, float tb) {
     ImDrawList* dl = ImGui::GetWindowDrawList();
 #ifdef __APPLE__
@@ -1398,8 +1471,13 @@ static void titleBar(ImGuiViewport* vp, float tb) {
     ImVec2 o = vp->Pos;
     const int nb = 4;
 #endif
-    if (ImTextureID logo = tex("icon:", 64)) dl->AddImage(logo, o + ImVec2{14 * S, tb * 0.5f - 10 * S}, o + ImVec2{34 * S, tb * 0.5f + 10 * S});
-    else dl->AddCircleFilled(o + ImVec2{24 * S, tb * 0.5f}, 7 * S, accU());
+    std::string ls = logoSrc();
+    if (ImTextureID logo = tex(ls, 64)) {
+        ImVec2 d = g_texDim[ls + "|64"], uv0{0, 0}, uv1{1, 1};  // image pas carrée : on garde le centre
+        if (d.x > d.y && d.x > 0) { uv0.x = (1 - d.y / d.x) / 2; uv1.x = 1 - uv0.x; }
+        if (d.y > d.x && d.y > 0) { uv0.y = (1 - d.x / d.y) / 2; uv1.y = 1 - uv0.y; }
+        dl->AddImageRounded(logo, o + ImVec2{14 * S, tb * 0.5f - 10 * S}, o + ImVec2{34 * S, tb * 0.5f + 10 * S}, uv0, uv1, IM_COL32_WHITE, 5 * S);
+    } else dl->AddCircleFilled(o + ImVec2{24 * S, tb * 0.5f}, 7 * S, accU());
     dl->AddText(g_bold, 15 * S, o + ImVec2{38 * S, tb * 0.5f - 10 * S}, col(1, 1, 1, 0.95f), "Glass");
     o = vp->Pos;
     if (!g_status.empty()) {
@@ -1407,6 +1485,20 @@ static void titleBar(ImGuiViewport* vp, float tb) {
         textAt(dl, o + ImVec2{std::max(120 * S, (vp->Size.x - ts.x) * 0.5f), tb * 0.5f - 9 * S}, vp->Size.x * 0.5f, col(1, 1, 1, 0.6f), g_status);
     }
     float bw = 46 * S;
+    g_updRect = {};
+    if (g_update.version > GLASS_VERSION) {  // une nouvelle version est publiée : un clic l'installe
+        const char* txt = g_update.busy ? "Mise à jour en cours..." : "Mise à jour disponible";
+        float w = ImGui::CalcTextSize(txt).x + 28 * S, h = 26 * S;
+        ImVec2 p = o + ImVec2{vp->Size.x - bw * nb - w - 12 * S, (tb - h) * 0.5f};
+        ImGui::SetCursorScreenPos(p);
+        if (ImGui::InvisibleButton("##upd", {w, h}) && !g_update.busy) installUpdate();
+        bool hov = ImGui::IsItemHovered();
+        ImGui::SetItemTooltip("Version %d disponible (tu as la %d) : clique pour l'installer, Glass redémarre tout seul", g_update.version, GLASS_VERSION);
+        if (g_set.neon > 0) glow(dl, p + ImVec2{w, h} * 0.5f, w * 0.6f, acc(), 0.3f * g_set.neon);
+        dl->AddRectFilled(p, p + ImVec2{w, h}, ImGui::GetColorU32(ImVec4{acc().x, acc().y, acc().z, hov ? 1.f : 0.8f}), h * 0.5f);
+        dl->AddText(p + ImVec2{14 * S, (h - ImGui::GetFontSize()) * 0.5f}, col(0, 0, 0, 0.85f), txt);
+        g_updRect = {p.x - o.x, p.y - o.y, w, h};
+    }
     const char* icons[4] = {I_MINI, I_MIN, plat::maximized() ? I_RESTORE : I_MAX, I_CLOSE};
     for (int i = 0; i < nb; i++) {
         ImGui::SetCursorPos({vp->Size.x - bw * (nb - i), 0});
@@ -1818,6 +1910,10 @@ static void settingsView() {
     if (g_set.particles) { ImGui::SameLine(); ImGui::TextDisabled("(~30 images/s tant que Glass est visible)"); }
     label("Lueurs néon");
     changed |= ImGui::SliderFloat("##neon", &g_set.neon, 0, 1, g_set.neon > 0 ? "%.2f" : "aucune");
+    label("Logo de Glass");
+    if (ImGui::Button("Choisir une image...##logo")) g_pick = 4;
+    if (!g_set.logo.empty()) { ImGui::SameLine(); if (ImGui::Button("Logo d'origine")) { g_set.logo.clear(); applyLogo(); changed = true; } }
+    ImGui::SameLine(); ImGui::TextDisabled("(barre de titre, barre des tâches / Dock ; image carrée conseillée)");
     label("Couleur d'après la pochette");
     changed |= ImGui::Checkbox("##aauto", &g_set.accentAuto);
     label("Transparence des panneaux");
@@ -1899,6 +1995,17 @@ static void settingsView() {
     if (ImGui::Checkbox("##st", &g_set.startup)) { plat::setStartup(g_set.startup); changed = true; }
     label("Mémoire utilisée");
     ImGui::Text("Glass %zu Mo + moteur %zu Mo", plat::memMB(false), plat::memMB(true));
+    label("Version");
+    if (GLASS_VERSION <= 0) ImGui::TextDisabled("compilée sur ce PC (pas de mise à jour automatique)");
+    else if (g_update.version > GLASS_VERSION) {
+        ImGui::Text("%d  (version %d disponible)", GLASS_VERSION, g_update.version);
+        ImGui::SameLine();
+        if (ImGui::Button(g_update.busy ? "Installation..." : "Installer la mise à jour") && !g_update.busy) installUpdate();
+    } else {
+        ImGui::Text("%d  (à jour)", GLASS_VERSION);
+        ImGui::SameLine();
+        if (ImGui::SmallButton("Vérifier")) { g_updT = now(); checkUpdate(); }
+    }
     label("Dossier de Glass");
     if (ImGui::Button("Ouvrir")) plat::openUrl(ustr(g_dir));
 
@@ -1912,6 +2019,7 @@ static void settingsView() {
     ImGui::TextDisabled("Le vrai lecteur d'Apple, caché dans Glass. Abonnement requis pour les titres entiers (sinon extraits de 30 s).");
     label("");
     ImGui::TextDisabled("Tes playlists apparaissent à gauche. Sans compte, colle un lien Apple Music avec « + ».");
+    if (!g_amDiag.empty()) { label("Diagnostic"); ImGui::TextDisabled("%s", g_amDiag.c_str()); }
 
     section("Compte Spotify");
     label(g_spReady ? "Connecté" : "Non connecté");
@@ -2518,6 +2626,7 @@ void app::initUI() {
     makeGlowTexture();
     plat::setMediaKeys(g_set.mediaKeys);
     setTopmost();
+    if (!g_set.logo.empty()) applyLogo();
 }
 
 int app::timeoutMs(bool visible, bool front) {
@@ -2546,11 +2655,15 @@ bool app::tick() {
         for (auto& [id, m] : g_wvOut) plat::webPost(id, m);
         g_wvOut.clear();
         if (g_has) plat::nowPlaying(g_cur.title, g_cur.artist, isPlaying());
+        if (now() - g_updT > 6 * 3600) { g_updT = now(); checkUpdate(); }
         pick = g_pick; g_pick = 0;
     }
     if (!pick) return false;
     auto paths = plat::pick(pick);  // boîte modale : hors du verrou
-    if (pick == 3) {
+    if (pick == 4) {  // logo
+        std::lock_guard lk(g_mx);
+        if (!paths.empty()) { g_set.logo = ustr(paths[0]); saveSettings(); applyLogo(); }
+    } else if (pick == 3) {
         std::lock_guard lk(g_mx);
         if (!paths.empty()) if (List* l = findList(g_pickUri)) {
             l->image = ustr(paths[0]);
@@ -2586,6 +2699,7 @@ void app::media(int cmd) {
 
 bool app::caption(float x, float y, float w, float) {
     if (g_mini) return x < 140 * S || y < 8 * S || y > 146 * S;  // pochette, bord haut, paroles = poignée
+    if (x >= g_updRect.x && x < g_updRect.x + g_updRect.z && y >= g_updRect.y && y < g_updRect.y + g_updRect.w) return false;
 #ifdef __APPLE__
     return y < 42 * S && x > 70 * S && x < w - 46 * S;  // boutons ronds du Mac à gauche, mini-lecteur à droite
 #else

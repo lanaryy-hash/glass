@@ -67,6 +67,8 @@ void setMiniHeight(int h);  // grandit vers le haut
 bool wallpaperUV(ImVec2& uv0, ImVec2& uv1);  // partie du fond d'écran derrière la fenêtre
 
 void openUrl(const std::string& url);  // lien ou dossier
+void setAppIcon(const uint8_t* px, int w, int h);  // icône de la fenêtre / barre des tâches / Dock (nullptr = d'origine)
+std::string installUpdate(const fs::path& zip);    // remplace Glass par la version du zip et relance ; "" si OK, sinon l'erreur
 void setMediaKeys(bool on);
 void setStartup(bool on);
 void nowPlaying(const std::string& title, const std::string& artist, bool playing);

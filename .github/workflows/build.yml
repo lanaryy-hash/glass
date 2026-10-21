@@ -1,12 +1,37 @@
-# Fabrique Glass.app (Mac Intel + Apple Silicon, macOS 12+) à chaque envoi du code.
-# Le résultat se télécharge dans l'onglet « Actions » du dépôt > dernière exécution > Glass-mac.
-name: Mac
+# À chaque envoi du code : Glass pour Windows et pour Mac, puis une « version » GitHub (vN) avec les deux.
+# Les Glass déjà installées la voient et proposent « Mise à jour disponible ».
+name: Glass
 on:
   push:
+    branches: [main]
   workflow_dispatch:
 
+env:
+  GLASS_VERSION: ${{ github.run_number }}
+
 jobs:
-  build:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Moteur Spotify (Rust)
+        working-directory: engine
+        run: cargo build --release
+
+      - name: Glass.exe
+        run: |
+          cmake -S . -B build -DGLASS_VERSION=${{ env.GLASS_VERSION }}
+          cmake --build build --config Release
+          Copy-Item engine/target/release/glass-engine.exe build/Release/
+          Compress-Archive -Path build/Release/Glass.exe, build/Release/glass-engine.exe, build/Release/Glass.pdb -DestinationPath Glass-windows.zip
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Glass-windows
+          path: Glass-windows.zip
+
+  mac:
     runs-on: macos-14
     env:
       MACOSX_DEPLOYMENT_TARGET: "12.0"
@@ -42,9 +67,10 @@ jobs:
 
       - name: Glass.app
         run: |
-          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release "-DCMAKE_OSX_ARCHITECTURES=arm64;x86_64"
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release "-DCMAKE_OSX_ARCHITECTURES=arm64;x86_64" -DGLASS_VERSION=${{ env.GLASS_VERSION }}
           cmake --build build -j 4
           cp glass-engine whisper-cli build/Glass.app/Contents/MacOS/
+          /usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString ${{ env.GLASS_VERSION }}" -c "Set :CFBundleVersion ${{ env.GLASS_VERSION }}" build/Glass.app/Contents/Info.plist
           codesign --force --deep -s - build/Glass.app
           ditto -c -k --keepParent build/Glass.app Glass-mac.zip
 
@@ -52,3 +78,20 @@ jobs:
         with:
           name: Glass-mac
           path: Glass-mac.zip
+
+  release:
+    needs: [windows, mac]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          merge-multiple: true
+      - name: Publier la version
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          NOTES: ${{ github.event.head_commit.message }}
+        run: |
+          gh release create "v${{ env.GLASS_VERSION }}" Glass-windows.zip Glass-mac.zip -R "${{ github.repository }}" \
+            --title "Glass ${{ env.GLASS_VERSION }}" --notes "$NOTES"
