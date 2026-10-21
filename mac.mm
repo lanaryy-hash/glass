@@ -309,7 +309,7 @@ void plat::webStart(int id, const std::string& html, const std::string& url, con
     // Sans elle, le site d'Apple ne donne que des extraits de 30 s ; réglages internes (non publics) : appelés seulement s'ils existent.
     for (const char* sel : {"_setEncryptedMediaAPIEnabled:", "_setLegacyEncryptedMediaAPIEnabled:", "_setMediaSourceEnabled:"}) {
         SEL s = sel_registerName(sel);
-        if ([cfg.preferences respondsToSelector:s]) ((void (*)(id, SEL, BOOL))objc_msgSend)(cfg.preferences, s, YES);
+        if ([cfg.preferences respondsToSelector:s]) ((void (*)(NSObject*, SEL, BOOL))objc_msgSend)(cfg.preferences, s, YES);
     }
     cfg.websiteDataStore = [WKWebsiteDataStore defaultDataStore];  // garde la connexion d'un lancement à l'autre
     NSWindow* w = [[NSWindow alloc] initWithContentRect:NSMakeRect(0, 0, 2, 2) styleMask:NSWindowStyleMaskBorderless backing:NSBackingStoreBuffered defer:NO];
