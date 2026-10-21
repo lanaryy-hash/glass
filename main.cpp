@@ -1432,9 +1432,12 @@ static Update g_update;
 static ImVec4 g_updRect;      // bouton « Mise à jour disponible » (la barre de titre ne doit pas le prendre pour une poignée)
 static double g_updT = -1e9;  // dernière vérification
 
-static void checkUpdate() {
-    if (GLASS_VERSION <= 0) return;
-    std::thread([] {
+static std::string g_updMsg;  // résultat de « Rechercher une mise à jour »
+
+static void checkUpdate(bool manual = false) {  // g_mx tenu
+    if (GLASS_VERSION <= 0) { if (manual) g_updMsg = "Version compilée sur ce PC : prends Glass sur la page des versions GitHub pour avoir les mises à jour."; return; }
+    if (manual) g_updMsg = "Recherche...";
+    std::thread([manual] {
         json r = json::parse(plat::httpGet(std::string("https://api.github.com/repos/") + kRepo + "/releases/latest"), nullptr, false);
         int v = atoi(jstr(r, "tag_name").c_str() + 1);  // "v12" -> 12
 #ifdef _WIN32
@@ -1442,9 +1445,15 @@ static void checkUpdate() {
 #else
         const char* want = "Glass-mac.zip";
 #endif
-        if (v <= GLASS_VERSION || !r.contains("assets") || !r["assets"].is_array()) return;
-        for (auto& a : r["assets"])
-            if (jstr(a, "name") == want) { std::lock_guard lk(g_mx); g_update.version = v; g_update.url = jstr(a, "browser_download_url"); }
+        std::lock_guard lk(g_mx);
+        if (v > GLASS_VERSION && r.is_object() && r["assets"].is_array())
+            for (auto& a : r["assets"]) if (jstr(a, "name") == want) { g_update.version = v; g_update.url = jstr(a, "browser_download_url"); }
+        if (manual) {
+            g_updMsg = v <= 0 ? "Impossible de vérifier (pas d'internet ?)"
+                     : g_update.version > GLASS_VERSION ? "Version " + std::to_string(g_update.version) + " disponible !"
+                     : "Tu as la dernière version (" + std::to_string(GLASS_VERSION) + ")";
+            g_status = g_updMsg;
+        }
         wake();
     }).detach();
 }
@@ -1996,16 +2005,13 @@ static void settingsView() {
     label("Mémoire utilisée");
     ImGui::Text("Glass %zu Mo + moteur %zu Mo", plat::memMB(false), plat::memMB(true));
     label("Version");
-    if (GLASS_VERSION <= 0) ImGui::TextDisabled("compilée sur ce PC (pas de mise à jour automatique)");
-    else if (g_update.version > GLASS_VERSION) {
-        ImGui::Text("%d  (version %d disponible)", GLASS_VERSION, g_update.version);
-        ImGui::SameLine();
+    if (GLASS_VERSION <= 0) ImGui::TextDisabled("compilée sur ce PC");
+    else ImGui::Text("%d", GLASS_VERSION);
+    ImGui::SameLine();
+    if (g_update.version > GLASS_VERSION) {
         if (ImGui::Button(g_update.busy ? "Installation..." : "Installer la mise à jour") && !g_update.busy) installUpdate();
-    } else {
-        ImGui::Text("%d  (à jour)", GLASS_VERSION);
-        ImGui::SameLine();
-        if (ImGui::SmallButton("Vérifier")) { g_updT = now(); checkUpdate(); }
-    }
+    } else if (ImGui::Button("Rechercher une mise à jour")) { g_updT = now(); checkUpdate(true); }
+    if (!g_updMsg.empty()) { ImGui::SameLine(); ImGui::TextDisabled("%s", g_updMsg.c_str()); }
     label("Dossier de Glass");
     if (ImGui::Button("Ouvrir")) plat::openUrl(ustr(g_dir));
 
@@ -2365,6 +2371,8 @@ static void playerBar() {
         if (ImGui::SliderFloat("##spd2", &g_set.speed, 0.5f, 2.0f, "x%.2f")) { plat::audioRate(g_set.speed); saveSettings(); }
         ImGui::Separator();
         if (ImGui::MenuItem("Mini-lecteur", "Ctrl+M")) toggleMini();
+        if (g_update.version > GLASS_VERSION) { if (ImGui::MenuItem("Installer la mise à jour")) installUpdate(); }
+        else if (ImGui::MenuItem("Rechercher une mise à jour")) { g_updT = now(); checkUpdate(true); }
         ImGui::EndPopup();
     }
     iconAt(dl, {o.x + w - vw - 16 * S, cy}, I_VOL, 15 * S, col(1, 1, 1, 0.75f));
