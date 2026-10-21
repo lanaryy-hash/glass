@@ -1,0 +1,2445 @@
+﻿// Glass — lecteur de musique léger : ta bibliothèque Spotify (via glass-engine), Apple Music (liens) + tes fichiers.
+// Son : lecteur web officiel Spotify (page invisible), YouTube (yt-dlp) ou fichiers locaux.
+// UI : Dear ImGui, effet verre dépoli, rendu uniquement quand quelque chose change.
+// Ce fichier est commun à Windows et macOS ; le reste est dans win.cpp / mac.mm (voir platform.h).
+#include <algorithm>
+#include <atomic>
+#include <cctype>
+#include <chrono>
+#include <cmath>
+#include <cstdlib>
+#include <condition_variable>
+#include <cstring>
+#include <deque>
+#include <fstream>
+#include <map>
+#include <random>
+#include <regex>
+#include <set>
+#include <sstream>
+#include <thread>
+#include <nlohmann/json.hpp>
+#define IMGUI_DEFINE_MATH_OPERATORS
+#include "platform.h"
+#ifndef _WIN32
+#include <strings.h>
+#define _stricmp strcasecmp
+#endif
+
+using json = nlohmann::json;
+
+// ---------- données ----------
+struct Track { std::string uri, title, artist, album, image; int ms = 0; bool local = false; };
+// custom : playlist Spotify ajoutée par lien ; own : playlist créée dans Glass (uri "glass:...")
+struct List { std::string uri, name, image; std::vector<Track> tracks; bool requested = false, loaded = false, custom = false, own = false; };
+struct LyricLine { int t; std::string w; };
+
+struct Settings {
+    int bg = 0, prefetch = 1, lyricsSize = 30, source = 0, density = 1;  // source : 0 auto, 1 Spotify uniquement, 2 YouTube uniquement
+    // bg : 0 pochette floutée, 1 fond d'écran flouté, 2 uni, 3 dégradé de la pochette (Apple Music), 4 néon, 5 aurore animée
+    float neon = 0;                     // intensité des lueurs néon (0 = aucune)
+    int particles = 0;                  // 0 aucune, 1 pétales de sakura, 2 neige, 3 lucioles
+    float accent[3] = {0.12f, 0.84f, 0.38f}, tint[3] = {0.05f, 0.07f, 0.12f};
+    float glass = 0.07f, dim = 0.45f, tintAmt = 0.15f, rounding = 20, textScale = 1, speed = 1, vol = 0.8f;
+    bool mediaKeys = true, startup = false, animations = true, showAlbum = true, tray = false, topmost = false, lyricsCenter = false, stopAtEnd = false;
+    bool accentAuto = false, autoLyrics = true;  // couleur prise sur la pochette ; paroles générées si introuvables
+    std::vector<std::string> pinned = {"glass:favoris", "spotify:collection", "local", "glass:recent"};  // en haut de la bibliothèque
+};
+static Settings g_set;
+
+struct Theme { const char* name; float acc[3], tint[3]; int bg; float glass, dim, tintAmt, rounding, neon = 0; bool accentAuto = false; };
+static const Theme kThemes[] = {
+    {"Glass", {0.12f, 0.84f, 0.38f}, {0.05f, 0.07f, 0.12f}, 0, 0.07f, 0.45f, 0.15f, 20},
+    {"Minuit", {0.30f, 0.55f, 1.00f}, {0.03f, 0.05f, 0.22f}, 1, 0.06f, 0.55f, 0.45f, 20},
+    {"Aurore", {0.68f, 0.48f, 1.00f}, {0.22f, 0.06f, 0.32f}, 0, 0.10f, 0.40f, 0.35f, 22},
+    {"Sakura", {1.00f, 0.48f, 0.72f}, {0.32f, 0.08f, 0.20f}, 0, 0.12f, 0.40f, 0.30f, 24},
+    {"Coucher de soleil", {1.00f, 0.60f, 0.22f}, {0.32f, 0.10f, 0.04f}, 0, 0.08f, 0.45f, 0.35f, 20},
+    {"Givre", {0.40f, 0.90f, 1.00f}, {0.05f, 0.16f, 0.22f}, 1, 0.18f, 0.30f, 0.25f, 26},
+    {"Forêt", {0.55f, 0.85f, 0.35f}, {0.04f, 0.14f, 0.06f}, 0, 0.08f, 0.50f, 0.35f, 18},
+    {"OLED", {0.12f, 0.84f, 0.38f}, {0.00f, 0.00f, 0.00f}, 2, 0.04f, 0.00f, 0.00f, 12},
+    {"Rétro", {1.00f, 0.82f, 0.25f}, {0.14f, 0.09f, 0.04f}, 2, 0.06f, 0.20f, 0.00f, 4},
+    {"Apple Music", {0.98f, 0.18f, 0.28f}, {0.10f, 0.06f, 0.08f}, 3, 0.10f, 0.35f, 0.00f, 14, 0, true},
+    {"Apple Clear", {0.04f, 0.52f, 1.00f}, {0.08f, 0.10f, 0.14f}, 1, 0.16f, 0.22f, 0.05f, 22},
+    {"Néon Glass", {1.00f, 0.17f, 0.84f}, {0.10f, 0.04f, 0.16f}, 3, 0.09f, 0.40f, 0.10f, 22, 0.8f, true},
+    {"Néon Tokyo", {1.00f, 0.17f, 0.84f}, {0.06f, 0.02f, 0.12f}, 4, 0.07f, 0.15f, 0.20f, 18, 1.0f},
+    {"Cyber", {0.00f, 0.95f, 1.00f}, {0.02f, 0.05f, 0.10f}, 4, 0.06f, 0.15f, 0.20f, 10, 1.0f},
+    {"Aurore boréale", {0.30f, 1.00f, 0.70f}, {0.02f, 0.08f, 0.10f}, 5, 0.08f, 0.20f, 0.15f, 22, 0.5f},
+};
+
+std::mutex g_mx;
+float S = 1;
+fs::path g_dir, g_bin;
+static std::vector<List> g_lists;
+static List g_search{"search", "Recherche"};
+static std::map<std::string, std::pair<std::string, std::string>> g_over;  // personnalisation : uri -> (nom, image)
+static std::string g_status, g_user, g_view, g_wall;
+static bool g_engineOk = false, g_spReady = false;
+static bool g_anim = false;             // une animation demande l'image suivante
+static bool g_animBg = false;
+
+// lecture : Glass gère la file d'attente pour toutes les sources
+static std::string g_plUri;             // liste d'où vient la lecture
+static int g_tr = -1, g_pos = 0;        // titre de la liste (-1 = vient de la file d'attente) / position dans g_order
+static std::vector<int> g_order;
+static std::deque<Track> g_queue;       // « lire ensuite » / « ajouter à la file »
+static Track g_cur;
+static bool g_has = false, g_shuffle = false, g_repeat = false, g_loading = false, g_failed = false;
+static fs::path g_ready;                // fichier YouTube prêt à jouer
+static std::atomic<int> g_gen{0};       // invalide les téléchargements périmés
+static std::set<std::string> g_inflight;
+static double g_sleepAt = 0;            // minuterie
+static bool g_sleepEnd = false;         // minuterie « à la fin du titre »
+// lecteur Spotify officiel (Web Playback SDK dans un WebView2 invisible)
+static bool g_webOk = false, g_sp = false, g_wvStarted = false, g_sdkReady = false, g_spPaused = true, g_spEnded = false;
+static std::string g_sdkDevice;
+static double g_spPos = 0, g_spT = 0, g_spDur = 0;
+static std::vector<std::string> g_wvOut;  // messages JSON pour la page (postés depuis le thread de la fenêtre)
+
+// interface
+static int g_pick = 0;                  // boîtes de dialogue (hors du verrou) : 1 fichiers, 2 dossier, 3 image de pochette
+static std::string g_pickUri;           // liste dont on choisit la pochette
+static bool g_lyricsOpen = false, g_mini = false, g_openPerso = false, g_openNew = false, g_focusSearch = false;
+static std::string g_editUri;           // liste en cours de personnalisation
+static std::vector<Track> g_pendingAdd; // titres à mettre dans la nouvelle playlist
+static Track g_dragTrack;               // glisser-déposer de titres
+static std::string g_dragFrom;
+static int g_dragIdx = -1;
+static char g_searchBuf[128];
+static std::string g_searchSent;
+static double g_searchT = 0;
+
+// paroles
+static std::string g_lyrKey, g_lyrSrc;
+static std::vector<LyricLine> g_lyr;
+static bool g_lyrSynced = false;
+static int g_lyrState = 0;              // 0 rien, 1 chargement, 2 trouvées, 3 introuvables
+
+static double now() { return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count(); }
+static void wake() { plat::wake(); }
+static fs::path upath(const std::string& s) { return fs::u8path(s); }  // chemins en UTF-8 dans tout Glass
+static std::string ustr(const fs::path& p) { return p.u8string(); }
+static bool fileExists(const fs::path& p) { std::error_code ec; return fs::exists(p, ec); }
+static long long nowId() { return std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count(); }
+
+// Les champs JSON peuvent être null (titres indisponibles...) : valeurs par défaut sans exception.
+static std::string jstr(const json& j, const char* k) { return j.contains(k) && j[k].is_string() ? j[k].get<std::string>() : ""; }
+static double jnum(const json& j, const char* k, double d = 0) { return j.contains(k) && j[k].is_number() ? j[k].get<double>() : d; }
+static json trackJson(const Track& t) { return {{"uri", t.uri}, {"title", t.title}, {"artist", t.artist}, {"album", t.album}, {"image", t.image}, {"ms", t.ms}, {"local", t.local}}; }
+static Track trackFrom(const json& j) {
+    Track t{jstr(j, "uri"), jstr(j, "title"), jstr(j, "artist"), jstr(j, "album"), jstr(j, "image"), (int)jnum(j, "ms")};
+    t.local = j.contains("local") && j["local"].is_boolean() && j["local"].get<bool>();
+    return t;
+}
+
+static List* findList(const std::string& uri) {
+    if (uri == "search") return &g_search;
+    for (auto& l : g_lists) if (l.uri == uri) return &l;
+    return nullptr;
+}
+static Track* current() { return g_has ? &g_cur : nullptr; }
+static bool isCurrent(const List& l, int i) { return g_has && g_plUri == l.uri && g_tr == i; }
+
+// Lien Spotify -> "spotify:playlist:<id>" ; lien Apple Music -> l'adresse de sa page (sans paramètres).
+static std::string toUri(const std::string& s) {
+    std::smatch m;
+    if (std::regex_search(s, m, std::regex(R"(music\.apple\.com/[a-z]{2}/(playlist|album)/[^?#\s"]+)"))) return "https://" + m[0].str();
+    if (std::regex_search(s, m, std::regex(R"((playlist|album)[/:]([A-Za-z0-9]{22}))"))) return "spotify:" + m[1].str() + ":" + m[2].str();
+    return "";
+}
+static bool isApple(const std::string& uri) { return uri.rfind("https://music.apple.com/", 0) == 0; }
+static bool isAlbum(const std::string& uri) { return uri.rfind("spotify:album", 0) == 0 || (isApple(uri) && uri.find("/album/") != std::string::npos); }
+
+// ---------- persistance ----------
+static void saveSettings() {
+    auto& s = g_set;
+    json j = {{"bg", s.bg}, {"prefetch", s.prefetch}, {"lyricsSize", s.lyricsSize}, {"source2", s.source}, {"density", s.density},
+              {"accentRGB", {s.accent[0], s.accent[1], s.accent[2]}}, {"tint", {s.tint[0], s.tint[1], s.tint[2]}},
+              {"glass", s.glass}, {"dim", s.dim}, {"tintAmt", s.tintAmt}, {"rounding", s.rounding}, {"textScale", s.textScale}, {"speed", s.speed}, {"vol", s.vol},
+              {"mediaKeys", s.mediaKeys}, {"startup", s.startup}, {"animations", s.animations}, {"showAlbum", s.showAlbum}, {"tray", s.tray},
+              {"topmost", s.topmost}, {"lyricsCenter", s.lyricsCenter}, {"stopAtEnd", s.stopAtEnd},
+              {"neon", s.neon}, {"accentAuto", s.accentAuto}, {"autoLyrics", s.autoLyrics}, {"particles", s.particles}, {"pinned", s.pinned}};
+    std::ofstream((g_dir / "settings.json")) << j.dump(1);
+}
+static void loadSettings() {
+    std::ifstream f((g_dir / "settings.json"));
+    json j = json::parse(f, nullptr, false);
+    if (!j.is_object()) return;
+    auto& s = g_set;
+    auto get = [&](const char* k, auto& v) { if (j.contains(k) && !j[k].is_null()) try { v = j[k].get<std::decay_t<decltype(v)>>(); } catch (...) {} };
+    get("bg", s.bg); get("prefetch", s.prefetch); get("lyricsSize", s.lyricsSize); get("source2", s.source); get("density", s.density);
+    get("glass", s.glass); get("dim", s.dim); get("tintAmt", s.tintAmt); get("rounding", s.rounding); get("textScale", s.textScale); get("speed", s.speed); get("vol", s.vol);
+    get("mediaKeys", s.mediaKeys); get("startup", s.startup); get("animations", s.animations); get("showAlbum", s.showAlbum); get("tray", s.tray);
+    get("topmost", s.topmost); get("lyricsCenter", s.lyricsCenter); get("stopAtEnd", s.stopAtEnd);
+    get("neon", s.neon); get("accentAuto", s.accentAuto); get("autoLyrics", s.autoLyrics); get("particles", s.particles); get("pinned", s.pinned);
+    for (int i = 0; i < 3; i++) {
+        if (j.contains("accentRGB") && j["accentRGB"].size() == 3) s.accent[i] = j["accentRGB"][i].get<float>();
+        if (j.contains("tint") && j["tint"].size() == 3) s.tint[i] = j["tint"][i].get<float>();
+    }
+}
+static void saveLinks() {
+    std::ofstream f((g_dir / "playlists.txt"));
+    for (auto& l : g_lists) if (l.custom) f << l.uri << "\n";
+}
+static void saveLocal() {
+    std::ofstream f((g_dir / "local.txt"));
+    if (List* l = findList("local"))
+        for (auto& t : l->tracks) f << t.uri << '\t' << t.title << '\t' << t.artist << '\t' << t.album << '\t' << t.ms << '\n';
+}
+static void saveMine() {  // playlists créées dans Glass (dont Favoris et Récents)
+    json a = json::array();
+    for (auto& l : g_lists) if (l.own) {
+        json t = json::array();
+        for (auto& x : l.tracks) t.push_back(trackJson(x));
+        a.push_back({{"uri", l.uri}, {"name", l.name}, {"image", l.image}, {"tracks", t}});
+    }
+    std::ofstream((g_dir / "myplaylists.json")) << a.dump();
+}
+static void saveOverrides() {
+    json j = json::object();
+    for (auto& [k, v] : g_over) j[k] = {{"name", v.first}, {"image", v.second}};
+    std::ofstream((g_dir / "overrides.json")) << j.dump(1);
+}
+static void applyOverride(List& l) {
+    auto it = g_over.find(l.uri);
+    if (it == g_over.end()) return;
+    if (!it->second.first.empty()) l.name = it->second.first;
+    if (!it->second.second.empty()) l.image = it->second.second;
+}
+static void loadSaved() {
+    List local{"local", "Mes musiques"}; local.loaded = true;
+    std::ifstream f((g_dir / "local.txt"));
+    for (std::string line; std::getline(f, line);) {
+        std::stringstream ss(line); Track t; std::string ms;
+        std::getline(ss, t.uri, '\t'); std::getline(ss, t.title, '\t'); std::getline(ss, t.artist, '\t'); std::getline(ss, t.album, '\t'); std::getline(ss, ms, '\t');
+        if (t.uri.empty()) continue;
+        t.ms = atoi(ms.c_str()); t.local = true; t.image = "thumb:" + t.uri;
+        local.tracks.push_back(t);
+    }
+    g_lists.push_back(local);
+
+    std::ifstream o((g_dir / "overrides.json"));
+    json ov = json::parse(o, nullptr, false);
+    if (ov.is_object()) for (auto& [k, v] : ov.items()) g_over[k] = {jstr(v, "name"), jstr(v, "image")};
+
+    std::ifstream m((g_dir / "myplaylists.json"));
+    json mine = json::parse(m, nullptr, false);
+    if (mine.is_array()) for (auto& p : mine) {
+        List l{jstr(p, "uri"), jstr(p, "name"), jstr(p, "image")};
+        l.own = l.loaded = true;
+        for (auto& t : p["tracks"]) l.tracks.push_back(trackFrom(t));
+        g_lists.push_back(l);
+    }
+    if (!findList("glass:favoris")) { List l{"glass:favoris", "Favoris"}; l.own = l.loaded = true; g_lists.push_back(l); }
+    if (!findList("glass:recent")) { List l{"glass:recent", "Écoutés récemment"}; l.own = l.loaded = true; g_lists.push_back(l); }
+
+    std::ifstream p((g_dir / "playlists.txt"));
+    for (std::string line; std::getline(p, line);)
+        if (auto u = toUri(line); !u.empty() && !findList(u)) { List l{u, "Chargement..."}; l.custom = true; g_lists.push_back(l); }
+    for (auto& l : g_lists) applyOverride(l);
+}
+
+static bool isFav(const std::string& uri) {
+    List* f = findList("glass:favoris");
+    return f && std::any_of(f->tracks.begin(), f->tracks.end(), [&](const Track& t) { return t.uri == uri; });
+}
+static void toggleFav(const Track& t) {
+    List* f = findList("glass:favoris");
+    auto it = std::find_if(f->tracks.begin(), f->tracks.end(), [&](const Track& x) { return x.uri == t.uri; });
+    if (it != f->tracks.end()) f->tracks.erase(it); else f->tracks.insert(f->tracks.begin(), t);
+    saveMine();
+}
+static void addRecent(const Track& t) {
+    List* r = findList("glass:recent");
+    if (!r || g_plUri == r->uri) return;  // on ne réordonne pas la liste qu'on est en train d'écouter
+    r->tracks.erase(std::remove_if(r->tracks.begin(), r->tracks.end(), [&](const Track& x) { return x.uri == t.uri; }), r->tracks.end());
+    r->tracks.insert(r->tracks.begin(), t);
+    if (r->tracks.size() > 100) r->tracks.resize(100);
+    saveMine();
+}
+static void addToList(List& l, const Track& t) {
+    if (std::none_of(l.tracks.begin(), l.tracks.end(), [&](const Track& x) { return x.uri == t.uri; })) l.tracks.push_back(t);
+    if (l.image.empty()) l.image = t.image;
+    g_status = "Ajouté à « " + l.name + " »";
+    saveMine();
+}
+
+// ---------- fichiers locaux ----------
+static bool isAudio(const fs::path& p) {
+    std::string e = ustr(p.extension());
+    std::transform(e.begin(), e.end(), e.begin(), [](unsigned char c) { return (char)tolower(c); });
+    for (auto x : {".mp3", ".m4a", ".aac", ".flac", ".wav", ".wma", ".ogg", ".opus"}) if (e == x) return true;
+    return false;
+}
+
+static Track readLocal(const fs::path& path) {
+    Track t; t.local = true; t.uri = ustr(path); t.image = "thumb:" + t.uri;
+    t.title = ustr(path.stem());
+    plat::readTags(path, t.title, t.artist, t.album, t.ms);
+    for (auto* s : {&t.title, &t.artist, &t.album}) std::replace_if(s->begin(), s->end(), [](char c) { return c == '\t' || c == '\n' || c == '\r'; }, ' ');
+    return t;
+}
+
+static void addLocal(std::vector<fs::path> paths) {  // fichiers et/ou dossiers (récursif)
+    std::thread([paths] {
+        std::vector<Track> found;
+        for (auto& p : paths) {
+            try {
+                if (fs::is_directory(p)) {
+                    for (auto& e : fs::recursive_directory_iterator(p, fs::directory_options::skip_permission_denied))
+                        if (e.is_regular_file() && isAudio(e.path())) found.push_back(readLocal(e.path()));
+                } else if (isAudio(p)) found.push_back(readLocal(p));
+            } catch (...) {}
+        }
+        {
+            std::lock_guard lk(g_mx);
+            List* l = findList("local");
+            int added = 0;
+            for (auto& t : found)
+                if (std::none_of(l->tracks.begin(), l->tracks.end(), [&](const Track& x) { return x.uri == t.uri; })) { l->tracks.push_back(t); added++; }
+            g_status = added ? std::to_string(added) + " musique(s) ajoutée(s)" : "Aucun fichier audio trouvé";
+            saveLocal();
+        }
+        wake();
+    }).detach();
+}
+
+// ---------- Apple Music : la page publique d'une playlist ou d'un album contient ses titres (pas de compte) ----------
+// shortcut: seulement les titres présents dans la page, à compléter si de longues playlists arrivent tronquées.
+static const json& jget(const json& j, const char* k) { static const json none; return j.is_object() && j.contains(k) ? j[k] : none; }
+
+static std::string appleArt(const json& item) {  // modèle ".../{w}x{h}bb.{f}" -> 300x300 jpg
+    std::string u = jstr(jget(jget(item, "artwork"), "dictionary"), "url");
+    static const std::pair<const char*, const char*> subs[] = {{"{w}", "300"}, {"{h}", "300"}, {"{c}", ""}, {"{f}", "jpg"}};
+    for (auto [a, b] : subs)
+        if (size_t p = u.find(a); p != std::string::npos) u.replace(p, strlen(a), b);
+    return u;
+}
+
+static void loadApple(const std::string& url) {
+    std::thread([url] {
+        std::string html = plat::httpGet(url), name, image;
+        std::vector<Track> tracks;
+        size_t a = html.find("id=\"serialized-server-data\"");
+        if (a != std::string::npos) a = html.find('>', a);
+        size_t b = a == std::string::npos ? a : html.find("</script>", a);
+        json d = b == std::string::npos ? json() : json::parse(html.substr(a + 1, b - a - 1), nullptr, false);
+        json page = d.is_object() && d["data"].is_array() && !d["data"].empty() ? d["data"][0]["data"] : json();
+        for (auto& sec : jget(page, "sections")) {
+            std::string kind = jstr(sec, "itemKind");
+            if (kind == "containerDetailHeaderLockup") for (auto& it : jget(sec, "items")) { name = jstr(it, "title"); image = appleArt(it); }
+            if (kind != "trackLockup") continue;
+            for (auto& it : jget(sec, "items")) {
+                Track t;
+                std::string id = jstr(jget(jget(it, "contentDescriptor"), "identifiers"), "storeAdamID");
+                t.uri = "apple:song:" + id; t.title = jstr(it, "title"); t.artist = jstr(it, "artistName");
+                t.ms = (int)jnum(it, "duration"); t.image = appleArt(it);
+                const json& links = jget(it, "tertiaryLinks");
+                if (links.is_array() && !links.empty()) t.album = jstr(links[0], "title");
+                if (!id.empty() && !t.title.empty()) tracks.push_back(t);
+            }
+        }
+        {
+            std::lock_guard lk(g_mx);
+            if (List* l = findList(url)) {
+                l->loaded = true;
+                if (tracks.empty()) { l->name = "Introuvable"; g_status = "Apple Music : impossible de lire cette page"; }
+                else {
+                    for (auto& t : tracks) { if (t.image.empty()) t.image = image; if (t.album.empty()) t.album = name; }  // albums : pochette et nom de l'album
+                    if (!name.empty()) l->name = name;
+                    if (l->image.empty()) l->image = image;
+                    l->tracks = std::move(tracks);
+                }
+                applyOverride(*l);
+            }
+        }
+        wake();
+    }).detach();
+}
+
+// ---------- moteur Spotify (glass-engine : bibliothèque, paroles, Web API) ----------
+static void send(const json& j) { plat::engineSend(j.dump() + "\n"); }
+
+static void requestTracks(List& l) {
+    if (l.requested || l.own || l.uri == "local" || l.uri == "search") return;
+    if (isApple(l.uri)) { l.requested = true; loadApple(l.uri); return; }
+    if (!g_spReady) return;
+    l.requested = true;
+    send({{"cmd", "tracks"}, {"uri", l.uri}});
+}
+
+static void ytPlay(const Track& t);
+static void wvPost(const json& j);
+
+static void onEngine(const std::string& line) try {
+    json j = json::parse(line, nullptr, false);
+    std::lock_guard lk(g_mx);
+    if (j.is_discarded() || !j.is_object()) {
+        if (line.find("panicked") != std::string::npos) g_status = "Erreur moteur : " + line.substr(0, 160);
+        return;
+    }
+    std::string ev = jstr(j, "ev");
+    if (ev == "status" || ev == "error") g_status = jstr(j, "msg");
+    else if (ev == "ready") {
+        g_spReady = true; g_user = jstr(j, "user"); g_status.clear();
+        for (auto& l : g_lists) if (l.custom) requestTracks(l);  // pour afficher leurs noms
+    } else if (ev == "library") {
+        std::vector<List> next;
+        for (auto& it : j["items"]) {
+            List l{jstr(it, "uri"), jstr(it, "name"), jstr(it, "image")};
+            if (List* old = findList(l.uri)) { l.tracks = std::move(old->tracks); l.loaded = old->loaded; l.requested = old->requested; }
+            applyOverride(l);
+            next.push_back(std::move(l));
+        }
+        for (auto& l : g_lists)
+            if ((l.custom || l.own || l.uri == "local") && std::none_of(next.begin(), next.end(), [&](const List& x) { return x.uri == l.uri; })) next.push_back(std::move(l));
+        g_lists = std::move(next);
+    } else if (ev == "tracks") {
+        if (List* l = findList(jstr(j, "uri"))) {
+            l->loaded = true; l->tracks.clear();
+            if (auto n = jstr(j, "name"); !n.empty()) l->name = n;
+            for (auto& t : j["items"]) if (Track x = trackFrom(t); !x.uri.empty()) l->tracks.push_back(x);
+            if (l->image.empty() && !l->tracks.empty()) l->image = l->tracks[0].image;
+            if (j.contains("error")) { g_status = "Impossible de charger : " + jstr(j, "error"); if (l->custom) l->name = "Introuvable"; }
+            applyOverride(*l);
+        }
+    } else if (ev == "lyrics" && jstr(j, "key") == g_lyrKey) {
+        g_lyr.clear();
+        for (auto& l : j["lines"]) g_lyr.push_back({(int)jnum(l, "t"), jstr(l, "w")});
+        g_lyrSynced = j.value("synced", false);
+        g_lyrSrc = jstr(j, "src");
+        g_lyrState = g_lyr.empty() ? 3 : 2;
+    } else if (ev == "search" && jstr(j, "q") == g_searchSent) {
+        // résultats du catalogue ajoutés après ceux de ta bibliothèque
+        for (auto& t : j["items"]) if (Track x = trackFrom(t); !x.uri.empty() &&
+            std::none_of(g_search.tracks.begin(), g_search.tracks.end(), [&](const Track& y) { return y.uri == x.uri; })) g_search.tracks.push_back(x);
+    } else if (ev == "web") {
+        g_webOk = j.value("ok", false);
+        if (j.contains("msg")) g_status = jstr(j, "msg");
+        else if (g_webOk && g_status.rfind("Accepte", 0) == 0) g_status = "Spotify officiel connecté";
+    } else if (ev == "token") {
+        wvPost({{"token", jstr(j, "token")}});
+    } else if (ev == "api") {
+        int st = (int)jnum(j, "status");
+        if (st < 200 || st >= 300) {
+            g_status = "Spotify : " + (jstr(j, "msg").empty() ? "erreur " + std::to_string(st) : jstr(j, "msg"));
+            if (jstr(j, "id") == "play" && g_sp) {  // le lecteur officiel refuse ce titre
+                g_sp = false; g_loading = false;
+                if (g_set.source == 0 && g_has) ytPlay(g_cur);
+                else g_failed = true;
+            }
+        }
+    }
+} catch (...) {}  // une ligne inattendue ne doit pas tuer le lecteur
+
+static int g_engGen = 0;  // l'arrêt d'un ancien moteur ne doit pas marquer le nouveau comme arrêté
+
+static void startEngine() {
+#ifdef _WIN32
+    fs::path exe = g_bin / "glass-engine.exe";
+#else
+    fs::path exe = g_bin / "glass-engine";
+#endif
+    if (!fs::exists(exe)) { g_status = "glass-engine manquant : relance la compilation"; return; }
+    int gen = ++g_engGen;
+    g_engineOk = plat::engineStart(exe, onEngine, [gen] { std::lock_guard lk(g_mx); if (gen == g_engGen) g_engineOk = g_spReady = false; });
+    if (!g_engineOk) g_status = "Impossible de lancer glass-engine";
+}
+
+static void logout() {  // oublie le compte Spotify et redemande la connexion
+    plat::engineStop();
+    std::error_code ec;
+    fs::remove(g_dir / "spotify-cache" / "credentials.json", ec);
+    fs::remove(g_dir / "spotify-cache" / "webapi.json", ec);
+    g_lists.erase(std::remove_if(g_lists.begin(), g_lists.end(), [](const List& l) { return !l.custom && !l.own && l.uri != "local"; }), g_lists.end());
+    for (auto& l : g_lists) l.requested = false;
+    g_spReady = g_webOk = false; g_user.clear();
+    startEngine();
+}
+
+// ---------- YouTube : l'audio des titres Spotify / Apple Music (mode Auto ou YouTube) ----------
+#ifdef _WIN32
+static const char* kNoYtdlp = "yt-dlp introuvable : winget install yt-dlp.yt-dlp";
+#else
+static const char* kNoYtdlp = "yt-dlp en cours d'installation, réessaie dans un instant";
+#endif
+
+static fs::path cachePath(const Track& t) { return g_dir / "cache" / upath(t.uri.substr(t.uri.rfind(':') + 1) + ".m4a"); }
+
+// Télécharge l'audio d'un titre dans cache ; renvoie le chemin ou "" si introuvable.
+static fs::path ytDownload(const Track& t) {
+    fs::path path = cachePath(t), base = path, ytdlp = plat::findTool("yt-dlp");
+    base.replace_extension();
+    for (;;) {  // un seul yt-dlp par titre à la fois (lecture + préchargement)
+        { std::lock_guard lk(g_mx); if (!g_inflight.count(t.uri)) { g_inflight.insert(t.uri); break; } }
+        std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    }
+    std::string bare = std::regex_replace(t.title, std::regex(R"(\s*[\(\[][^\)\]]*[\)\]])"), "");
+    std::string artist1 = t.artist.substr(0, t.artist.find(','));
+    int sec = t.ms / 1000, tol = std::max(10, sec / 10);
+    std::string filter = "duration>=" + std::to_string(sec - tol) + " & duration<=" + std::to_string(sec + tol);
+    // la bonne durée ne suffit pas (autre morceau de même longueur) : le titre doit contenir son premier mot
+    std::string word = bare.substr(0, bare.find(' '));
+    word.erase(std::remove_if(word.begin(), word.end(), [](unsigned char c) { return c < 0x80 && !isalnum(c); }), word.end());
+    if (word.size() >= 2) filter += " & title~='(?i)" + word + "'";
+    auto ytm = [](const std::string& q) {  // recherche « titres » de YouTube Music : les versions officielles, comme sur Spotify
+        std::string u = "https://music.youtube.com/search?q=";
+        for (unsigned char c : q) { char h[4]; if (isalnum(c)) u += (char)c; else { snprintf(h, sizeof h, "%%%02X", c); u += h; } }
+        return u + "#songs";
+    };
+    // D'abord la bonne durée (évite clips, live, versions longues), puis sans filtre.
+    // YouTube classique filtre certains mots (aucun résultat) : YouTube Music passe en premier.
+    struct Try { std::string target; bool filtered; };
+    std::string full = t.artist + " " + t.title;
+    std::vector<Try> tries = {{ytm(full), true}, {"ytsearch5:" + t.artist + " - " + t.title + " audio", true},
+                              {"ytsearch5:" + artist1 + " " + bare, true}, {ytm(full), false}, {"ytsearch1:" + t.artist + " - " + t.title, false}};
+    for (auto& [target, filtered] : tries) {
+        if (ytdlp.empty() || fileExists(path)) break;
+        if (filtered && !sec) continue;
+        std::string q = target;
+        q.erase(std::remove_if(q.begin(), q.end(), [](char c) { return c == '"' || c == '\\'; }), q.end());
+#ifdef _WIN32
+        std::vector<std::string> args = {ustr(ytdlp), "-f", "bestaudio[ext=m4a]/bestaudio", "-x", "--audio-format", "m4a"};
+#else
+        std::vector<std::string> args = {ustr(ytdlp), "-f", "bestaudio[ext=m4a]"};  // sans ffmpeg : directement en m4a, lu par AVFoundation
+#endif
+        args.insert(args.end(), {"-q", "--no-warnings", "-o", ustr(base) + ".%(ext)s"});
+        if (filtered) args.insert(args.end(), {"--playlist-items", "1:5", "--match-filter", filter, "--max-downloads", "1"});
+        else args.insert(args.end(), {"--playlist-items", "1"});
+        args.push_back(q);
+        plat::run(args, 120000);
+    }
+    std::lock_guard lk(g_mx);
+    g_inflight.erase(t.uri);
+    return fileExists(path) ? path : fs::path();
+}
+
+// ---------- paroles générées par IA (whisper.cpp, sur l'ordinateur) quand aucune n'existe ----------
+// shortcut: échoue sur les voix noyées (versions très accélérées) ; la séparation voix/musique serait trop lourde.
+static bool g_genRunning = false;
+
+static fs::path lyricsFile(const Track& t, const char* ext) {
+    std::string id = t.local ? std::to_string(std::hash<std::string>{}(t.uri)) : t.uri.substr(t.uri.rfind(':') + 1);
+    return g_dir / "lyrics" / upath(id + ext);
+}
+
+// Téléchargement avec avancement dans la barre d'état.
+static bool httpDownload(const std::string& url, const fs::path& path, const std::string& what) {
+    return plat::download(url, path, [&](int pct) { { std::lock_guard lk(g_mx); g_status = what + " : " + std::to_string(pct) + " %"; } wake(); });
+}
+
+// Lit un .lrc, retire les inventions typiques de Whisper (sous-titres, « musique »...) et recale les temps.
+static std::vector<LyricLine> cleanLrc(const fs::path& path, double scale) {
+    std::vector<LyricLine> out;
+    std::ifstream f(path);
+    static const char* junk[] = {"subtitle", "sous-titr", "amara", "thanks for watching", "merci d'avoir", "music", "musique", "musik",
+                                 "субтитр", "редактор", "корректор", "продолжение следует", "музык", "by:whisper", "♪"};
+    for (std::string l; std::getline(f, l);) {
+        if (l.size() < 10 || l[0] != '[' || !isdigit((unsigned char)l[1])) continue;
+        int mm = atoi(l.c_str() + 1); double ss = atof(l.c_str() + 4);
+        std::string w = l.substr(l.find(']') + 1);
+        w.erase(0, w.find_first_not_of(' '));
+        std::string low = w;
+        std::transform(low.begin(), low.end(), low.begin(), [](unsigned char c) { return (char)tolower(c); });
+        if (w.empty() || w[0] == '[' || w[0] == '(' || std::any_of(std::begin(junk), std::end(junk), [&](const char* j) { return low.find(j) != std::string::npos; })) continue;
+        if (out.size() >= 2 && out.back().w == w && out[out.size() - 2].w == w) continue;  // boucle d'hallucination
+        out.push_back({(int)((mm * 60 + ss) * 1000 * scale), w});
+    }
+    return out;
+}
+
+static void loadLrcInto(const fs::path& path, double scale) {  // g_mx tenu
+    g_lyr = cleanLrc(path, scale);
+    g_lyrSynced = true; g_lyrSrc = "générées par IA (Whisper, sur ton ordinateur)";
+    g_lyrState = g_lyr.size() >= 2 ? 2 : 3;
+}
+
+static void generateLyrics(const Track& t) {  // g_mx tenu
+    if (g_genRunning) return;
+    g_genRunning = true; g_lyrState = 4;
+    std::thread([t] {
+        fs::path wdir = g_dir / "whisper", model = wdir / "ggml-small-q5_1.bin";
+        std::error_code ec;
+        fs::create_directories(wdir, ec);
+        fs::create_directories(g_dir / "lyrics", ec);
+        auto fail = [&](const std::string& msg) {
+            std::lock_guard lk(g_mx);
+            g_genRunning = false; g_status = msg;
+            if (g_lyrKey == t.uri) g_lyrState = 5;
+            wake();
+        };
+#ifdef _WIN32
+        fs::path exe = wdir / "Release" / "whisper-cli.exe";
+        if (!fileExists(exe)) {  // première fois : le programme (8 Mo) puis le modèle multilingue (190 Mo)
+            fs::path zip = wdir / "whisper.zip";
+            if (!httpDownload("https://github.com/ggml-org/whisper.cpp/releases/download/b5454/whisper-bin-x64.zip", zip, "Générateur de paroles")) return fail("Téléchargement du générateur impossible");
+            plat::run({"tar.exe", "-xf", ustr(zip), "-C", ustr(wdir)}, 60000);
+            fs::remove(zip, ec);
+            if (!fileExists(exe)) return fail("Générateur de paroles : installation impossible");
+        }
+#else
+        fs::path exe = plat::findTool("whisper-cli");  // fourni avec Glass.app
+        if (exe.empty()) return fail("Générateur de paroles absent de Glass.app");
+#endif
+        if (!fileExists(model) && !httpDownload("https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-small-q5_1.bin", model, "Modèle de paroles (190 Mo, une seule fois)"))
+            return fail("Téléchargement du modèle impossible");
+        { std::lock_guard lk(g_mx); g_status = "Écoute du titre pour écrire les paroles..."; } wake();
+        fs::path audio = t.local ? upath(t.uri) : ytDownload(t);  // le son du lecteur Spotify est protégé : on prend la copie YouTube
+        if (audio.empty()) return fail("Paroles : audio introuvable");
+        fs::path wav = g_dir / "lyrics" / "tmp.wav", out = lyricsFile(t, ""), lrc = lyricsFile(t, ".lrc"), none = lyricsFile(t, ".none");
+#ifdef _WIN32
+        if (!plat::run({"ffmpeg.exe", "-loglevel", "error", "-y", "-i", ustr(audio), "-ar", "16000", "-ac", "1", "-c:a", "pcm_s16le", ustr(wav)}, 120000))
+            return fail("Paroles : ffmpeg introuvable (winget install ffmpeg)");
+#else
+        if (!plat::run({"/usr/bin/afconvert", "-f", "WAVE", "-d", "LEI16@16000", "-c", "1", ustr(audio), ustr(wav)}, 120000))
+            return fail("Paroles : conversion de l'audio impossible");
+#endif
+        auto bytes = fs::file_size(wav, ec);
+        double wavMs = ec || bytes < 44 ? 0 : (bytes - 44) / 32.0;  // 16 kHz, 16 bits, mono
+        if (t.ms > 0 && wavMs > 0 && std::fabs(t.ms / wavMs - 1) > 0.25) {  // autre morceau (remix, version longue...) : paroles fausses
+            fs::remove(wav, ec);
+            std::ofstream{none};  // ne pas réessayer à chaque ouverture
+            return fail("Paroles : la copie YouTube n'est pas la même version, rien de fiable");
+        }
+        int threads = std::max(2, (int)std::thread::hardware_concurrency() / 2);  // la moitié du processeur, priorité basse
+        bool ok = plat::run({ustr(exe), "-m", ustr(model), "-f", ustr(wav), "-l", "auto", "-t", std::to_string(threads), "-olrc", "-of", ustr(out), "-np", "-sns"}, 600000);
+        fs::remove(wav, ec);
+        if (!ok || !fileExists(lrc)) return fail("Paroles : la génération a échoué");
+        double scale = t.ms > 0 && wavMs > 0 && std::fabs(t.ms / wavMs - 1) > 0.04 ? t.ms / wavMs : 1;  // version YouTube d'une autre durée
+        std::lock_guard lk(g_mx);
+        auto lines = cleanLrc(lrc, scale);
+        if (lines.size() < 2) fs::rename(lrc, none, ec);
+        else {  // on garde la version propre et déjà recalée
+            std::ofstream f(lrc);
+            for (auto& l : lines) { char ts[16]; snprintf(ts, sizeof ts, "[%02d:%05.2f]", l.t / 60000, (l.t % 60000) / 1000.0); f << ts << " " << l.w << "\n"; }
+        }
+        g_genRunning = false;
+        g_status = lines.size() < 2 ? "Paroles : voix trop couverte par la musique, rien de fiable" : "Paroles générées";
+        if (g_lyrKey == t.uri) { if (lines.size() >= 2) loadLrcInto(lrc, 1); else g_lyrState = 5; }
+        wake();
+    }).detach();
+}
+
+// ---------- lecture (appelé avec g_mx verrouillé) ----------
+static void wvPost(const json& j) { g_wvOut.push_back(j.dump()); wake(); }
+
+static void audioPlay(const fs::path& path) {
+    plat::audioPlay(path);
+    plat::audioRate(g_set.speed);
+    g_loading = false;
+}
+
+static double posMs() {
+    if (!g_has) return 0;
+    if (g_sp) return std::min(g_spPos + (g_spPaused || g_loading ? 0 : (now() - g_spT) * 1000), std::max(g_spDur, (double)g_cur.ms));
+    return plat::audioPos() * 1000;
+}
+static double durMs() {
+    if (!g_has) return 0;
+    if (g_sp) return g_spDur > 0 ? g_spDur : g_cur.ms;
+    double d = g_loading ? 0 : plat::audioDur();
+    return d > 0 ? d * 1000 : g_cur.ms;
+}
+static bool isPlaying() { return g_has && !g_loading && (g_sp ? !g_spPaused : !plat::audioPaused()); }
+
+static void stopSp() {
+    if (!g_sp) return;
+    wvPost({{"cmd", "stop"}});
+    g_sp = false;
+}
+
+static void pausePlayback() {
+    if (g_sp) { g_spPos = posMs(); g_spT = now(); g_spPaused = true; wvPost({{"cmd", "pause"}}); }
+    else plat::audioPause();
+}
+
+// Les prochains titres : la file d'attente d'abord, puis la suite de la liste.
+static std::vector<Track> upcoming(int n) {
+    std::vector<Track> out(g_queue.begin(), g_queue.begin() + std::min<size_t>(n, g_queue.size()));
+    List* l = findList(g_plUri);
+    for (int k = 1; l && (int)out.size() < n && k < (int)g_order.size(); k++) {
+        int i = g_order[(g_pos + k) % g_order.size()];
+        if (i < (int)l->tracks.size()) out.push_back(l->tracks[i]);
+    }
+    return out;
+}
+
+static void ytPlay(const Track& t) {
+    stopSp();
+    plat::audioPause();
+    g_loading = true;
+    if (plat::findTool("yt-dlp").empty()) {
+        g_loading = false; g_failed = true;
+        g_status = kNoYtdlp;
+        return;
+    }
+    if (!fileExists(cachePath(t)) && g_status.empty()) g_status = "Recherche de « " + t.title + " »...";
+    int gen = g_gen;
+    std::thread([gen, cur = t, next = upcoming(g_set.prefetch)] {
+        fs::path path = ytDownload(cur);
+        {
+            std::lock_guard lk(g_mx);
+            if (gen != g_gen) return;
+            if (path.empty()) { g_loading = false; g_failed = true; g_status = "Introuvable sur YouTube : " + cur.title; }
+            else g_ready = path;
+        }
+        wake();
+        for (auto& n : next) if (!n.local) ytDownload(n);  // préchargés pendant l'écoute
+    }).detach();
+}
+
+// ---------- hors ligne : télécharge à l'avance les titres d'une playlist (audio YouTube, en cache) ----------
+static std::deque<Track> g_dl;
+static int g_dlDone = 0, g_dlTotal = 0;
+static bool g_dlRunning = false;
+
+static bool isCached(const Track& t) { return t.local || fileExists(cachePath(t)); }
+
+static void downloadAll(const List& l) {
+    if (plat::findTool("yt-dlp").empty()) { g_status = kNoYtdlp; return; }
+    int n = 0;
+    for (auto& t : l.tracks)
+        if (!isCached(t) && std::none_of(g_dl.begin(), g_dl.end(), [&](const Track& x) { return x.uri == t.uri; })) { g_dl.push_back(t); n++; }
+    g_dlTotal += n;
+    g_status = n ? "Hors ligne : " + std::to_string(n) + " titres à télécharger..." : "« " + l.name + " » est déjà disponible hors ligne";
+    if (g_dlRunning || !n) return;
+    g_dlRunning = true;
+    std::thread([] {  // un titre à la fois, en arrière-plan
+        for (;;) {
+            Track t;
+            {
+                std::lock_guard lk(g_mx);
+                if (g_dl.empty()) {
+                    if (g_dlTotal) g_status = "Hors ligne : " + std::to_string(g_dlDone) + " titres téléchargés";
+                    g_dlRunning = false; g_dlDone = g_dlTotal = 0;
+                    break;
+                }
+                t = g_dl.front(); g_dl.pop_front();
+            }
+            ytDownload(t);
+            {
+                std::lock_guard lk(g_mx);
+                g_dlDone++;
+                if (g_dlTotal) g_status = "Hors ligne : " + std::to_string(g_dlDone) + " / " + std::to_string(g_dlTotal);
+            }
+            wake();
+        }
+        wake();
+    }).detach();
+}
+
+static void startTrack(const Track& t) {
+    g_cur = t; g_has = true;
+    g_failed = g_spEnded = false; ++g_gen;
+    g_status.clear();
+    addRecent(t);
+    if (t.local) { stopSp(); audioPlay(upath(t.uri)); return; }
+    bool spotify = t.uri.rfind("spotify:", 0) == 0;  // Apple Music : toujours via YouTube
+    if (spotify && g_set.source != 2 && g_sdkReady) {  // lecteur officiel : la vraie version, Premium
+        plat::audioPause();
+        g_sp = true; g_loading = true; g_spPaused = false;
+        g_spPos = 0; g_spDur = t.ms; g_spT = now();
+        wvPost({{"cmd", "expect"}, {"uri", t.uri}});
+        send({{"cmd", "api"}, {"id", "play"}, {"method", "PUT"}, {"path", "/v1/me/player/play?device_id=" + g_sdkDevice}, {"body", {{"uris", {t.uri}}}}});
+        return;
+    }
+    if (spotify && g_set.source == 1) {  // Spotify uniquement
+        stopSp(); plat::audioPause(); g_failed = true;
+        g_status = g_webOk ? "Lecteur Spotify pas encore prêt..." : "Spotify uniquement : connecte le lecteur officiel dans Réglages";
+        return;
+    }
+    ytPlay(t);
+}
+
+static void playPos(int pos) {
+    List* l = findList(g_plUri);
+    if (!l || g_order.empty() || pos >= (int)g_order.size() || g_order[pos] >= (int)l->tracks.size()) return;
+    g_pos = pos; g_tr = g_order[pos];
+    startTrack(l->tracks[g_tr]);
+}
+
+// Lance la liste à partir du titre tr ; view = ordre affiché (tri/filtre) si fourni.
+static void play(const std::string& uri, int tr, const std::vector<int>* view = nullptr) {
+    List* l = findList(uri);
+    if (!l || l->tracks.empty()) return;
+    g_plUri = uri;
+    if (view && !view->empty()) g_order = *view;
+    else { g_order.resize(l->tracks.size()); for (int i = 0; i < (int)g_order.size(); i++) g_order[i] = i; }
+    auto it = std::find(g_order.begin(), g_order.end(), tr);
+    if (it == g_order.end()) { g_order.insert(g_order.begin(), tr); it = g_order.begin(); }
+    if (g_shuffle) {
+        std::iter_swap(g_order.begin(), it);
+        std::shuffle(g_order.begin() + 1, g_order.end(), std::mt19937{std::random_device{}()});
+        playPos(0);
+    } else playPos((int)(it - g_order.begin()));
+}
+
+static void step(int d) {
+    if (d == 0 && g_has) { Track t = g_cur; startTrack(t); return; }
+    if (d > 0 && !g_queue.empty()) { Track t = g_queue.front(); g_queue.pop_front(); g_tr = -1; startTrack(t); return; }
+    List* l = findList(g_plUri);
+    if (!l || g_order.empty()) return;
+    int n = (int)g_order.size();
+    if (d > 0 && g_pos + 1 >= n && g_set.stopAtEnd) { pausePlayback(); g_status = "Fin de la liste"; return; }
+    playPos(((g_pos + d) % n + n) % n);
+}
+
+static void onTrackEnd() {
+    if (g_sleepEnd) { g_sleepEnd = false; pausePlayback(); g_status = "Minuterie : lecture arrêtée"; return; }
+    step(g_repeat ? 0 : 1);
+}
+
+static void togglePlay() {
+    if (!g_has || g_loading) return;
+    if (g_sp) { g_spPos = posMs(); g_spT = now(); g_spPaused = !g_spPaused; wvPost({{"cmd", "toggle"}}); return; }
+    if (plat::audioPaused()) plat::audioResume(); else plat::audioPause();
+}
+
+static void seekMs(double ms) {
+    if (g_sp) {  // seek() du SDK est ignoré une fois la lecture lancée : on passe par la Web API
+        g_spPos = ms; g_spT = now();
+        send({{"cmd", "api"}, {"method", "PUT"}, {"path", "/v1/me/player/seek?position_ms=" + std::to_string((int)ms) + "&device_id=" + g_sdkDevice}});
+    }
+    else if (g_has) plat::audioSeek(ms / 1000);
+}
+
+static void setVolume() {
+    plat::audioVolume(g_set.vol * g_set.vol);
+    if (g_wvStarted) wvPost({{"cmd", "volume"}, {"v", std::max(g_set.vol * g_set.vol, 0.0001f)}});  // le SDK ignore 0
+}
+
+
+// ---------- lecteur Spotify officiel : Web Playback SDK dans une page web invisible (WebView2 / WKWebView) ----------
+static const char* kPlayerHtml = R"HTML(<!doctype html><meta charset="utf-8"><title>Glass</title>
+<script>
+// Windows : WebView2 (chrome.webview) ; Mac : WKWebView (webkit.messageHandlers, et glassIn() pour les messages de Glass)
+const wv = window.chrome && chrome.webview ? chrome.webview : {
+  postMessage: m => webkit.messageHandlers.glass.postMessage(JSON.stringify(m)),
+  addEventListener: (_, f) => { window.glassIn = d => f({data: d}); }
+};
+let player = null, waiting = [], expect = '';
+const isExp = t => t && expect && (t.uri === expect || (t.linked_from && t.linked_from.uri === expect));
+wv.addEventListener('message', e => {
+  const m = e.data;
+  if (m.token) { const w = waiting; waiting = []; w.forEach(cb => cb(m.token)); return; }
+  if (m.cmd === 'expect') { expect = m.uri; return; }
+  if (!player) return;
+  if (m.cmd === 'toggle') player.togglePlay();
+  else if (m.cmd === 'pause') player.pause();
+  else if (m.cmd === 'stop') { expect = ''; player.pause(); }
+  else if (m.cmd === 'seek') player.seek(m.ms);
+  else if (m.cmd === 'volume') player.setVolume(m.v);
+});
+window.onSpotifyWebPlaybackSDKReady = () => {
+  player = new Spotify.Player({ name: 'Glass', volume: Math.max(parseFloat(new URLSearchParams(location.search).get('v') ?? '0.5') || 0, 0.0001), getOAuthToken: cb => { waiting.push(cb); wv.postMessage({t: 'token'}); } });
+  player.addListener('ready', ({device_id}) => wv.postMessage({t: 'ready', id: device_id}));
+  player.addListener('not_ready', () => wv.postMessage({t: 'notready'}));
+  const onState = s => {
+    if (!s) return wv.postMessage({t: 'state', none: true});
+    const c = s.track_window.current_track || {}, prev = s.track_window.previous_tracks || [];
+    // fin du titre attendu : il passe dans « précédents » (arrêt à 0 ou lecture auto d'autre chose)
+    if (expect && prev.some(isExp) && (!isExp(c) || (s.paused && s.position === 0))) { expect = ''; wv.postMessage({t: 'ended'}); return; }
+    wv.postMessage({t: 'state', paused: s.paused, pos: s.position, dur: s.duration});
+  };
+  player.addListener('player_state_changed', onState);
+  // le SDK reste souvent « loading » et se tait une fois lancé : on relit la position chaque seconde pendant la lecture
+  setInterval(async () => { if (expect) onState(await player.getCurrentState()); }, 1000);
+  for (const ev of ['initialization_error', 'authentication_error', 'account_error', 'playback_error', 'autoplay_failed'])
+    player.addListener(ev, e => wv.postMessage({t: 'error', msg: ev + ' ' + ((e && e.message) || '')}));
+  player.connect();
+};
+</script>
+<script src="https://sdk.scdn.co/spotify-player.js"></script>)HTML";
+
+static void onPlayer(const std::string& msg) try {  // messages de la page
+    json j = json::parse(msg);
+    std::lock_guard lk(g_mx);
+    std::string t = jstr(j, "t");
+    if (t == "token") send({{"cmd", "token"}});
+    else if (t == "ready") { g_sdkDevice = jstr(j, "id"); g_sdkReady = true; setVolume(); }
+    else if (t == "notready") g_sdkReady = false;
+    else if (t == "error") g_status = "Lecteur Spotify : " + jstr(j, "msg");
+    else if (t == "ended" && g_sp) g_spEnded = true;
+    else if (t == "state" && g_sp) {
+        if (j.value("none", false)) { g_spPaused = true; return; }
+        double pos = jnum(j, "pos"), dur = jnum(j, "dur");
+        bool paused = j.value("paused", true);
+        // filet de sécurité : arrêt à 0 juste après la fin du titre
+        if (paused && pos == 0 && g_spDur > 0 && posMs() > g_spDur - 4000 && !g_loading) { g_spEnded = true; return; }
+        g_spPaused = paused; g_spPos = pos; g_spT = now();
+        if (dur > 0) g_spDur = dur;
+        if ((!paused || pos > 0) && g_loading) { g_loading = false; setVolume(); }  // drapeau « loading » du SDK peu fiable ; volume réappliqué (ignoré avant la lecture)
+    }
+} catch (...) {}
+
+static void stopWebView() { plat::webStop(); g_wvStarted = g_sdkReady = g_sp = false; }
+static void startWebView() { g_wvStarted = true; plat::webStart(kPlayerHtml, g_set.vol * g_set.vol); }  // thread de la fenêtre
+
+// ---------- images (pochettes, fond flouté) ----------
+// Couleurs d'une pochette (calculées sur sa version floutée) : 4 coins + la plus vive.
+struct Palette { ImVec4 c[4], vivid; };
+struct TexJob { std::string key, src; int size; bool blur; };
+struct TexReady { std::string key, src; std::vector<uint8_t> px; int w = 0, h = 0; bool blur = false; Palette pal{}; };
+static std::deque<TexJob> g_jobs;
+static std::vector<TexReady> g_texReady;  // décodées par les threads, envoyées à la carte graphique par la fenêtre
+static std::condition_variable g_jobCv;
+static std::map<std::string, ImTextureID> g_tex;
+static std::map<std::string, Palette> g_pal;
+
+static void boxBlur(std::vector<uint8_t>& p, int w, int h, int r) {
+    std::vector<uint8_t> t(p.size());
+    for (int pass = 0; pass < 6; pass++, p.swap(t)) {  // 3 passes horizontales + 3 verticales ≈ flou gaussien
+        bool hz = pass % 2 == 0;
+        for (int y = 0; y < h; y++) for (int x = 0; x < w; x++) for (int c = 0; c < 4; c++) {
+            int s = 0;
+            for (int k = -r; k <= r; k++) s += hz ? p[(y * w + std::clamp(x + k, 0, w - 1)) * 4 + c] : p[(std::clamp(y + k, 0, h - 1) * w + x) * 4 + c];
+            t[(y * w + x) * 4 + c] = (uint8_t)(s / (2 * r + 1));
+        }
+    }
+}
+
+static Palette palette(const std::vector<uint8_t>& px, int tw, int th) {
+    Palette pal{};
+    float best = -1;
+    for (int q = 0; q < 4; q++) {  // moyenne de chaque quart de l'image
+        float r = 0, g = 0, b = 0; int n = 0;
+        for (int y = (q / 2) * th / 2; y < (q / 2 + 1) * th / 2; y++) for (int x = (q % 2) * tw / 2; x < (q % 2 + 1) * tw / 2; x++, n++) {
+            r += px[(y * tw + x) * 4]; g += px[(y * tw + x) * 4 + 1]; b += px[(y * tw + x) * 4 + 2];
+        }
+        n = std::max(n, 1);
+        pal.c[q] = {r / n / 255, g / n / 255, b / n / 255, 1};
+        float mx = std::max({pal.c[q].x, pal.c[q].y, pal.c[q].z}), mn = std::min({pal.c[q].x, pal.c[q].y, pal.c[q].z});
+        if (mx - mn > best) { best = mx - mn; pal.vivid = pal.c[q]; }
+    }
+    // couleur d'accent lisible : on pousse la saturation et la luminosité
+    ImVec4& v = pal.vivid;
+    float mx = std::max({v.x, v.y, v.z, 0.01f}), mn = std::min({v.x, v.y, v.z});
+    auto boost = [&](float c) { return std::clamp((c - mn) / std::max(mx - mn, 0.05f) * 0.75f + 0.25f, 0.f, 1.f); };
+    v = {boost(v.x), boost(v.y), boost(v.z), 1};
+    return pal;
+}
+
+static void texWorker() {
+    for (;;) {
+        TexJob j;
+        {
+            std::unique_lock lk(g_mx);
+            g_jobCv.wait(lk, [] { return !g_jobs.empty(); });
+            j = g_jobs.back(); g_jobs.pop_back();  // le plus récent d'abord = ce qui est à l'écran
+        }
+        TexReady r{j.key, j.src};
+        r.blur = j.blur;
+        if (!plat::decodeImage(j.src, j.size, r.px, r.w, r.h)) r.px.clear();
+        else if (j.blur) {
+            boxBlur(r.px, r.w, r.h, std::max(2, std::max(r.w, r.h) / 14));
+            r.pal = palette(r.px, r.w, r.h);
+        }
+        { std::lock_guard lk(g_mx); g_texReady.push_back(std::move(r)); }
+        wake();
+    }
+}
+
+static void uploadTextures() {  // g_mx tenu, thread de la fenêtre
+    for (auto& r : g_texReady) {
+        if (r.px.empty()) continue;  // échec : reste à 0 (pochette par défaut)
+        g_tex[r.key] = plat::makeTexture(r.px.data(), r.w, r.h);
+        if (r.blur) g_pal[r.src] = r.pal;
+    }
+    g_texReady.clear();
+}
+
+static ImTextureID tex(const std::string& src, int size, bool blur = false) {  // g_mx tenu ; 0 tant que pas chargé
+    if (src.empty()) return 0;
+    std::string key = src + "|" + std::to_string(size) + (blur ? "b" : "");
+    auto it = g_tex.find(key);
+    if (it != g_tex.end()) return it->second;
+    g_tex[key] = 0;
+    g_jobs.push_back({key, src, size, blur});
+    g_jobCv.notify_one();
+    return 0;
+}
+
+// ---------- UI ----------
+static ImVec4 g_accLive{0.12f, 0.84f, 0.38f, 1};  // couleur d'accent affichée (glisse vers la cible)
+static ImVec4 acc() { return g_accLive; }
+static ImU32 accU() { return ImGui::GetColorU32(acc()); }
+static ImFont *g_bold, *g_icons;
+#ifdef _WIN32  // icônes Segoe MDL2 Assets
+static const char *I_PLAY = u8"\uE768", *I_PAUSE = u8"\uE769", *I_PREV = u8"\uE892", *I_NEXT = u8"\uE893",
+                  *I_SHUFFLE = u8"\uE8B1", *I_REPEAT1 = u8"\uE8ED", *I_VOL = u8"\uE767", *I_ADD = u8"\uE710",
+                  *I_NOTE = u8"\uEC4F", *I_HEART = u8"\uEB52", *I_HEART_O = u8"\uEB51", *I_FOLDER = u8"\uE8D6", *I_MIN = u8"\uE921",
+                  *I_MAX = u8"\uE922", *I_RESTORE = u8"\uE923", *I_CLOSE = u8"\uE8BB", *I_GEAR = u8"\uE713",
+                  *I_LYRICS = u8"\uE720", *I_QUEUE = u8"\uE8FD", *I_MORE = u8"\uE712", *I_EDIT = u8"\uE70F",
+                  *I_MINI = u8"\uE73F", *I_EXPAND = u8"\uE740", *I_SEARCH = u8"\uE721", *I_HISTORY = u8"\uE81C", *I_LIST = u8"\uE8A4", *I_DOWNLOAD = u8"\uE896";
+#else  // icônes Material Icons (fournies avec Glass.app)
+static const char *I_PLAY = u8"\uE037", *I_PAUSE = u8"\uE034", *I_PREV = u8"\uE045", *I_NEXT = u8"\uE044",
+                  *I_SHUFFLE = u8"\uE043", *I_REPEAT1 = u8"\uE041", *I_VOL = u8"\uE050", *I_ADD = u8"\uE145",
+                  *I_NOTE = u8"\uE405", *I_HEART = u8"\uE87D", *I_HEART_O = u8"\uE87E", *I_FOLDER = u8"\uE2C7", *I_MIN = u8"\uE931",
+                  *I_MAX = u8"\uE3C6", *I_RESTORE = u8"\uE3E0", *I_CLOSE = u8"\uE5CD", *I_GEAR = u8"\uE8B8",
+                  *I_LYRICS = u8"\uE029", *I_QUEUE = u8"\uE03D", *I_MORE = u8"\uE5D3", *I_EDIT = u8"\uE3C9",
+                  *I_MINI = u8"\uE911", *I_EXPAND = u8"\uF1CE", *I_SEARCH = u8"\uE8B6", *I_HISTORY = u8"\uE889", *I_LIST = u8"\uE896", *I_DOWNLOAD = u8"\uF090";
+#endif
+
+static ImU32 col(float r, float g, float b, float a = 1) { return ImGui::GetColorU32(ImVec4{r, g, b, a}); }
+
+static std::string fmtTime(double ms) {
+    int s = ms > 0 ? (int)(ms / 1000) : 0;
+    char b[16]; snprintf(b, sizeof b, "%d:%02d", s / 60, s % 60);
+    return b;
+}
+
+// Texte coupé avec "…" s'il dépasse maxW.
+static void textAt(ImDrawList* dl, ImVec2 p, float maxW, ImU32 c, const std::string& s, ImFont* f = nullptr, float size = 0) {
+    if (!f) f = ImGui::GetFont();
+    size = size ? size * S * g_set.textScale : ImGui::GetFontSize();
+    const char *b = s.c_str(), *e = b + s.size();
+    if (f->CalcTextSizeA(size, FLT_MAX, 0, b, e).x <= maxW) { dl->AddText(f, size, p, c, b, e); return; }
+    float ell = f->CalcTextSizeA(size, FLT_MAX, 0, "…").x;
+    size_t lo = 0, hi = s.size();  // recherche par dichotomie de la plus longue partie qui tient (appelé à chaque image)
+    while (lo < hi) {
+        size_t mid = (lo + hi + 1) / 2;
+        if (f->CalcTextSizeA(size, FLT_MAX, 0, b, b + mid).x + ell <= maxW) lo = mid; else hi = mid - 1;
+    }
+    while (lo > 0 && lo < s.size() && (s[lo] & 0xC0) == 0x80) lo--;  // pas au milieu d'un caractère UTF-8
+    std::string t(b, b + lo); t += "…";
+    dl->AddText(f, size, p, c, t.c_str());
+}
+
+static void iconAt(ImDrawList* dl, ImVec2 center, const char* icon, float size, ImU32 c) {
+    ImVec2 ts = g_icons->CalcTextSizeA(size, FLT_MAX, 0, icon);
+    dl->AddText(g_icons, size, center - ts * 0.5f, c, icon);
+}
+
+static void coverAt(ImDrawList* dl, const std::string& img, const std::string& uri, ImVec2 p, float sz, float round) {
+    round = std::min(round, g_set.rounding * S * 0.7f);
+    if (ImTextureID t = tex(img, sz > 120 * S ? 300 : 96)) { dl->AddImageRounded(t, p, p + ImVec2{sz, sz}, {0, 0}, {1, 1}, IM_COL32_WHITE, round); return; }
+    bool liked = uri == "spotify:collection" || uri == "glass:favoris", local = uri == "local", recent = uri == "glass:recent", own = uri.rfind("glass:", 0) == 0;
+    auto shade = [](float dh, float v) {  // teinte du thème, décalée pour distinguer les listes
+        float h, s, b, r, g, bl;
+        ImGui::ColorConvertRGBtoHSV(acc().x, acc().y, acc().z, h, s, b);
+        ImGui::ColorConvertHSVtoRGB(fmodf(h + dh + 1, 1), s, v, r, g, bl);
+        return col(r, g, bl);
+    };
+    ImU32 a = liked ? shade(0, 0.8f) : local ? shade(0.08f, 0.65f) : recent ? shade(-0.08f, 0.65f) : own ? shade(0, 0.5f) : col(1, 1, 1, 0.08f);
+    dl->AddRectFilled(p, p + ImVec2{sz, sz}, a, round);
+    iconAt(dl, p + ImVec2{sz, sz} * 0.5f, liked ? I_HEART : local ? I_FOLDER : recent ? I_HISTORY : own ? I_LIST : I_NOTE, sz * 0.4f, col(1, 1, 1, 0.9f));
+}
+
+// Valeur animée vers une cible, gardée par ImGui pour chaque élément ; demande des images tant qu'elle bouge.
+static void glow(ImDrawList* dl, ImVec2 c, float r, ImVec4 col, float alpha);
+static float animTo(ImGuiID id, float target, float speed = 14) {
+    ImGuiStorage* st = ImGui::GetStateStorage();
+    float v = st->GetFloat(id, target);
+    if (!g_set.animations || std::fabs(target - v) < 0.01f) v = target;
+    else { v += (target - v) * std::min(1.f, ImGui::GetIO().DeltaTime * speed); g_anim = true; }
+    st->SetFloat(id, v);
+    return v;
+}
+
+static bool iconBtn(const char* id, const char* icon, float size, bool active = false) {
+    ImGui::PushID(id);
+    ImVec2 p = ImGui::GetCursorScreenPos();
+    bool r = ImGui::InvisibleButton("##b", {size, size});
+    bool hov = ImGui::IsItemHovered();
+    float hv = animTo(ImGui::GetID("##hv"), hov ? 1.f : 0.f), pr = animTo(ImGui::GetID("##pr"), ImGui::IsItemActive() ? 0.85f : 1.f, 20);
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    ImVec2 c = p + ImVec2{size, size} * 0.5f;
+    if (hv > 0) dl->AddCircleFilled(c, size * 0.5f * (0.7f + 0.3f * hv), col(1, 1, 1, 0.09f * hv));
+    if (active && g_set.neon > 0) glow(dl, c, size * 0.55f, acc(), 0.25f * g_set.neon);
+    iconAt(dl, c, icon, size * 0.42f * pr, active ? accU() : col(1, 1, 1, 0.72f + 0.28f * hv));
+    if (active) dl->AddCircleFilled(p + ImVec2{size * 0.5f, size - 2 * S}, 2 * S, accU());
+    ImGui::PopID();
+    return r;
+}
+
+static bool playBtn(const char* id, float size, bool playing, ImU32 bg, ImU32 fg) {
+    ImGui::PushID(id);
+    ImVec2 p = ImGui::GetCursorScreenPos(), c = p + ImVec2{size, size} * 0.5f;
+    bool r = ImGui::InvisibleButton("##p", {size, size});
+    float k = animTo(ImGui::GetID("##k"), ImGui::IsItemActive() ? 0.92f : ImGui::IsItemHovered() ? 1.06f : 1.f, 18);
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    if (g_set.neon > 0) glow(dl, c, size * 0.95f * k, acc(), 0.35f * g_set.neon);  // halo néon
+    dl->AddCircleFilled(c, size * 0.5f * k, bg);
+    iconAt(dl, c + ImVec2{playing ? 0 : size * 0.03f, 0}, playing ? I_PAUSE : I_PLAY, size * 0.38f, fg);
+    ImGui::PopID();
+    return r;
+}
+
+// Barre fine façon Spotify/Apple ; renvoie true quand on relâche.
+static bool scrub(const char* id, float* v, float maxv, float w, float wheelStep = 0) {
+    ImVec2 p = ImGui::GetCursorScreenPos();
+    float h = 16 * S;
+    ImGui::InvisibleButton(id, {w, h});
+    bool hov = ImGui::IsItemHovered() || ImGui::IsItemActive();
+    if (ImGui::IsItemActive()) *v = std::clamp((ImGui::GetIO().MousePos.x - p.x) / w, 0.f, 1.f) * maxv;
+    float wheel = ImGui::IsItemHovered() ? ImGui::GetIO().MouseWheel : 0;
+    if (wheelStep > 0 && wheel != 0) { *v = std::clamp(*v + wheel * wheelStep * maxv, 0.f, maxv); return true; }
+    float f = maxv > 0 ? std::clamp(*v / maxv, 0.f, 1.f) : 0, y = p.y + h / 2, th = (hov ? 6 : 4) * S;
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    dl->AddRectFilled({p.x, y - th / 2}, {p.x + w, y + th / 2}, col(1, 1, 1, 0.18f), th);
+    if (g_set.neon > 0 && f > 0) for (int i = 3; i >= 1; i--) dl->AddRectFilled({p.x, y - th / 2 - i * 2 * S}, {p.x + w * f, y + th / 2 + i * 2 * S}, ImGui::GetColorU32(ImVec4{acc().x, acc().y, acc().z, 0.08f * g_set.neon}), th + i * 2 * S);
+    dl->AddRectFilled({p.x, y - th / 2}, {p.x + w * f, y + th / 2}, hov || g_set.neon > 0 ? accU() : col(1, 1, 1, 0.92f), th);
+    if (hov) dl->AddCircleFilled({p.x + w * f, y}, 7 * S, IM_COL32_WHITE);
+    return ImGui::IsItemDeactivated();
+}
+
+static ImVec4 scale(ImVec4 c, float k) { return {c.x * k, c.y * k, c.z * k, c.w}; }
+
+// Halo doux : disques concentriques presque transparents (pas de shader, coût négligeable).
+static ImTextureID g_glowTex;  // dégradé radial blanc → transparent, créé une fois : halos lisses en un seul rectangle
+
+static void makeGlowTexture() {
+    const int N = 128;
+    std::vector<uint8_t> px(N * N * 4, 255);
+    for (int y = 0; y < N; y++) for (int x = 0; x < N; x++) {
+        float d = std::min(1.f, std::hypot(x - N / 2 + 0.5f, y - N / 2 + 0.5f) / (N / 2));
+        float a = (1 - d) * (1 - d) * (1 - d);  // décroissance douce, sans bord
+        px[(y * N + x) * 4 + 3] = (uint8_t)(a * 255);
+    }
+    g_glowTex = plat::makeTexture(px.data(), N, N);
+}
+
+static void glow(ImDrawList* dl, ImVec2 c, float r, ImVec4 col, float alpha) {
+    if (g_glowTex) dl->AddImage(g_glowTex, c - ImVec2{r, r}, c + ImVec2{r, r}, {0, 0}, {1, 1}, ImGui::GetColorU32(ImVec4{col.x, col.y, col.z, std::min(1.f, alpha)}));
+}
+
+// Contour néon : traits de plus en plus larges et transparents autour d'un rectangle arrondi.
+static void neonRect(ImDrawList* dl, ImVec2 a, ImVec2 b, float round, float amt) {
+    if (amt <= 0) return;
+    ImVec4 c = acc();
+    for (int i = 6; i >= 1; i--) {
+        float e = i * 2.2f * S;
+        dl->AddRect(a - ImVec2{e, e}, b + ImVec2{e, e}, ImGui::GetColorU32(ImVec4{c.x, c.y, c.z, amt * 0.045f * (7 - i)}), round + e, 0, 2.5f * S);
+    }
+    dl->AddRect(a, b, ImGui::GetColorU32(ImVec4{c.x, c.y, c.z, 0.55f * amt + 0.15f}), round, 0, 1.2f * S);
+}
+
+// Couleur d'accent : celle des réglages, ou la plus vive de la pochette (glisse en douceur).
+static void updateAccent() {
+    ImVec4 target{g_set.accent[0], g_set.accent[1], g_set.accent[2], 1};
+    if (g_set.accentAuto && g_has) {
+        tex(g_cur.image, 64, true);
+        if (auto it = g_pal.find(g_cur.image); it != g_pal.end()) target = it->second.vivid;
+    }
+    ImVec4& c = g_accLive;
+    float k = g_set.animations ? std::min(1.f, ImGui::GetIO().DeltaTime * 5) : 1.f, d = std::fabs(c.x - target.x) + std::fabs(c.y - target.y) + std::fabs(c.z - target.z);
+    if (d < 0.003f) c = target;
+    else { c = {c.x + (target.x - c.x) * k, c.y + (target.y - c.y) * k, c.z + (target.z - c.z) * k, 1}; g_anim = true; }
+    ImVec4* sc = ImGui::GetStyle().Colors;
+    sc[ImGuiCol_SliderGrab] = sc[ImGuiCol_CheckMark] = sc[ImGuiCol_DragDropTarget] = c;
+    sc[ImGuiCol_TextSelectedBg] = ImVec4{c.x, c.y, c.z, 0.35f};
+}
+
+struct Particle { float x, y, speed, sway, phase, rot, spin, size; };
+
+static void petal(ImDrawList* dl, ImVec2 c, float s, float rot, float flip, ImU32 col) {
+    static const ImVec2 shape[] = {{0, 0.95f}, {0.5f, 0.25f}, {0.48f, -0.5f}, {0.18f, -0.85f}, {0, -0.62f}, {-0.18f, -0.85f}, {-0.48f, -0.5f}, {-0.5f, 0.25f}};
+    ImVec2 pts[8];
+    float cs = cosf(rot), sn = sinf(rot);
+    for (int i = 0; i < 8; i++) {
+        float x = shape[i].x * s * flip, y = shape[i].y * s;  // flip : le pétale tourne sur lui-même
+        pts[i] = {c.x + x * cs - y * sn, c.y + x * sn + y * cs};
+    }
+    dl->AddConvexPolyFilled(pts, 8, col);
+}
+
+static void drawParticles(ImDrawList* dl, ImVec2 a, ImVec2 b) {
+    if (!g_set.particles) return;
+    static std::vector<Particle> ps;
+    static std::mt19937 rng{7};
+    static double last = ImGui::GetTime();
+    auto rnd = [](float lo, float hi) { return std::uniform_real_distribution<float>(lo, hi)(rng); };
+    size_t want = g_mini ? 12 : 34;
+    while (ps.size() < want) ps.push_back({rnd(0, 1), rnd(-0.1f, 1), rnd(0.035f, 0.08f), rnd(0.01f, 0.05f), rnd(0, 6.28f), rnd(0, 6.28f), rnd(-1.4f, 1.4f), rnd(5, 9.5f)});
+    ps.resize(want);
+    double t = ImGui::GetTime();
+    float dt = (float)std::min(0.1, t - last), W = b.x - a.x, H = b.y - a.y;
+    last = t;
+    for (auto& p : ps) {
+        p.phase += dt; p.rot += p.spin * dt;
+        if (g_set.particles == 3) p.y -= p.speed * 0.25f * dt; else p.y += p.speed * dt;  // les lucioles montent doucement
+        if (p.y > 1.05f) { p.y = -0.05f; p.x = rnd(0, 1); }
+        if (p.y < -0.05f) { p.y = 1.05f; p.x = rnd(0, 1); }
+        ImVec2 c{a.x + (p.x + sinf(p.phase * 0.8f) * p.sway) * W, a.y + p.y * H};
+        float sz = p.size * S * (g_mini ? 0.8f : 1.f);
+        if (g_set.particles == 1) petal(dl, c, sz, p.rot, cosf(p.phase * 1.7f), col(1.f, 0.74f, 0.84f, 0.8f));
+        else if (g_set.particles == 2) dl->AddCircleFilled(c, sz * 0.32f, col(1, 1, 1, 0.7f));
+        else {
+            float pulse = 0.5f + 0.5f * sinf(p.phase * 2.3f);
+            glow(dl, c, sz * 2.4f, acc(), 0.55f * pulse);
+            dl->AddCircleFilled(c, sz * 0.18f, col(1, 1, 0.85f, 0.9f * pulse));
+        }
+    }
+    g_animBg = true;
+}
+
+static void drawBackground(ImGuiViewport* vp) {
+    ImDrawList* dl = ImGui::GetBackgroundDrawList();
+    ImVec2 a = vp->Pos, b = vp->Pos + vp->Size;
+    ImVec4 tint{g_set.tint[0], g_set.tint[1], g_set.tint[2], 1};
+    int bg = g_set.bg;
+    g_animBg = false;
+    if (bg == 2) {  // fond uni : dégradé de la teinte du thème
+        ImU32 top = ImGui::GetColorU32(tint), bot = ImGui::GetColorU32(scale(tint, 0.4f));
+        dl->AddRectFilledMultiColor(a, b, top, top, bot, bot);
+        drawParticles(dl, a, b);
+        return;
+    }
+    dl->AddRectFilled(a, b, ImGui::GetColorU32(tint));
+    Track* t = current();
+    if (bg >= 3) {  // 3 dégradé de la pochette (façon Apple Music), 4 néon, 5 aurore animée
+        float W = b.x - a.x, H = b.y - a.y, R = std::max(W, H);
+        ImVec4 ac = acc(), c[4] = {ac, {0.10f, 0.85f, 1.00f, 1}, {0.55f, 0.25f, 1.00f, 1}, scale(ac, 0.7f)};  // accent + cyan + violet néon
+        if (bg == 3 && t) {
+            tex(t->image, 64, true);
+            if (auto it = g_pal.find(t->image); it != g_pal.end()) std::copy(it->second.c, it->second.c + 4, c);
+        }
+        float tm = 0;
+        if (bg == 5 && g_set.animations) {
+            tm = (float)ImGui::GetTime() * 3;
+            g_animBg = true;
+            for (auto& ci : c) {  // les couleurs tournent lentement sur le cercle chromatique
+                float h, sat, v;
+                ImGui::ColorConvertRGBtoHSV(ci.x, ci.y, ci.z, h, sat, v);
+                ImGui::ColorConvertHSVtoRGB(fmodf(h + tm * 0.01f, 1.f), sat, v, ci.x, ci.y, ci.z);
+            }
+        }
+        float amp = bg == 5 ? 1.9f : 1.f;
+        ImVec2 p[4] = {
+            {a.x + W * (0.15f + amp * 0.12f * sinf(tm * 0.21f)), a.y + H * (0.20f + amp * 0.12f * cosf(tm * 0.17f))},
+            {a.x + W * (0.85f + amp * 0.10f * cosf(tm * 0.13f)), a.y + H * (0.15f + amp * 0.14f * sinf(tm * 0.19f))},
+            {a.x + W * (0.20f + amp * 0.14f * cosf(tm * 0.11f)), a.y + H * (0.85f + amp * 0.10f * sinf(tm * 0.23f))},
+            {a.x + W * (0.80f + amp * 0.12f * sinf(tm * 0.15f)), a.y + H * (0.80f + amp * 0.12f * cosf(tm * 0.12f))}};
+        if (bg == 3) dl->AddRectFilledMultiColor(a, b, ImGui::GetColorU32(scale(c[0], 0.55f)), ImGui::GetColorU32(scale(c[1], 0.55f)),
+                                                 ImGui::GetColorU32(scale(c[3], 0.55f)), ImGui::GetColorU32(scale(c[2], 0.55f)));
+        for (int i = 0; i < 4; i++) glow(dl, p[i], R * (bg == 3 ? 0.6f : 0.42f), c[i], bg == 3 ? 0.9f : 0.6f);
+    } else {
+        static std::string cur, prev;
+        static double fadeT = 0;
+        std::string img = t && bg == 0 ? t->image : "";
+        if (img != cur && (img.empty() || tex(img, 64, true))) { prev = cur; cur = img; fadeT = ImGui::GetTime(); }  // change quand la nouvelle est prête
+        float fade = g_set.animations ? (float)std::min(1.0, (ImGui::GetTime() - fadeT) / 0.8) : 1.f;
+        if (fade < 1) g_anim = true;
+        auto draw = [&](const std::string& s, float alpha) {
+            ImU32 tc = col(1, 1, 1, alpha);
+            if (ImTextureID tx = s.empty() ? 0 : tex(s, 64, true)) {
+                float W = b.x - a.x, H = b.y - a.y, u = W > H ? 0 : (1 - W / H) / 2, v = W > H ? (1 - H / W) / 2 : 0;
+                dl->AddImage(tx, a, b, {u, v}, {1 - u, 1 - v}, tc);
+            } else if (ImTextureID wt = tex(g_wall, 160, true)) {  // pas de pochette : fond d'écran flouté, aligné sur l'écran = verre dépoli
+                ImVec2 uv0{0, 0}, uv1{1, 1};
+                plat::wallpaperUV(uv0, uv1);
+                dl->AddImage(wt, a, b, uv0, uv1, tc);
+            }
+        };
+        draw(prev, 1);
+        draw(cur, fade);
+    }
+    if (g_set.tintAmt > 0) dl->AddRectFilled(a, b, ImGui::GetColorU32(ImVec4{tint.x, tint.y, tint.z, g_set.tintAmt}));  // teinte du thème
+    float d = g_set.dim;
+    dl->AddRectFilledMultiColor(a, b, col(0, 0, 0, d * 0.65f), col(0, 0, 0, d * 0.65f), col(0, 0, 0, std::min(1.f, d * 1.35f)), col(0, 0, 0, std::min(1.f, d * 1.35f)));
+    drawParticles(dl, a, b);
+}
+
+static void setTopmost() { plat::setTopmost(g_set.topmost || g_mini); }
+static bool g_miniLyrics = false;
+static int miniHeight() { return (int)((g_miniLyrics ? 262 : 146) * S); }
+
+static void toggleMini() {
+    g_mini = !g_mini;
+    if (g_mini) plat::enterMini((int)(480 * S), miniHeight());  // en bas à droite de l'écran
+    else plat::leaveMini();                                      // taille d'avant, même si la fenêtre était agrandie
+    setTopmost();
+}
+
+static void toggleMiniLyrics() {  // agrandit le mini-lecteur vers le haut pour afficher les paroles
+    g_miniLyrics = !g_miniLyrics;
+    plat::setMiniHeight(miniHeight());
+}
+
+static void titleBar(ImGuiViewport* vp, float tb) {
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+#ifdef __APPLE__
+    ImVec2 o = vp->Pos + ImVec2{70 * S, 0};
+    const int nb = 1;
+#else
+    ImVec2 o = vp->Pos;
+    const int nb = 4;
+#endif
+    if (ImTextureID logo = tex("icon:", 64)) dl->AddImage(logo, o + ImVec2{14 * S, tb * 0.5f - 10 * S}, o + ImVec2{34 * S, tb * 0.5f + 10 * S});
+    else dl->AddCircleFilled(o + ImVec2{24 * S, tb * 0.5f}, 7 * S, accU());
+    dl->AddText(g_bold, 15 * S, o + ImVec2{38 * S, tb * 0.5f - 10 * S}, col(1, 1, 1, 0.95f), "Glass");
+    o = vp->Pos;
+    if (!g_status.empty()) {
+        ImVec2 ts = ImGui::CalcTextSize(g_status.c_str());
+        textAt(dl, o + ImVec2{std::max(120 * S, (vp->Size.x - ts.x) * 0.5f), tb * 0.5f - 9 * S}, vp->Size.x * 0.5f, col(1, 1, 1, 0.6f), g_status);
+    }
+    float bw = 46 * S;
+    const char* icons[4] = {I_MINI, I_MIN, plat::maximized() ? I_RESTORE : I_MAX, I_CLOSE};
+    for (int i = 0; i < nb; i++) {
+        ImGui::SetCursorPos({vp->Size.x - bw * (nb - i), 0});
+        ImGui::PushID(i);
+        ImVec2 p = ImGui::GetCursorScreenPos();
+        bool click = ImGui::InvisibleButton("##w", {bw, tb - 6 * S});
+        if (ImGui::IsItemHovered()) dl->AddRectFilled(p, p + ImVec2{bw, tb - 6 * S}, i == 3 ? col(0.9f, 0.15f, 0.15f) : col(1, 1, 1, 0.08f));
+        if (i == 0) ImGui::SetItemTooltip("Mini-lecteur");
+        iconAt(dl, p + ImVec2{bw, tb - 6 * S} * 0.5f, icons[i], (i == 0 ? 13 : 10) * S, col(1, 1, 1, 0.9f));
+        ImGui::PopID();
+        if (click) {
+            if (i == 0) toggleMini();
+            else if (i == 1) plat::minimize();
+            else if (i == 2) plat::toggleMaximize();
+            else plat::close();
+        }
+    }
+}
+
+static bool hasI(const std::string& s, const char* q) {
+    return std::search(s.begin(), s.end(), q, q + strlen(q), [](char a, char b) { return tolower((unsigned char)a) == tolower((unsigned char)b); }) != s.end();
+}
+
+// Recherche : ta bibliothèque tout de suite, le catalogue Spotify une demi-seconde après la frappe.
+static void updateSearch() {
+    g_search.tracks.clear();
+    g_search.loaded = true;
+    if (!g_searchBuf[0]) return;
+    std::set<std::string> seen;
+    for (auto& l : g_lists) for (auto& t : l.tracks)
+        if (g_search.tracks.size() < 200 && (hasI(t.title, g_searchBuf) || hasI(t.artist, g_searchBuf) || hasI(t.album, g_searchBuf)) && seen.insert(t.uri).second)
+            g_search.tracks.push_back(t);
+    g_searchT = now();
+}
+
+static void sidebarItem(List& l, int index) {
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    ImGui::PushID(l.uri.c_str());
+    ImVec2 p = ImGui::GetCursorScreenPos();
+    float h = (g_set.density == 0 ? 46 : 56) * S, iw = ImGui::GetContentRegionAvail().x, cs = h - 12 * S;
+    if (ImGui::Selectable("##it", g_view == l.uri && !g_lyricsOpen, 0, {iw, h})) { g_view = l.uri; g_lyricsOpen = false; }
+    if (l.own && l.uri != "glass:recent" && ImGui::BeginDragDropTarget()) {  // glisser un titre sur une de tes playlists
+        if (ImGui::AcceptDragDropPayload("TRACK")) addToList(l, g_dragTrack);
+        ImGui::EndDragDropTarget();
+    }
+    if (ImGui::BeginPopupContextItem()) {
+        if (ImGui::MenuItem("Lire")) { if (!l.tracks.empty()) play(l.uri, 0); }
+        if (ImGui::MenuItem("Ajouter à la file d'attente")) for (auto& t : l.tracks) g_queue.push_back(t);
+        if (l.uri != "local" && ImGui::MenuItem("Télécharger pour écouter hors ligne")) downloadAll(l);
+        auto& pins = g_set.pinned;
+        auto pin = std::find(pins.begin(), pins.end(), l.uri);
+        if (ImGui::MenuItem(pin == pins.end() ? "Épingler en haut" : "Désépingler")) {
+            if (pin == pins.end()) pins.push_back(l.uri); else pins.erase(pin);
+            saveSettings();
+        }
+        if (ImGui::MenuItem("Personnaliser (nom, pochette)...")) { g_editUri = l.uri; g_openPerso = true; }
+        if (!l.own && ImGui::MenuItem("Dupliquer dans mes playlists")) {
+            List c{"glass:" + std::to_string(nowId()), l.name + " (copie)", l.image, l.tracks};
+            c.own = c.loaded = true;
+            g_lists.push_back(c); saveMine(); g_view = c.uri;
+            ImGui::EndPopup(); ImGui::PopID(); return;  // g_lists a pu être réalloué : on ne touche plus à l
+        }
+        if (l.custom && ImGui::MenuItem("Retirer de Glass")) { g_lists.erase(g_lists.begin() + index); saveLinks(); ImGui::EndPopup(); ImGui::PopID(); return; }
+        if (l.own && l.uri != "glass:favoris" && l.uri != "glass:recent" && ImGui::MenuItem("Supprimer la playlist")) {
+            g_lists.erase(g_lists.begin() + index); saveMine(); ImGui::EndPopup(); ImGui::PopID(); return;
+        }
+        ImGui::EndPopup();
+    }
+    coverAt(dl, l.image, l.uri, p + ImVec2{6 * S, 6 * S}, cs, 8 * S);
+    bool playingHere = g_plUri == l.uri && current();
+    textAt(dl, p + ImVec2{cs + 16 * S, h * 0.5f - 19 * S}, iw - cs - 22 * S, playingHere ? accU() : col(1, 1, 1, 0.95f), l.name);
+    std::string sub = l.uri == "local" ? "Tes fichiers" : l.own ? "Playlist Glass" : isAlbum(l.uri) ? "Album" : "Playlist";
+    if (l.loaded) sub += " · " + std::to_string(l.tracks.size()) + " titres";
+    textAt(dl, p + ImVec2{cs + 16 * S, h * 0.5f + 1 * S}, iw - cs - 22 * S, col(1, 1, 1, 0.5f), sub);
+    ImGui::PopID();
+}
+
+static void sidebar() {
+    static char url[512];
+    float w = ImGui::GetContentRegionAvail().x;
+    ImGui::PushFont(g_bold, 18); ImGui::TextUnformatted("Bibliothèque"); ImGui::PopFont();
+    ImGui::SameLine(w - 58 * S);
+    ImGui::SetCursorPosY(ImGui::GetCursorPosY() - 3 * S);
+    if (iconBtn("settings", I_GEAR, 30 * S, g_view == "settings")) { g_view = "settings"; g_lyricsOpen = false; }
+    ImGui::SetItemTooltip("Réglages");
+    ImGui::SameLine(0, 2 * S);
+    if (iconBtn("add", I_ADD, 30 * S)) ImGui::OpenPopup("add");
+    ImGui::SetItemTooltip("Nouvelle playlist / ajouter un lien Spotify ou Apple Music");
+    if (ImGui::BeginPopup("add")) {
+        if (ImGui::MenuItem("Nouvelle playlist...")) { g_pendingAdd.clear(); g_openNew = true; }
+        ImGui::Separator();
+        ImGui::TextUnformatted("Lien d'une playlist ou d'un album Spotify ou Apple Music");
+        ImGui::SetNextItemWidth(360 * S);
+        bool ok = ImGui::InputTextWithHint("##url", "https://open.spotify.com/... ou https://music.apple.com/...", url, sizeof url, ImGuiInputTextFlags_EnterReturnsTrue);
+        if (ok || ImGui::Button("Ajouter")) {
+            std::string u = toUri(url);
+            if (u.empty()) g_status = "Lien Spotify ou Apple Music invalide";
+            else if (!findList(u)) { List l{u, "Chargement..."}; l.custom = true; g_lists.push_back(l); saveLinks(); g_view = u; }
+            else g_view = u;
+            url[0] = 0; g_lyricsOpen = false; ImGui::CloseCurrentPopup();
+        }
+        ImGui::EndPopup();
+    }
+    // recherche globale
+    ImGui::SetNextItemWidth(-1);
+    if (g_focusSearch) { ImGui::SetKeyboardFocusHere(); g_focusSearch = false; }
+    if (ImGui::InputTextWithHint("##search", u8"Rechercher  (Ctrl+F)", g_searchBuf, sizeof g_searchBuf)) { g_view = "search"; g_lyricsOpen = false; updateSearch(); }
+    if (g_view == "search" && g_webOk && g_searchBuf[0] && g_searchSent != g_searchBuf && now() - g_searchT > 0.5) {
+        g_searchSent = g_searchBuf;
+        send({{"cmd", "search"}, {"q", g_searchSent}});
+    }
+    if (!g_engineOk) ImGui::TextDisabled("Spotify : moteur arrêté");
+    else if (!g_spReady) ImGui::TextDisabled("Spotify : connexion...");
+    ImGui::Spacing();
+
+    ImGui::BeginChild("items", {0, 0}, 0, ImGuiWindowFlags_NoBackground);
+    auto header = [](const char* s) { ImGui::Spacing(); ImGui::TextDisabled("%s", s); };
+    auto pinned = [](const List& l) { return std::find(g_set.pinned.begin(), g_set.pinned.end(), l.uri) != g_set.pinned.end(); };
+    // copie : un clic droit peut modifier g_set.pinned pendant la boucle
+    std::vector<std::string> pins = g_set.pinned;
+    if (std::any_of(g_lists.begin(), g_lists.end(), pinned)) header("ÉPINGLÉES");
+    for (auto& u : pins) for (int i = 0; i < (int)g_lists.size(); i++) if (g_lists[i].uri == u) { sidebarItem(g_lists[i], i); break; }
+    auto mine = [&](const List& l) { return (l.uri == "local" || l.own) && !pinned(l); };
+    auto spot = [&](const List& l) { return l.uri != "local" && !l.own && !isApple(l.uri) && !pinned(l); };
+    auto apple = [&](const List& l) { return isApple(l.uri) && !pinned(l); };
+    if (std::any_of(g_lists.begin(), g_lists.end(), mine)) header("TES PLAYLISTS");
+    for (int i = 0; i < (int)g_lists.size(); i++) if (mine(g_lists[i])) sidebarItem(g_lists[i], i);
+    if (std::any_of(g_lists.begin(), g_lists.end(), spot)) header("SPOTIFY");
+    for (int i = 0; i < (int)g_lists.size(); i++) if (spot(g_lists[i])) sidebarItem(g_lists[i], i);
+    if (std::any_of(g_lists.begin(), g_lists.end(), apple)) header("APPLE MUSIC");
+    for (int i = 0; i < (int)g_lists.size(); i++) if (apple(g_lists[i])) sidebarItem(g_lists[i], i);
+    ImGui::EndChild();
+}
+
+static void centerText(const char* s, ImFont* f, float size, ImU32 c) {
+    float w = ImGui::GetContentRegionAvail().x;
+    size *= S;
+    ImVec2 ts = f->CalcTextSizeA(size, w, w, s);
+    ImGui::GetWindowDrawList()->AddText(f, size, ImGui::GetCursorScreenPos() + ImVec2{std::max(0.f, (w - ts.x) * 0.5f), 0}, c, s, nullptr, w);
+    ImGui::Dummy({w, ts.y + 8 * S});
+}
+
+static void loginPanel() {
+    ImGui::SetCursorPos(ImGui::GetCursorPos() + ImVec2{0, ImGui::GetContentRegionAvail().y * 0.32f});
+    centerText("Connecte ton compte Spotify", g_bold, 30, col(1, 1, 1, 0.95f));
+    centerText(!g_engineOk ? "Le moteur Spotify ne tourne pas (voir Réglages ou relance Glass)."
+                           : "Une page de connexion Spotify s'est ouverte dans ton navigateur.", ImGui::GetFont(), 16, col(1, 1, 1, 0.6f));
+    centerText("En attendant, tes musiques locales marchent déjà (« Mes musiques »).", ImGui::GetFont(), 16, col(1, 1, 1, 0.45f));
+}
+
+static std::map<std::string, int> g_lyrOff;  // décalage des paroles par titre (ms), gardé pendant la session
+
+static void ensureLyrics(const Track& t) {
+    if (g_lyrKey != t.uri) {
+        g_lyrKey = t.uri; g_lyr.clear(); g_lyrState = 1;
+        if (fileExists(lyricsFile(t, ".lrc"))) loadLrcInto(lyricsFile(t, ".lrc"), 1);  // déjà générées
+        else send({{"cmd", "lyrics"}, {"key", t.uri}, {"uri", t.local ? "" : t.uri}, {"title", t.title}, {"artist", t.artist}, {"ms", t.ms}});
+    }
+    if (g_lyrState == 3 && g_set.autoLyrics && !g_genRunning && !fileExists(lyricsFile(t, ".none"))) generateLyrics(t);
+}
+
+static void lyricsView() {
+    Track* t = current();
+    if (!t) { ImGui::Dummy({0, 80 * S}); centerText("Lance un titre pour voir ses paroles.", g_bold, 22, col(1, 1, 1, 0.6f)); return; }
+    ensureLyrics(*t);
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    ImVec2 p = ImGui::GetCursorScreenPos();
+    coverAt(dl, t->image, "", p, 64 * S, 8 * S);
+    textAt(dl, p + ImVec2{80 * S, 8 * S}, ImGui::GetContentRegionAvail().x - 90 * S, col(1, 1, 1), t->title, g_bold, 22);
+    textAt(dl, p + ImVec2{80 * S, 38 * S}, ImGui::GetContentRegionAvail().x - 90 * S, col(1, 1, 1, 0.6f), t->artist);
+    ImGui::Dummy({0, 76 * S});
+    if (g_lyrState != 2) {
+        ImGui::Dummy({0, 60 * S});
+        const char* msg = g_lyrState == 1 ? "Chargement des paroles..."
+                        : g_lyrState == 4 ? "L'IA écoute le titre et écrit les paroles..."
+                        : g_lyrState == 5 ? "Impossible d'écrire des paroles fiables pour ce titre." : "Pas de paroles publiées pour ce titre.";
+        centerText(msg, g_bold, 22, col(1, 1, 1, 0.6f));
+        if (g_lyrState == 4) { centerText(g_status.c_str(), ImGui::GetFont(), 15, col(1, 1, 1, 0.45f)); g_anim = false; }
+        if ((g_lyrState == 3 || g_lyrState == 5) && !g_genRunning) {
+            float bw = 300 * S;
+            ImGui::SetCursorPosX(ImGui::GetCursorPosX() + (ImGui::GetContentRegionAvail().x - bw) * 0.5f);
+            if (ImGui::Button(g_lyrState == 5 ? "Réessayer la génération" : "Générer les paroles avec l'IA", {bw, 0})) {
+                std::error_code ec;
+                fs::remove(lyricsFile(*t, ".none"), ec);
+                generateLyrics(*t);
+            }
+            centerText("Sur ton PC, ~10 s par titre. 1re fois : téléchargement de ~200 Mo.", ImGui::GetFont(), 14, col(1, 1, 1, 0.4f));
+        }
+        return;
+    }
+    // Décalage réglable par titre (paroles en avance / en retard), gardé pendant la session.
+    int& off = g_lyrOff[t->uri];
+    double pos = posMs() + off;
+    int curLine = -1;
+    if (g_lyrSynced) for (int i = 0; i < (int)g_lyr.size(); i++) if (g_lyr[i].t <= pos + 120) curLine = i;
+    if (g_lyrSynced) {  // petite barre : décalage
+        ImGui::SetCursorPos({ImGui::GetWindowContentRegionMax().x - 230 * S, ImGui::GetCursorPosY() - 64 * S});
+        ImGui::TextDisabled("Décalage %+.1f s", off / 1000.0);
+        ImGui::SameLine();
+        if (ImGui::SmallButton(" - ")) off -= 250;
+        ImGui::SetItemTooltip("Paroles en avance : les retarder");
+        ImGui::SameLine();
+        if (ImGui::SmallButton(" + ")) off += 250;
+        ImGui::SetItemTooltip("Paroles en retard : les avancer");
+        ImGui::SameLine();
+        if (off && ImGui::SmallButton("0")) off = 0;
+        ImGui::Dummy({0, 34 * S});
+    }
+    ImGui::BeginChild("lyr", {0, 0}, 0, ImGuiWindowFlags_NoBackground | ImGuiWindowFlags_NoScrollbar);
+    static double userScrollT = -10;
+    if (ImGui::IsWindowHovered() && ImGui::GetIO().MouseWheel != 0) userScrollT = ImGui::GetTime();  // on laisse la main 3 s
+    float h = ImGui::GetWindowHeight(), w = ImGui::GetContentRegionAvail().x - 24 * S;
+    ImGui::PushFont(g_bold, (float)g_set.lyricsSize);
+    ImFont* f = ImGui::GetFont();
+    float fs = ImGui::GetFontSize(), lh = fs * 1.22f, targetScroll = -1;
+    ImDrawList* ldl = ImGui::GetWindowDrawList();
+    ImVec4 a4 = acc();
+    ImGui::Dummy({0, h * 0.36f});
+    if (g_lyrSynced && curLine < 0 && !g_lyr.empty()) {  // intro : trois points qui se remplissent jusqu'à la 1re ligne
+        float k = std::clamp((float)(pos / std::max(1, g_lyr[0].t)), 0.f, 1.f);
+        ImVec2 c = ImGui::GetCursorScreenPos() + ImVec2{g_set.lyricsCenter ? w * 0.5f - 24 * S : 8 * S, lh * 0.5f};
+        for (int d = 0; d < 3; d++) ldl->AddCircleFilled(c + ImVec2{d * 24 * S, 0}, 6 * S, col(1, 1, 1, 0.25f + 0.75f * std::clamp(k * 3 - d, 0.f, 1.f)));
+        ImGui::Dummy({w, lh});
+        targetScroll = 0;
+    }
+    // Découpe en lignes visuelles + largeurs : recalculée seulement si les paroles, la largeur ou la taille changent.
+    struct Seg { std::string text; float w; };
+    static std::vector<std::vector<Seg>> layout;
+    static std::string layoutKey;
+    std::string key = g_lyrKey + "|" + std::to_string(g_lyr.size()) + "|" + std::to_string((int)w) + "|" + std::to_string((int)fs);
+    if (key != layoutKey) {
+        layoutKey = key;
+        layout.assign(g_lyr.size(), {});
+        for (size_t i = 0; i < g_lyr.size(); i++) {
+            std::string txt = g_lyr[i].w.empty() ? u8"♪" : g_lyr[i].w;
+            for (const char *p = txt.c_str(), *e = p + txt.size(); p < e;) {
+                const char* nx = f->CalcWordWrapPosition(fs, p, e, w);
+                if (nx <= p) nx = p + 1;
+                std::string part(p, nx);
+                while (!part.empty() && part.back() == ' ') part.pop_back();
+                layout[i].push_back({part, f->CalcTextSizeA(fs, FLT_MAX, 0, part.c_str()).x});
+                p = nx;
+                while (p < e && *p == ' ') p++;
+            }
+        }
+    }
+    for (int i = 0; i < (int)g_lyr.size(); i++) {
+        const auto& segs = layout[i];
+        ImVec2 sp = ImGui::GetCursorScreenPos();
+        float y0 = ImGui::GetCursorPosY(), blockH = segs.size() * lh;
+        ImGui::PushID(i);
+        bool clicked = ImGui::InvisibleButton("##l", {w, blockH});
+        bool hov = ImGui::IsItemHovered();
+        ImGui::PopID();
+        float on = animTo(ImGui::GetID(i + 100000), i == curLine ? 1.f : 0.f, 8);  // passage en douceur d'une ligne à l'autre
+        float base = !g_lyrSynced ? 0.85f : i < curLine ? 0.3f : 0.42f;
+        float alpha = base + (0.95f - base) * on + (hov && g_lyrSynced ? 0.15f : 0);
+        // progression karaoké dans la ligne chantée
+        float prog = 0;
+        if (i == curLine) {
+            int end = i + 1 < (int)g_lyr.size() ? g_lyr[i + 1].t : g_lyr[i].t + 4000;
+            prog = std::clamp((float)((pos - g_lyr[i].t) / std::max(1, std::min(end - g_lyr[i].t, 8000))), 0.f, 1.f);
+        }
+        float total = 0;
+        for (auto& sg : segs) total += sg.w;
+        float done = prog * total, acc0 = 0;
+        bool visible = ImGui::IsRectVisible(sp, sp + ImVec2{w, blockH});  // hors écran : on ne dessine pas
+        for (size_t k = 0; visible && k < segs.size(); k++) {
+            const char *sb = segs[k].text.c_str(), *se = sb + segs[k].text.size();
+            float sw = segs[k].w;
+            ImVec2 tp{sp.x + (g_set.lyricsCenter ? (w - sw) * 0.5f : 0), sp.y + k * lh};
+            if (on > 0.01f && g_set.neon > 0)  // lueur néon
+                for (ImVec2 o : {ImVec2{2 * S, 0}, ImVec2{-2 * S, 0}, ImVec2{0, 2 * S}, ImVec2{0, -2 * S}})
+                    ldl->AddText(f, fs, tp + o, ImGui::GetColorU32(ImVec4{a4.x, a4.y, a4.z, 0.28f * g_set.neon * on}), sb, se);
+            ldl->AddText(f, fs, tp, col(1, 1, 1, i == curLine ? 0.42f + 0.2f * (1 - on) : alpha), sb, se);
+            if (i == curLine) {  // partie déjà chantée : blanc plein, se remplit de gauche à droite
+                float fill = std::clamp(done - acc0, 0.f, sw);
+                if (fill > 0) {
+                    ldl->PushClipRect(tp, tp + ImVec2{fill, lh}, true);
+                    ldl->AddText(f, fs, tp, col(1, 1, 1, on), sb, se);
+                    ldl->PopClipRect();
+                }
+            }
+            acc0 += sw;
+        }
+        if (g_lyrSynced && hov) ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
+        if (g_lyrSynced && clicked) { seekMs(g_lyr[i].t - off); userScrollT = -10; }
+        if (i == curLine) targetScroll = std::max(0.f, y0 + blockH * 0.5f - h * 0.4f);
+        ImGui::Dummy({0, 14 * S});
+    }
+    ImGui::PopFont();
+    ImGui::Dummy({0, h * 0.55f});
+    if (!g_lyrSrc.empty()) ImGui::TextDisabled("Paroles : %s", g_lyrSrc.c_str());
+    if (g_lyrSynced && targetScroll >= 0 && ImGui::GetTime() - userScrollT > 3) {  // suit la ligne chantée
+        float cur = ImGui::GetScrollY(), d = targetScroll - cur;
+        if (std::fabs(d) > 0.5f) {
+            float k = g_set.animations ? std::min(1.f, ImGui::GetIO().DeltaTime * 7) : 1.f;
+            ImGui::SetScrollY(cur + d * k);
+            g_anim = g_set.animations;
+        }
+    }
+    ImGui::EndChild();
+}
+
+static long long dirSize(const fs::path& d) {
+    long long s = 0;
+    std::error_code ec;
+    for (auto& e : fs::directory_iterator(d, ec)) if (e.is_regular_file(ec)) s += (long long)e.file_size(ec);
+    return s;
+}
+
+// Assistant : l'app développeur Spotify qui autorise Glass à utiliser le lecteur officiel (Premium).
+static void webSetup() {
+    static char cid[96];
+    if (!ImGui::BeginPopup("websetup")) return;
+    ImGui::PushTextWrapPos(470 * S);
+    ImGui::PushFont(g_bold, 18); ImGui::TextUnformatted("Son officiel Spotify"); ImGui::PopFont();
+    ImGui::TextWrapped("Glass joue la vraie version des titres avec le lecteur web officiel de Spotify, intégré et invisible (pas besoin de l'app Spotify). Il faut une « app développeur » Spotify, une seule fois :");
+    ImGui::Spacing();
+    ImGui::TextUnformatted("1.");
+    ImGui::SameLine();
+    if (ImGui::Button("Ouvrir le tableau de bord Spotify")) plat::openUrl("https://developer.spotify.com/dashboard");
+    ImGui::TextWrapped("2. Ouvre ton app « Glass » (ou « Create app » si tu n'en as pas : nom et description Glass).");
+    ImGui::TextUnformatted("3. Redirect URI :");
+    ImGui::SameLine(); ImGui::TextColored(acc(), "http://127.0.0.1:5589/callback");
+    ImGui::SameLine(); if (ImGui::SmallButton("Copier")) ImGui::SetClipboardText("http://127.0.0.1:5589/callback");
+    ImGui::TextWrapped("4. Dans « APIs used », coche « Web API » ET « Web Playback SDK », puis « Save ».");
+    ImGui::TextWrapped("5. Copie le « Client ID » et colle-le ici :");
+    ImGui::SetNextItemWidth(300 * S);
+    ImGui::InputTextWithHint("##cid", "Client ID", cid, sizeof cid, ImGuiInputTextFlags_CharsNoBlank);
+    ImGui::SameLine();
+    if (ImGui::Button("Connecter") && strlen(cid) >= 20) {
+        send({{"cmd", "webauth"}, {"client_id", cid}});
+        g_status = "Accepte la connexion dans la page qui s'ouvre...";
+        ImGui::CloseCurrentPopup();
+    }
+    ImGui::PopTextWrapPos();
+    ImGui::EndPopup();
+}
+
+static void applyStyle() {
+    ImGuiStyle& s = ImGui::GetStyle();
+    s.ChildRounding = g_set.rounding * S;
+    s.FrameRounding = std::min(g_set.rounding, 18.f) * S;
+    s.PopupRounding = std::min(g_set.rounding, 14.f) * S;
+    s.GrabRounding = std::min(g_set.rounding, 8.f) * S;
+    s.FontScaleMain = g_set.textScale;
+    ImVec4* c = s.Colors;
+    c[ImGuiCol_ChildBg] = ImVec4{1, 1, 1, g_set.glass};
+    c[ImGuiCol_SliderGrab] = c[ImGuiCol_CheckMark] = acc();
+    c[ImGuiCol_TextSelectedBg] = ImVec4{acc().x, acc().y, acc().z, 0.35f};
+    c[ImGuiCol_DragDropTarget] = acc();
+    c[ImGuiCol_PopupBg] = ImVec4{g_set.tint[0] * 0.5f + 0.08f, g_set.tint[1] * 0.5f + 0.08f, g_set.tint[2] * 0.5f + 0.1f, 0.98f};
+}
+
+static void applyTheme(const Theme& t) {
+    std::copy(t.acc, t.acc + 3, g_set.accent);
+    std::copy(t.tint, t.tint + 3, g_set.tint);
+    g_set.bg = t.bg; g_set.glass = t.glass; g_set.dim = t.dim; g_set.tintAmt = t.tintAmt; g_set.rounding = t.rounding;
+    g_set.neon = t.neon; g_set.accentAuto = t.accentAuto;
+    applyStyle();
+}
+
+static void settingsView() {
+    static long long cacheBytes = -1;
+    static double cacheT = 0;
+    if (now() - cacheT > 5) { cacheBytes = dirSize((g_dir / "cache")); cacheT = now(); }
+    bool changed = false;
+    ImGui::PushFont(g_bold, 34); ImGui::TextUnformatted("Réglages"); ImGui::PopFont();
+    ImGui::Spacing();
+    auto section = [](const char* s) { ImGui::Spacing(); ImGui::Spacing(); ImGui::PushFont(g_bold, 18); ImGui::TextUnformatted(s); ImGui::PopFont(); ImGui::Separator(); ImGui::Spacing(); };
+    float lw = 300 * S;  // assez large pour les libellés longs (sinon ils passent sous les contrôles)
+    auto label = [&](const char* s) { ImGui::AlignTextToFramePadding(); ImGui::TextUnformatted(s); ImGui::SameLine(lw); ImGui::SetNextItemWidth(280 * S); };
+
+    ImGui::BeginChild("set", {0, 0}, 0, ImGuiWindowFlags_NoBackground);
+    section("Thèmes");
+    {  // cartes de thème cliquables
+        float cw = 150 * S, chh = 74 * S, x0 = ImGui::GetCursorPosX(), avail = ImGui::GetContentRegionAvail().x;
+        int perRow = std::max(1, (int)(avail / (cw + 10 * S)));
+        for (int i = 0; i < (int)std::size(kThemes); i++) {
+            const Theme& t = kThemes[i];
+            if (i % perRow) ImGui::SameLine(); else ImGui::SetCursorPosX(x0);
+            ImGui::PushID(i);
+            ImVec2 p = ImGui::GetCursorScreenPos();
+            if (ImGui::InvisibleButton("##t", {cw, chh})) { applyTheme(t); changed = true; }
+            bool hov = ImGui::IsItemHovered();
+            ImDrawList* dl = ImGui::GetWindowDrawList();
+            ImU32 a = ImGui::GetColorU32(ImVec4{t.tint[0] + 0.05f, t.tint[1] + 0.05f, t.tint[2] + 0.05f, 1}), b = ImGui::GetColorU32(ImVec4{t.tint[0] * 0.4f, t.tint[1] * 0.4f, t.tint[2] * 0.4f, 1});
+            dl->AddRectFilledMultiColor(p, p + ImVec2{cw, chh}, a, a, b, b);
+            dl->AddRect(p, p + ImVec2{cw, chh}, hov ? IM_COL32_WHITE : col(1, 1, 1, 0.15f), 0, 0, hov ? 2 * S : 1 * S);
+            dl->AddCircleFilled(p + ImVec2{20 * S, 22 * S}, 9 * S, ImGui::GetColorU32(ImVec4{t.acc[0], t.acc[1], t.acc[2], 1}));
+            dl->AddRectFilled(p + ImVec2{36 * S, 16 * S}, p + ImVec2{cw - 14 * S, 28 * S}, col(1, 1, 1, t.glass + 0.08f), 4 * S);
+            dl->AddText(g_bold, 14 * S, p + ImVec2{12 * S, chh - 26 * S}, IM_COL32_WHITE, t.name);
+            ImGui::PopID();
+        }
+    }
+    section("Couleurs et verre");
+    label("Couleur d'accent");
+    changed |= ImGui::ColorEdit3("##acc", g_set.accent, ImGuiColorEditFlags_NoInputs | ImGuiColorEditFlags_PickerHueWheel);
+    label("Teinte du fond");
+    changed |= ImGui::ColorEdit3("##tint", g_set.tint, ImGuiColorEditFlags_NoInputs | ImGuiColorEditFlags_PickerHueWheel);
+    label("Force de la teinte");
+    changed |= ImGui::SliderFloat("##tamt", &g_set.tintAmt, 0, 0.8f, "%.2f");
+    label("Fond");
+    changed |= ImGui::Combo("##bg", &g_set.bg, "Pochette floutée\0Fond d'écran flouté\0Uni (teinte)\0Dégradé de la pochette (Apple Music)\0Néon\0Aurore animée\0");
+    if (g_set.bg == 5) { ImGui::SameLine(); ImGui::TextDisabled("(bouge seulement quand Glass est au premier plan)"); }
+    label("Particules");
+    changed |= ImGui::Combo("##part", &g_set.particles, "Aucune\0Pétales de sakura\0Neige\0Lucioles\0");
+    if (g_set.particles) { ImGui::SameLine(); ImGui::TextDisabled("(~30 images/s tant que Glass est visible)"); }
+    label("Lueurs néon");
+    changed |= ImGui::SliderFloat("##neon", &g_set.neon, 0, 1, g_set.neon > 0 ? "%.2f" : "aucune");
+    label("Couleur d'après la pochette");
+    changed |= ImGui::Checkbox("##aauto", &g_set.accentAuto);
+    label("Transparence des panneaux");
+    changed |= ImGui::SliderFloat("##glass", &g_set.glass, 0, 0.35f, "%.2f");
+    label("Assombrir le fond");
+    changed |= ImGui::SliderFloat("##dim", &g_set.dim, 0, 0.9f, "%.2f");
+    label("Arrondi des coins");
+    changed |= ImGui::SliderFloat("##round", &g_set.rounding, 0, 30, "%.0f");
+
+    section("Affichage");
+    label("Taille du texte");
+    changed |= ImGui::SliderFloat("##ts", &g_set.textScale, 0.85f, 1.25f, "%.2f");
+    label("Densité des listes");
+    changed |= ImGui::Combo("##dens", &g_set.density, "Compacte\0Normale\0Aérée\0");
+    label("Colonne Album");
+    changed |= ImGui::Checkbox("##alb", &g_set.showAlbum);
+    label("Animations");
+    changed |= ImGui::Checkbox("##anim", &g_set.animations);
+    ImGui::SameLine(); ImGui::TextDisabled("(fondu des pochettes, défilement des paroles)");
+    label("Taille des paroles");
+    changed |= ImGui::SliderInt("##ly", &g_set.lyricsSize, 18, 48);
+    label("Paroles centrées");
+    changed |= ImGui::Checkbox("##lyc", &g_set.lyricsCenter);
+    label("Générer les paroles manquantes (IA)");
+    changed |= ImGui::Checkbox("##alyr", &g_set.autoLyrics);
+    ImGui::SameLine(); ImGui::TextDisabled("(seulement quand tu ouvres les paroles d'un titre qui n'en a pas)");
+
+    section("Lecture");
+    label("Son des titres Spotify");
+    changed |= ImGui::Combo("##src", &g_set.source, "Auto (Spotify, sinon YouTube)\0Spotify officiel uniquement\0YouTube uniquement\0");
+    if (g_set.source != 2) {
+        ImGui::SameLine();
+        if (!g_webOk) { if (ImGui::Button("Connecter Spotify")) ImGui::OpenPopup("websetup"); }
+        else ImGui::TextDisabled(g_sdkReady ? "lecteur prêt" : "démarrage du lecteur...");
+        webSetup();
+    }
+    label("");
+    ImGui::TextDisabled(g_set.source == 2 ? "Plus léger, mais parfois une autre version du titre."
+                                          : "Vraie version (Premium). Lecteur intégré : ~100-150 Mo de RAM en plus.");
+    label("Titres préchargés (YouTube)");
+    {
+        static const int counts[] = {0, 1, 2, 3, 5, 10, 20};
+        int sel = (int)(std::find(std::begin(counts), std::end(counts), g_set.prefetch) - std::begin(counts));
+        if (ImGui::Combo("##pre", &sel, "Aucun\0" "1 titre\0" "2 titres\0" "3 titres\0" "5 titres\0" "10 titres\0" "20 titres\0")) { g_set.prefetch = counts[sel]; changed = true; }
+    }
+    ImGui::SameLine(); ImGui::TextDisabled("(au cas où la connexion lâche)");
+    label("Hors ligne");
+    if (g_dlRunning) {
+        ImGui::Text("%d / %d titres", g_dlDone, g_dlTotal);
+        ImGui::SameLine();
+        if (ImGui::Button("Arrêter")) { g_dl.clear(); g_dlTotal = g_dlDone; }
+    } else ImGui::TextDisabled("Clic droit sur une playlist > Télécharger pour écouter hors ligne");
+    label("Vitesse (fichiers / YouTube)");
+    if (ImGui::SliderFloat("##spd", &g_set.speed, 0.5f, 2.0f, "x%.2f")) { plat::audioRate(g_set.speed); changed = true; }
+    label("S'arrêter à la fin de la liste");
+    changed |= ImGui::Checkbox("##sae", &g_set.stopAtEnd);
+    label("Touches multimédia du clavier");
+    if (ImGui::Checkbox("##mk", &g_set.mediaKeys)) { plat::setMediaKeys(g_set.mediaKeys); changed = true; }
+    label("Cache audio YouTube");
+    ImGui::Text("%.0f Mo", cacheBytes / 1048576.0);
+    ImGui::SameLine();
+    if (ImGui::Button("Vider le cache")) {
+        std::error_code ec;
+        for (auto& e : fs::directory_iterator((g_dir / "cache"), ec)) fs::remove(e.path(), ec);  // le titre en cours reste (fichier ouvert)
+        cacheT = 0;
+    }
+
+    section("Fenêtre et système");
+    label("Toujours au premier plan");
+    if (ImGui::Checkbox("##top", &g_set.topmost)) { setTopmost(); changed = true; }
+#ifdef _WIN32
+    label("Fermer = réduire près de l'horloge");
+    changed |= ImGui::Checkbox("##tray", &g_set.tray);
+    ImGui::SameLine(); ImGui::TextDisabled("(la musique continue)");
+    label("Lancer au démarrage de Windows");
+#else
+    label("Ouvrir à l'ouverture de session");
+#endif
+    if (ImGui::Checkbox("##st", &g_set.startup)) { plat::setStartup(g_set.startup); changed = true; }
+    label("Mémoire utilisée");
+    ImGui::Text("Glass %zu Mo + moteur %zu Mo", plat::memMB(false), plat::memMB(true));
+    label("Dossier de Glass");
+    if (ImGui::Button("Ouvrir")) plat::openUrl(ustr(g_dir));
+
+    section("Compte Spotify");
+    label(g_spReady ? "Connecté" : "Non connecté");
+    if (ImGui::Button(g_spReady ? "Se déconnecter" : "Se connecter")) logout();
+
+    section("Raccourcis");
+    for (const char* s : {"Espace : lecture / pause", "Ctrl + flèches gauche/droite : précédent / suivant", "Ctrl + flèches haut/bas : volume",
+                          "Ctrl + F : rechercher", "Ctrl + L : paroles", "Ctrl + Q : file d'attente", "Ctrl + M : mini-lecteur"})
+        ImGui::TextDisabled("%s", s);
+    ImGui::Dummy({0, 20 * S});
+    ImGui::EndChild();
+    if (changed) { applyStyle(); saveSettings(); }
+}
+
+// Menu clic droit d'un titre (toutes les listes).
+static void trackMenu(List& l, int i, int& removeAt) {
+    Track t = l.tracks[i];
+    if (ImGui::MenuItem("Lire ensuite")) g_queue.push_front(t);
+    if (ImGui::MenuItem("Ajouter à la file d'attente")) g_queue.push_back(t);
+    if (ImGui::MenuItem(isFav(t.uri) ? "Retirer des favoris" : "Ajouter aux favoris")) toggleFav(t);
+    if (ImGui::BeginMenu("Ajouter à la playlist")) {
+        for (auto& p : g_lists) if (p.own && p.uri != "glass:recent" && ImGui::MenuItem(p.name.c_str())) addToList(p, t);
+        ImGui::Separator();
+        if (ImGui::MenuItem("Nouvelle playlist...")) { g_pendingAdd = {t}; g_openNew = true; }
+        ImGui::EndMenu();
+    }
+    if (!t.local && t.uri.rfind("spotify:track:", 0) == 0 && ImGui::MenuItem("Copier le lien Spotify"))
+        ImGui::SetClipboardText(("https://open.spotify.com/track/" + t.uri.substr(14)).c_str());
+    if (l.own && ImGui::MenuItem("Retirer de cette playlist")) removeAt = i;
+    if (l.uri == "local" && ImGui::MenuItem("Retirer de Mes musiques")) removeAt = i;
+}
+
+// Tableau des titres d'une liste : tri par colonne, filtre, glisser-déposer, menu clic droit.
+static void trackTable(List& l, const char* filter) {
+    std::vector<int> idx;
+    for (int i = 0; i < (int)l.tracks.size(); i++) {
+        auto& t = l.tracks[i];
+        if (!filter || !filter[0] || hasI(t.title, filter) || hasI(t.artist, filter) || hasI(t.album, filter)) idx.push_back(i);
+    }
+    float rowH = (g_set.density == 0 ? 44 : g_set.density == 1 ? 56 : 68) * S, cov = rowH - 16 * S;
+    bool canReorder = l.own && l.uri != "glass:recent" && (!filter || !filter[0]);
+    ImGui::PushStyleVar(ImGuiStyleVar_CellPadding, ImVec2{10 * S, 0});
+    ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4{0, 0, 0, 0});
+    int cols = g_set.showAlbum ? 4 : 3;
+    if (ImGui::BeginTable("tracks", cols, ImGuiTableFlags_ScrollY | ImGuiTableFlags_PadOuterX | ImGuiTableFlags_Sortable | ImGuiTableFlags_SortTristate)) {
+        ImGui::TableSetupScrollFreeze(0, 1);
+        ImGui::TableSetupColumn("#", ImGuiTableColumnFlags_WidthFixed | ImGuiTableColumnFlags_NoSort, 34 * S);
+        ImGui::TableSetupColumn("Titre", ImGuiTableColumnFlags_WidthStretch, 2);
+        if (g_set.showAlbum) ImGui::TableSetupColumn("Album", ImGuiTableColumnFlags_WidthStretch, 1);
+        ImGui::TableSetupColumn("Durée", ImGuiTableColumnFlags_WidthFixed, 56 * S);
+        ImGui::TableHeadersRow();
+        bool sorted = false;
+        if (ImGuiTableSortSpecs* sp = ImGui::TableGetSortSpecs(); sp && sp->SpecsCount) {
+            sorted = true; canReorder = false;
+            auto s = sp->Specs[0];
+            int c = s.ColumnIndex - (!g_set.showAlbum && s.ColumnIndex >= 2 ? -1 : 0);  // sans colonne Album, la 2 est Durée
+            std::stable_sort(idx.begin(), idx.end(), [&](int a, int b) {
+                const Track &x = l.tracks[a], &y = l.tracks[b];
+                int r = c == 1 ? _stricmp(x.title.c_str(), y.title.c_str()) : c == 2 ? _stricmp(x.album.c_str(), y.album.c_str()) : (x.ms > y.ms) - (x.ms < y.ms);
+                return s.SortDirection == ImGuiSortDirection_Ascending ? r < 0 : r > 0;
+            });
+        }
+        ImDrawList* tdl = ImGui::GetWindowDrawList();
+        ImGuiListClipper clip;
+        clip.Begin((int)idx.size(), rowH);
+        int removeAt = -1, moveFrom = -1, moveTo = -1;
+        while (clip.Step()) for (int r = clip.DisplayStart; r < clip.DisplayEnd; r++) {
+            int i = idx[r];
+            Track& t = l.tracks[i];
+            bool cur = isCurrent(l, i);
+            ImGui::TableNextRow(0, rowH);
+            ImGui::TableNextColumn();
+            ImGui::PushID(i);
+            ImVec2 c0 = ImGui::GetCursorScreenPos();
+            ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2{ImGui::GetStyle().ItemSpacing.x, 0});  // sinon les surlignages des lignes se chevauchent
+            bool clicked = ImGui::Selectable("##r", cur, ImGuiSelectableFlags_SpanAllColumns, {0, rowH});
+            ImGui::PopStyleVar();
+            if (clicked)  // un clic suffit
+                play(l.uri, i, (sorted || (filter && filter[0])) ? &idx : nullptr);
+            bool hov = ImGui::IsItemHovered();
+            if (ImGui::BeginDragDropSource()) {  // vers une playlist à gauche, ou pour réordonner
+                g_dragTrack = t; g_dragFrom = l.uri; g_dragIdx = i;
+                ImGui::SetDragDropPayload("TRACK", &i, sizeof i);
+                ImGui::TextUnformatted(t.title.c_str());
+                ImGui::EndDragDropSource();
+            }
+            if (canReorder && ImGui::BeginDragDropTarget()) {
+                if (ImGui::AcceptDragDropPayload("TRACK")) {
+                    if (g_dragFrom == l.uri) { moveFrom = g_dragIdx; moveTo = i; }
+                    else { moveFrom = -2; moveTo = i; }  // titre venu d'une autre liste : inséré ici
+                }
+                ImGui::EndDragDropTarget();
+            }
+            if (ImGui::BeginPopupContextItem()) { trackMenu(l, i, removeAt); ImGui::EndPopup(); }
+            ImGui::PopID();
+            float cy = c0.y + rowH * 0.5f;
+            ImU32 dim = col(1, 1, 1, 0.55f), green = accU();
+            if (cur) {
+                if (g_set.neon > 0) {  // barre néon sur le titre en cours
+                    ImVec4 a4 = acc();
+                    for (int g = 3; g >= 1; g--) tdl->AddRectFilled({c0.x - 10 * S - g * 2 * S, c0.y + 8 * S}, {c0.x - 7 * S + g * 2 * S, c0.y + rowH - 8 * S}, ImGui::GetColorU32(ImVec4{a4.x, a4.y, a4.z, 0.12f * g_set.neon}), 4 * S);
+                    tdl->AddRectFilled({c0.x - 10 * S, c0.y + 8 * S}, {c0.x - 7 * S, c0.y + rowH - 8 * S}, green, 2 * S);
+                }
+                iconAt(tdl, {c0.x + 12 * S, cy}, isPlaying() ? I_VOL : I_PAUSE, 14 * S, green);
+            }
+            else if (hov) iconAt(tdl, {c0.x + 12 * S, cy}, I_PLAY, 14 * S, col(1, 1, 1));
+            else { std::string n = std::to_string(r + 1); tdl->AddText({c0.x + 12 * S - ImGui::CalcTextSize(n.c_str()).x * 0.5f, cy - 9 * S}, dim, n.c_str()); }
+
+            ImGui::TableNextColumn();
+            ImVec2 c1 = ImGui::GetCursorScreenPos();
+            float cw = ImGui::GetContentRegionAvail().x;
+            coverAt(tdl, t.image, "", {c1.x, cy - cov / 2}, cov, 6 * S);
+            bool fav = isFav(t.uri);
+            float tx = c1.x + cov + 12 * S;
+            textAt(tdl, {tx, cy - 19 * S}, cw - cov - 16 * S - (fav ? 18 * S : 0), cur ? green : col(1, 1, 1, 0.95f), t.title);
+            if (fav) iconAt(tdl, {c1.x + cw - 8 * S, cy - 10 * S}, I_HEART, 11 * S, green);
+            if (!t.local && isCached(t)) iconAt(tdl, {c1.x + cw - 8 * S, cy + 10 * S}, I_DOWNLOAD, 11 * S, col(1, 1, 1, 0.45f));  // dispo hors ligne
+            textAt(tdl, {tx, cy + 1 * S}, cw - cov - 16 * S, dim, t.artist.empty() ? "Artiste inconnu" : t.artist);
+
+            if (g_set.showAlbum) { ImGui::TableNextColumn(); textAt(tdl, {ImGui::GetCursorScreenPos().x, cy - 9 * S}, ImGui::GetContentRegionAvail().x, dim, t.album); }
+            ImGui::TableNextColumn();
+            tdl->AddText({ImGui::GetCursorScreenPos().x, cy - 9 * S}, dim, fmtTime(t.ms).c_str());
+        }
+        ImGui::EndTable();
+        bool changedList = false;
+        if (moveTo >= 0 && moveFrom != moveTo) {
+            if (moveFrom == -2) {
+                if (std::none_of(l.tracks.begin(), l.tracks.end(), [](const Track& x) { return x.uri == g_dragTrack.uri; })) l.tracks.insert(l.tracks.begin() + moveTo, g_dragTrack);
+            } else if (moveFrom >= 0) {
+                Track tmp = l.tracks[moveFrom];
+                l.tracks.erase(l.tracks.begin() + moveFrom);
+                l.tracks.insert(l.tracks.begin() + moveTo, tmp);
+            }
+            changedList = true;
+        }
+        if (removeAt >= 0) { l.tracks.erase(l.tracks.begin() + removeAt); changedList = true; }
+        if (changedList) {
+            if (g_plUri == l.uri) {  // la liste en cours change : on retrouve le titre en cours
+                auto it = std::find_if(l.tracks.begin(), l.tracks.end(), [](const Track& x) { return x.uri == g_cur.uri; });
+                g_tr = it == l.tracks.end() ? -1 : (int)(it - l.tracks.begin());
+                g_order.resize(l.tracks.size());
+                for (int k = 0; k < (int)g_order.size(); k++) g_order[k] = k;
+                g_pos = std::max(0, g_tr);
+            }
+            if (l.uri == "local") saveLocal(); else saveMine();
+        }
+    }
+    ImGui::PopStyleColor();
+    ImGui::PopStyleVar();
+}
+
+static void queueView() {
+    ImGui::PushFont(g_bold, 34); ImGui::TextUnformatted("File d'attente"); ImGui::PopFont();
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    auto row = [&](const Track& t, const char* id, bool playing) {
+        ImGui::PushID(id);
+        ImVec2 p = ImGui::GetCursorScreenPos();
+        float w = ImGui::GetContentRegionAvail().x, h = 52 * S;
+        bool dbl = ImGui::Selectable("##q", playing, ImGuiSelectableFlags_AllowDoubleClick, {w - 40 * S, h}) && ImGui::IsMouseDoubleClicked(0);
+        coverAt(dl, t.image, "", p + ImVec2{4 * S, 6 * S}, 40 * S, 6 * S);
+        textAt(dl, p + ImVec2{56 * S, 7 * S}, w - 110 * S, playing ? accU() : col(1, 1, 1, 0.95f), t.title);
+        textAt(dl, p + ImVec2{56 * S, 27 * S}, w - 110 * S, col(1, 1, 1, 0.55f), t.artist);
+        ImGui::PopID();
+        return dbl;
+    };
+    ImGui::Spacing(); ImGui::TextDisabled("EN COURS");
+    if (Track* t = current()) row(*t, "cur", true); else ImGui::TextDisabled("Rien pour l'instant");
+    ImGui::Spacing(); ImGui::TextDisabled("DANS LA FILE (%d)", (int)g_queue.size());
+    if (!g_queue.empty()) { ImGui::SameLine(); if (ImGui::SmallButton("Vider")) g_queue.clear(); }
+    for (int i = 0; i < (int)g_queue.size(); i++) {
+        std::string id = "q" + std::to_string(i);
+        if (row(g_queue[i], id.c_str(), false)) { Track t = g_queue[i]; g_queue.erase(g_queue.begin() + i); g_tr = -1; startTrack(t); break; }
+        ImGui::SameLine();
+        ImGui::SetCursorPosY(ImGui::GetCursorPosY() + 10 * S);
+        if (iconBtn(id.c_str(), I_CLOSE, 30 * S)) { g_queue.erase(g_queue.begin() + i); break; }
+    }
+    List* l = findList(g_plUri);
+    if (l && !g_order.empty()) {
+        ImGui::Spacing(); ImGui::TextDisabled("ENSUITE DANS « %s »", l->name.c_str());
+        for (int k = 1; k <= 30 && k < (int)g_order.size(); k++) {
+            int pos = (g_pos + k) % (int)g_order.size();
+            if (g_order[pos] >= (int)l->tracks.size()) continue;
+            std::string id = "n" + std::to_string(k);
+            if (row(l->tracks[g_order[pos]], id.c_str(), false)) { playPos(pos); break; }
+        }
+    }
+}
+
+static void searchView() {
+    ImGui::PushFont(g_bold, 34); ImGui::TextUnformatted("Recherche"); ImGui::PopFont();
+    if (!g_searchBuf[0]) { ImGui::TextDisabled("Tape un titre, un artiste ou un album dans la barre à gauche."); return; }
+    ImGui::TextDisabled(g_webOk ? "Dans ta bibliothèque + le catalogue Spotify (%d résultats)" : "Dans ta bibliothèque (%d résultats) - connecte le lecteur Spotify pour chercher tout le catalogue",
+                        (int)g_search.tracks.size());
+    ImGui::Spacing();
+    trackTable(g_search, nullptr);
+}
+
+static void mainView() {
+    static char filter[128];
+    if (g_lyricsOpen) { lyricsView(); return; }
+    if (g_view == "settings") { settingsView(); return; }
+    if (g_view == "queue") { queueView(); return; }
+    if (g_view == "search") { searchView(); return; }
+    List* l = findList(g_view);
+    if (!l) { if (g_lists.empty()) return; l = &g_lists[0]; g_view = l->uri; }
+    if (l->uri != "local" && !l->own && !isApple(l->uri) && !g_spReady) { loginPanel(); return; }
+    requestTracks(*l);
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    bool local = l->uri == "local";
+
+    // --- en-tête ---
+    float hero = 200 * S, w = ImGui::GetContentRegionAvail().x;
+    ImVec2 p = ImGui::GetCursorScreenPos();
+    dl->AddRectFilled(p + ImVec2{4 * S, 8 * S}, p + ImVec2{hero + 4 * S, hero + 8 * S}, col(0, 0, 0, 0.35f), 16 * S);  // ombre
+    coverAt(dl, l->image, l->uri, p, hero, 14 * S);
+    ImGui::Dummy({hero, hero});
+    ImGui::SameLine(0, 28 * S);
+    ImGui::BeginGroup();
+    float tx = w - hero - 28 * S;
+    long long total = 0;
+    for (auto& t : l->tracks) total += t.ms;
+    ImVec2 q = ImGui::GetCursorScreenPos();
+    const char* kind = local ? "TES MUSIQUES" : l->own ? "PLAYLIST GLASS" : isAlbum(l->uri) ? (isApple(l->uri) ? "ALBUM APPLE MUSIC" : "ALBUM") : isApple(l->uri) ? "PLAYLIST APPLE MUSIC" : "PLAYLIST";
+    dl->AddText(g_bold, 12 * S, q + ImVec2{0, 26 * S}, col(1, 1, 1, 0.7f), kind);
+    textAt(dl, q + ImVec2{0, 40 * S}, tx, col(1, 1, 1), l->name, g_bold, 46);
+    char meta[96];
+    snprintf(meta, sizeof meta, "%d titres · %lld h %lld min", (int)l->tracks.size(), total / 3600000, total / 60000 % 60);
+    dl->AddText(q + ImVec2{0, 108 * S}, col(1, 1, 1, 0.6f), l->loaded ? meta : "Chargement...");
+    ImGui::SetCursorScreenPos(q + ImVec2{0, 144 * S});
+    bool playingThis = g_plUri == l->uri && isPlaying();
+    if (playBtn("hero", 54 * S, playingThis, accU(), col(0, 0, 0))) {
+        if (g_plUri == l->uri && current()) togglePlay();
+        else if (!l->tracks.empty()) play(l->uri, g_shuffle ? std::mt19937{std::random_device{}()}() % l->tracks.size() : 0);
+    }
+    float bx = 68 * S;
+    auto btn = [&](const char* id, const char* icon, bool active, const char* tip) {
+        ImGui::SetCursorScreenPos(q + ImVec2{bx, 153 * S}); bx += 42 * S;
+        bool r = iconBtn(id, icon, 36 * S, active);
+        ImGui::SetItemTooltip("%s", tip);
+        return r;
+    };
+    if (btn("shuf", I_SHUFFLE, g_shuffle, "Aléatoire")) g_shuffle = !g_shuffle;
+    if (btn("edit", I_EDIT, false, "Personnaliser (nom, pochette)")) { g_editUri = l->uri; g_openPerso = true; }
+    if (btn("qadd", I_QUEUE, false, "Tout ajouter à la file d'attente")) { for (auto& t : l->tracks) g_queue.push_back(t); g_status = "Ajouté à la file d'attente"; }
+    if (!local && btn("dl", I_DOWNLOAD, g_dlRunning, g_dlRunning ? "Téléchargement en cours (voir en haut)" : "Télécharger pour écouter hors ligne")) downloadAll(*l);
+    if (local) {
+        ImGui::SetCursorScreenPos(q + ImVec2{bx + 6 * S, 153 * S});
+        if (ImGui::Button("+ Fichiers")) g_pick = 1;
+        ImGui::SameLine();
+        if (ImGui::Button("+ Dossier")) g_pick = 2;
+    }
+    ImGui::SetCursorScreenPos({std::max(q.x + 420 * S, q.x + tx - 260 * S), q.y + 153 * S});
+    ImGui::SetNextItemWidth(260 * S);
+    ImGui::InputTextWithHint("##f", "Rechercher dans la liste", filter, sizeof filter);
+    ImGui::EndGroup();
+    ImGui::SetCursorScreenPos(p + ImVec2{0, hero + 18 * S});
+    ImGui::Dummy({0, 0});  // ImGui exige un élément après un déplacement du curseur
+
+    if (l->tracks.empty() && l->loaded) {
+        if (!local && !l->own) ImGui::TextDisabled("Aucun titre dans cette liste.");
+        if (local) {
+            ImGui::TextDisabled("Glisse tes fichiers ou dossiers de musique (mp3, flac, m4a, wav...) dans la fenêtre,");
+            ImGui::TextDisabled("ou clique sur « + Fichiers » / « + Dossier ».");
+        } else if (l->own) {
+            ImGui::TextDisabled("Playlist vide : clic droit sur un titre > « Ajouter à la playlist »,");
+            ImGui::TextDisabled("ou glisse un titre sur cette playlist dans la colonne de gauche.");
+        }
+        return;
+    }
+    trackTable(*l, filter);
+}
+
+static void playerBar() {
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    ImVec2 o = ImGui::GetCursorScreenPos(), avail = ImGui::GetContentRegionAvail();
+    float w = avail.x, h = avail.y, cy = o.y + h * 0.5f;
+    Track* t = current();
+
+    // gauche : piste en cours (clic = aller à sa liste) + favori
+    if (t) {
+        float cs = 60 * S, tw = w * 0.3f - cs - 54 * S;
+        coverAt(dl, t->image, t->local ? "local" : "", {o.x, cy - cs / 2}, cs, 8 * S);
+        textAt(dl, {o.x + cs + 14 * S, cy - 20 * S}, tw, col(1, 1, 1), t->title, g_bold, 16);
+        textAt(dl, {o.x + cs + 14 * S, cy + 2 * S}, tw, col(1, 1, 1, 0.6f), t->artist);
+        ImGui::SetCursorScreenPos({o.x, cy - cs / 2});
+        if (ImGui::InvisibleButton("##now", {cs + tw, cs})) { if (findList(g_plUri)) g_view = g_plUri; g_lyricsOpen = false; }
+        ImGui::SetCursorScreenPos({o.x + cs + 14 * S + tw + 6 * S, cy - 17 * S});
+        bool fav = isFav(t->uri);
+        if (iconBtn("fav", fav ? I_HEART : I_HEART_O, 34 * S, fav)) toggleFav(*t);
+        ImGui::SetItemTooltip(fav ? "Retirer des favoris" : "Ajouter aux favoris");
+    }
+
+    // centre : contrôles + progression
+    float cw = std::min(w * 0.40f, 620 * S), cx = o.x + (w - cw) * 0.5f;
+    float bs = 36 * S, ps = 44 * S, gap = 12 * S, row = bs * 4 + ps + gap * 4;
+    float bx = cx + (cw - row) * 0.5f, by = o.y + 2 * S;
+    ImGui::SetCursorScreenPos({bx, by + (ps - bs) / 2});
+    if (iconBtn("shuffle", I_SHUFFLE, bs, g_shuffle)) g_shuffle = !g_shuffle;
+    ImGui::SetCursorScreenPos({bx + (bs + gap), by + (ps - bs) / 2});
+    if (iconBtn("prev", I_PREV, bs)) { if (posMs() > 3000) seekMs(0); else step(-1); }
+    ImGui::SetCursorScreenPos({bx + (bs + gap) * 2, by});
+    if (playBtn("main", ps, isPlaying() || g_loading, col(1, 1, 1), col(0, 0, 0))) togglePlay();
+    ImGui::SetCursorScreenPos({bx + (bs + gap) * 2 + ps + gap, by + (ps - bs) / 2});
+    if (iconBtn("next", I_NEXT, bs)) step(1);
+    ImGui::SetCursorScreenPos({bx + (bs + gap) * 3 + ps + gap, by + (ps - bs) / 2});
+    if (iconBtn("repeat", I_REPEAT1, bs, g_repeat)) g_repeat = !g_repeat;
+    ImGui::SetItemTooltip("Répéter le titre");
+
+    static float sv = 0;
+    static bool drag = false;
+    double dur = durMs();
+    if (!drag) sv = (float)posMs();
+    float sy = by + ps + 8 * S, tw = 44 * S;
+    std::string a = g_loading && t ? "..." : fmtTime(sv), b = fmtTime(dur);
+    dl->AddText({cx + tw - ImGui::CalcTextSize(a.c_str()).x - 8 * S, sy - 1 * S}, col(1, 1, 1, 0.6f), a.c_str());
+    ImGui::SetCursorScreenPos({cx + tw, sy});
+    bool rel = scrub("##seek", &sv, (float)std::max(dur, 1.0), cw - tw * 2);
+    drag = ImGui::IsItemActive();
+    if (rel && t) seekMs(sv);
+    dl->AddText({cx + cw - tw + 8 * S, sy - 1 * S}, col(1, 1, 1, 0.6f), b.c_str());
+
+    // droite : paroles, file, plus, volume
+    float vw = 100 * S, rx = o.x + w - vw - 30 * S - 34 * S * 3;
+    ImGui::SetCursorScreenPos({rx, cy - 17 * S});
+    if (iconBtn("lyrics", I_LYRICS, 34 * S, g_lyricsOpen)) g_lyricsOpen = !g_lyricsOpen;
+    ImGui::SetItemTooltip("Paroles (Ctrl+L)");
+    ImGui::SetCursorScreenPos({rx + 34 * S, cy - 17 * S});
+    if (iconBtn("queue", I_QUEUE, 34 * S, g_view == "queue" && !g_lyricsOpen)) { g_view = "queue"; g_lyricsOpen = false; }
+    ImGui::SetItemTooltip("File d'attente (Ctrl+Q)");
+    ImGui::SetCursorScreenPos({rx + 68 * S, cy - 17 * S});
+    if (iconBtn("more", I_MORE, 34 * S, g_sleepAt > 0 || g_sleepEnd)) ImGui::OpenPopup("more");
+    ImGui::SetItemTooltip("Minuterie, vitesse, mini-lecteur");
+    if (ImGui::BeginPopup("more")) {
+        ImGui::TextDisabled("MINUTERIE");
+        if (g_sleepAt > 0) ImGui::Text("Arrêt dans %d min", (int)((g_sleepAt - now()) / 60) + 1);
+        if (g_sleepEnd) ImGui::Text("Arrêt à la fin du titre");
+        for (int m : {15, 30, 45, 60, 90}) if (ImGui::MenuItem((std::to_string(m) + " minutes").c_str())) { g_sleepAt = now() + m * 60; g_sleepEnd = false; }
+        if (ImGui::MenuItem("À la fin du titre")) { g_sleepEnd = true; g_sleepAt = 0; }
+        if ((g_sleepAt > 0 || g_sleepEnd) && ImGui::MenuItem("Désactiver la minuterie")) { g_sleepAt = 0; g_sleepEnd = false; }
+        ImGui::Separator();
+        ImGui::TextDisabled("VITESSE (fichiers / YouTube)");
+        ImGui::SetNextItemWidth(200 * S);
+        if (ImGui::SliderFloat("##spd2", &g_set.speed, 0.5f, 2.0f, "x%.2f")) { plat::audioRate(g_set.speed); saveSettings(); }
+        ImGui::Separator();
+        if (ImGui::MenuItem("Mini-lecteur", "Ctrl+M")) toggleMini();
+        ImGui::EndPopup();
+    }
+    iconAt(dl, {o.x + w - vw - 16 * S, cy}, I_VOL, 15 * S, col(1, 1, 1, 0.75f));
+    ImGui::SetCursorScreenPos({o.x + w - vw, cy - 8 * S});
+    float old = g_set.vol;
+    if (scrub("##vol", &g_set.vol, 1, vw, 0.05f)) saveSettings();
+    if (g_set.vol != old) setVolume();
+}
+
+// Texte centré sur une ligne, coupé avec « … » ; fill = partie déjà chantée (karaoké, 0..1).
+static void centeredLine(ImDrawList* dl, float cx, float y, float maxW, const std::string& txt, ImFont* f, float size, ImU32 dim, ImU32 bright, float fill) {
+    float tw = std::min(maxW, f->CalcTextSizeA(size * S * g_set.textScale, FLT_MAX, 0, txt.c_str()).x);
+    ImVec2 p{cx - tw * 0.5f, y};
+    textAt(dl, p, maxW, dim, txt, f, size);
+    if (fill > 0) {
+        dl->PushClipRect(p, p + ImVec2{tw * fill, size * S * 2}, true);
+        textAt(dl, p, maxW, bright, txt, f, size);
+        dl->PopClipRect();
+    }
+}
+
+static void miniPlayer(ImGuiViewport* vp) {  // fenêtre compacte, toujours au premier plan
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    ImVec2 o = vp->Pos, sz = vp->Size;
+    Track* t = current();
+    float pad = 14 * S, cs = 112 * S, x = o.x + pad + cs + 16 * S, right = o.x + sz.x - pad;
+    coverAt(dl, t ? t->image : "icon:", "", o + ImVec2{pad, pad}, cs, 12 * S);
+
+    // en haut à droite : paroles, agrandir
+    ImGui::SetCursorScreenPos({right - 62 * S, o.y + 8 * S});
+    if (iconBtn("mlyr", I_LYRICS, 30 * S, g_miniLyrics)) toggleMiniLyrics();
+    ImGui::SetItemTooltip("Paroles");
+    ImGui::SetCursorScreenPos({right - 30 * S, o.y + 8 * S});
+    if (iconBtn("expand", I_EXPAND, 30 * S)) toggleMini();
+    ImGui::SetItemTooltip("Agrandir");
+    float tw = right - 70 * S - x;
+    textAt(dl, {x, o.y + 15 * S}, tw, col(1, 1, 1), t ? t->title : "Glass", g_bold, 15);
+    textAt(dl, {x, o.y + 36 * S}, tw, col(1, 1, 1, 0.6f), t ? t->artist : "Rien en lecture");
+
+    // contrôles + volume
+    float by = o.y + 60 * S;
+    ImGui::SetCursorScreenPos({x - 6 * S, by + 4 * S});
+    if (iconBtn("mprev", I_PREV, 32 * S)) { if (posMs() > 3000) seekMs(0); else step(-1); }
+    ImGui::SetCursorScreenPos({x + 30 * S, by});
+    if (playBtn("mplay", 40 * S, isPlaying() || g_loading, col(1, 1, 1), col(0, 0, 0))) togglePlay();
+    ImGui::SetCursorScreenPos({x + 74 * S, by + 4 * S});
+    if (iconBtn("mnext", I_NEXT, 32 * S)) step(1);
+    ImGui::SetCursorScreenPos({x + 108 * S, by + 4 * S});
+    bool fav = t && isFav(t->uri);
+    if (iconBtn("mfav", fav ? I_HEART : I_HEART_O, 32 * S, fav) && t) toggleFav(*t);
+    float vx = x + 152 * S, vw = right - vx - 22 * S;
+    if (vw > 30 * S) {
+        iconAt(dl, {vx + 8 * S, by + 20 * S}, I_VOL, 13 * S, col(1, 1, 1, 0.7f));
+        ImGui::SetCursorScreenPos({vx + 22 * S, by + 12 * S});
+        float old = g_set.vol;
+        if (scrub("##mvol", &g_set.vol, 1, vw, 0.05f)) saveSettings();
+        if (g_set.vol != old) setVolume();
+    }
+
+    // progression avec les temps
+    static float sv = 0;
+    static bool drag = false;
+    double dur = durMs();
+    if (!drag) sv = (float)posMs();
+    float py = o.y + 112 * S, tl = 36 * S;
+    std::string a1 = g_loading && t ? "..." : fmtTime(sv), a2 = fmtTime(dur);
+    dl->AddText({x, py - 1 * S}, col(1, 1, 1, 0.55f), a1.c_str());
+    dl->AddText({right - ImGui::CalcTextSize(a2.c_str()).x, py - 1 * S}, col(1, 1, 1, 0.55f), a2.c_str());
+    ImGui::SetCursorScreenPos({x + tl, py});
+    bool rel = scrub("##mseek", &sv, (float)std::max(dur, 1.0), right - x - tl * 2);
+    drag = ImGui::IsItemActive();
+    if (rel && t) seekMs(sv);
+
+    // paroles sous le lecteur : ligne précédente, ligne chantée (karaoké), ligne suivante
+    if (g_miniLyrics) {
+        float ly = o.y + 150 * S, cx = o.x + sz.x * 0.5f, mw = sz.x - pad * 2;
+        dl->AddLine({o.x + pad, ly - 6 * S}, {right, ly - 6 * S}, col(1, 1, 1, 0.08f));
+        if (!t) { centeredLine(dl, cx, ly + 40 * S, mw, "Lance un titre", g_bold, 15, col(1, 1, 1, 0.5f), 0, 0); return; }
+        ensureLyrics(*t);
+        if (g_lyrState != 2) {
+            const char* m = g_lyrState == 1 ? "Chargement des paroles..." : g_lyrState == 4 ? "L'IA écrit les paroles..." : "Pas de paroles pour ce titre";
+            centeredLine(dl, cx, ly + 40 * S, mw, m, g_bold, 15, col(1, 1, 1, 0.5f), 0, 0);
+            return;
+        }
+        double pos = posMs() + g_lyrOff[t->uri];
+        int cur = -1;
+        if (g_lyrSynced) for (int i = 0; i < (int)g_lyr.size(); i++) if (g_lyr[i].t <= pos + 120) cur = i;
+        auto line = [&](int i) { return i >= 0 && i < (int)g_lyr.size() ? (g_lyr[i].w.empty() ? std::string(u8"♪") : g_lyr[i].w) : std::string(); };
+        float fill = 0;
+        if (cur >= 0) {
+            int end = cur + 1 < (int)g_lyr.size() ? g_lyr[cur + 1].t : g_lyr[cur].t + 4000;
+            fill = std::clamp((float)((pos - g_lyr[cur].t) / std::max(1, std::min(end - g_lyr[cur].t, 8000))), 0.f, 1.f);
+        }
+        if (!g_lyrSynced) cur = 0;
+        ImVec4 a4 = acc();
+        centeredLine(dl, cx, ly + 4 * S, mw, line(cur - 1), ImGui::GetFont(), 14, col(1, 1, 1, 0.35f), 0, 0);
+        if (g_set.neon > 0 && cur >= 0) glow(dl, {cx, ly + 50 * S}, mw * 0.35f, a4, 0.18f * g_set.neon);
+        centeredLine(dl, cx, ly + 36 * S, mw, cur >= 0 ? line(cur) : std::string(u8"• • •"), g_bold, 19, col(1, 1, 1, 0.45f), col(1, 1, 1), g_lyrSynced ? fill : 1);
+        centeredLine(dl, cx, ly + 74 * S, mw, line(cur + 1), ImGui::GetFont(), 14, col(1, 1, 1, 0.35f), 0, 0);
+    }
+}
+
+// Fenêtres « Personnaliser » et « Nouvelle playlist ».
+static void dialogs() {
+    static char name[128];
+    if (g_openPerso) { ImGui::OpenPopup("Personnaliser"); g_openPerso = false; if (List* l = findList(g_editUri)) snprintf(name, sizeof name, "%s", l->name.c_str()); }
+    if (g_openNew) { ImGui::OpenPopup("Nouvelle playlist"); g_openNew = false; snprintf(name, sizeof name, "Ma playlist"); }
+    ImGui::SetNextWindowSize({460 * S, 0});
+    if (ImGui::BeginPopupModal("Personnaliser", nullptr, ImGuiWindowFlags_NoResize)) {
+        List* l = findList(g_editUri);
+        if (!l) { ImGui::CloseCurrentPopup(); ImGui::EndPopup(); return; }
+        ImVec2 p = ImGui::GetCursorScreenPos();
+        coverAt(ImGui::GetWindowDrawList(), l->image, l->uri, p, 120 * S, 12 * S);
+        ImGui::Dummy({120 * S, 120 * S});
+        ImGui::SameLine();
+        ImGui::BeginGroup();
+        ImGui::TextDisabled("Nom");
+        ImGui::SetNextItemWidth(-1);
+        ImGui::InputText("##name", name, sizeof name);
+        if (ImGui::Button("Choisir une image...")) { g_pick = 3; g_pickUri = l->uri; }
+        if (!l->own) {
+            ImGui::SameLine();
+            if (ImGui::Button("Réinitialiser")) { g_over.erase(l->uri); saveOverrides(); l->requested = false; g_status = "Nom et pochette d'origine au prochain chargement"; }
+        }
+        ImGui::EndGroup();
+        if (!l->own) ImGui::TextDisabled("Le changement reste dans Glass (la playlist d'origine n'est pas modifiée).");
+        ImGui::Spacing();
+        if (ImGui::Button("Enregistrer", {120 * S, 0}) && name[0]) {
+            l->name = name;
+            if (l->own) saveMine();
+            else { g_over[l->uri].first = name; saveOverrides(); }
+            ImGui::CloseCurrentPopup();
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Fermer", {120 * S, 0})) ImGui::CloseCurrentPopup();
+        ImGui::EndPopup();
+    }
+    ImGui::SetNextWindowSize({400 * S, 0});
+    if (ImGui::BeginPopupModal("Nouvelle playlist", nullptr, ImGuiWindowFlags_NoResize)) {
+        ImGui::TextDisabled("Nom de la playlist");
+        ImGui::SetNextItemWidth(-1);
+        if (ImGui::IsWindowAppearing()) ImGui::SetKeyboardFocusHere();
+        bool ok = ImGui::InputText("##nn", name, sizeof name, ImGuiInputTextFlags_EnterReturnsTrue);
+        if ((ImGui::Button("Créer", {120 * S, 0}) || ok) && name[0]) {
+            List l{"glass:" + std::to_string(nowId()), name, g_pendingAdd.empty() ? "" : g_pendingAdd[0].image, g_pendingAdd};
+            l.own = l.loaded = true;
+            g_lists.push_back(l); saveMine();
+            g_view = l.uri; g_lyricsOpen = false; g_pendingAdd.clear();
+            ImGui::CloseCurrentPopup();
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Annuler", {120 * S, 0})) ImGui::CloseCurrentPopup();
+        ImGui::EndPopup();
+    }
+}
+
+static void drawUI() {
+    ImGuiViewport* vp = ImGui::GetMainViewport();
+    updateAccent();
+    drawBackground(vp);
+    ImGui::SetNextWindowPos(vp->Pos); ImGui::SetNextWindowSize(vp->Size);
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2{0, 0});
+    ImGui::Begin("##root", nullptr, ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoBackground | ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoBringToFrontOnFocus);
+    ImGui::PopStyleVar();
+    if (g_mini) {
+        if (g_set.neon > 0) neonRect(ImGui::GetBackgroundDrawList(), vp->Pos + ImVec2{3 * S, 3 * S}, vp->Pos + vp->Size - ImVec2{3 * S, 3 * S}, 10 * S, g_set.neon);
+        miniPlayer(vp);
+    } else {
+        float tb = 42 * S, gap = 10 * S, barH = 100 * S, sideW = 290 * S;
+        titleBar(vp, tb);
+        float bodyH = vp->Size.y - tb - barH - gap * 2;
+        if (g_set.neon > 0) {  // contours néon des panneaux, dessinés sous le verre
+            ImDrawList* bg = ImGui::GetBackgroundDrawList();
+            float r = g_set.rounding * S;
+            ImVec2 o = vp->Pos;
+            neonRect(bg, o + ImVec2{gap, tb}, o + ImVec2{gap + sideW, tb + bodyH}, r, g_set.neon * 0.6f);
+            neonRect(bg, o + ImVec2{gap * 2 + sideW, tb}, o + ImVec2{vp->Size.x - gap, tb + bodyH}, r, g_set.neon * 0.6f);
+            neonRect(bg, o + ImVec2{gap, tb + bodyH + gap}, o + ImVec2{vp->Size.x - gap, tb + bodyH + gap + barH}, r, g_set.neon);
+        }
+        ImGui::SetCursorPos({gap, tb});
+        ImGui::BeginChild("side", {sideW, bodyH}, ImGuiChildFlags_Borders | ImGuiChildFlags_AlwaysUseWindowPadding);
+        sidebar();
+        ImGui::EndChild();
+        ImGui::SameLine(0, gap);
+        ImGui::BeginChild("main", {vp->Size.x - sideW - gap * 3, bodyH}, ImGuiChildFlags_Borders | ImGuiChildFlags_AlwaysUseWindowPadding);
+        static std::string lastView;
+        static double viewT = 0;
+        std::string key = g_view + (g_lyricsOpen ? "|paroles" : "");
+        if (key != lastView) { lastView = key; viewT = ImGui::GetTime(); }
+        float k = g_set.animations ? (float)std::min(1.0, (ImGui::GetTime() - viewT) / 0.22) : 1.f;
+        if (k < 1) g_anim = true;
+        k = 1 - (1 - k) * (1 - k);  // ralentit en fin de course
+        ImGui::PushStyleVar(ImGuiStyleVar_Alpha, 0.15f + 0.85f * k);
+        ImGui::SetCursorPosY(ImGui::GetCursorPosY() + (1 - k) * 14 * S);
+        mainView();
+        ImGui::PopStyleVar();
+        ImGui::EndChild();
+        ImGui::SetCursorPos({gap, tb + bodyH + gap});
+        ImGui::BeginChild("bar", {vp->Size.x - gap * 2, barH}, ImGuiChildFlags_Borders | ImGuiChildFlags_AlwaysUseWindowPadding, ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
+        playerBar();
+        ImGui::EndChild();
+        dialogs();
+    }
+    ImGui::End();
+
+    if (!ImGui::GetIO().WantTextInput) {
+        if (ImGui::IsKeyPressed(ImGuiKey_Space, false)) togglePlay();
+        if (ImGui::IsKeyChordPressed(ImGuiMod_Ctrl | ImGuiKey_RightArrow)) step(1);
+        if (ImGui::IsKeyChordPressed(ImGuiMod_Ctrl | ImGuiKey_LeftArrow)) step(-1);
+        if (ImGui::IsKeyChordPressed(ImGuiMod_Ctrl | ImGuiKey_L)) g_lyricsOpen = !g_lyricsOpen;
+        if (ImGui::IsKeyChordPressed(ImGuiMod_Ctrl | ImGuiKey_Q)) { g_view = "queue"; g_lyricsOpen = false; }
+        if (ImGui::IsKeyChordPressed(ImGuiMod_Ctrl | ImGuiKey_M)) toggleMini();
+        float dv = ImGui::IsKeyChordPressed(ImGuiMod_Ctrl | ImGuiKey_UpArrow) ? 0.05f : ImGui::IsKeyChordPressed(ImGuiMod_Ctrl | ImGuiKey_DownArrow) ? -0.05f : 0;
+        if (dv) { g_set.vol = std::clamp(g_set.vol + dv, 0.f, 1.f); setVolume(); saveSettings(); }
+    }
+    if (ImGui::IsKeyChordPressed(ImGuiMod_Ctrl | ImGuiKey_F)) { if (g_mini) toggleMini(); g_focusSearch = true; }
+}
+
+static void setupStyle() {
+    ImGuiStyle& s = ImGui::GetStyle();
+    s.WindowPadding = {16, 16}; s.FramePadding = {12, 8}; s.ItemSpacing = {10, 8}; s.CellPadding = {10, 8};
+    s.ScrollbarRounding = 8; s.ScrollbarSize = 8; s.WindowBorderSize = s.PopupBorderSize = 0; s.ChildBorderSize = 1;
+    s.SelectableTextAlign = {0, 0.5f};
+    ImVec4* c = s.Colors;
+    auto W = [](float a) { return ImVec4{1, 1, 1, a}; };
+    c[ImGuiCol_Text] = W(0.95f); c[ImGuiCol_TextDisabled] = W(0.5f);
+    c[ImGuiCol_Border] = W(0.12f);  // panneaux en verre dépoli
+    c[ImGuiCol_FrameBg] = W(0.09f); c[ImGuiCol_FrameBgHovered] = W(0.13f); c[ImGuiCol_FrameBgActive] = W(0.17f);
+    c[ImGuiCol_Button] = W(0.10f); c[ImGuiCol_ButtonHovered] = W(0.18f); c[ImGuiCol_ButtonActive] = W(0.25f);
+    c[ImGuiCol_Header] = W(0.12f); c[ImGuiCol_HeaderHovered] = W(0.07f); c[ImGuiCol_HeaderActive] = W(0.15f);
+    c[ImGuiCol_TableHeaderBg] = W(0); c[ImGuiCol_TableRowBg] = W(0); c[ImGuiCol_TableRowBgAlt] = W(0);
+    c[ImGuiCol_TableBorderLight] = W(0.06f); c[ImGuiCol_TableBorderStrong] = W(0.08f);
+    c[ImGuiCol_ScrollbarBg] = W(0); c[ImGuiCol_ScrollbarGrab] = W(0.15f); c[ImGuiCol_ScrollbarGrabHovered] = W(0.25f); c[ImGuiCol_ScrollbarGrabActive] = W(0.35f);
+    c[ImGuiCol_NavCursor] = W(0); c[ImGuiCol_Separator] = W(0.08f);
+    c[ImGuiCol_SliderGrabActive] = W(1);
+    c[ImGuiCol_ModalWindowDimBg] = ImVec4{0, 0, 0, 0.5f};
+}
+
+// ---------- ce que le système appelle (win.cpp / mac.mm) ----------
+void app::init() {
+    std::error_code ec;
+    fs::create_directories(g_dir / "cache", ec);
+    g_wall = plat::wallpaper();
+    loadSettings();
+    g_accLive = {g_set.accent[0], g_set.accent[1], g_set.accent[2], 1};
+    plat::audioVolume(g_set.vol * g_set.vol);
+    loadSaved();
+    for (auto& l : g_lists) if (isApple(l.uri)) requestTracks(l);  // pas besoin du compte Spotify
+    startEngine();
+}
+
+void app::initUI() {
+    ImFont* regular;
+    plat::loadFonts(&regular, &g_bold, &g_icons);
+    setupStyle();
+    ImGui::GetStyle().ScaleAllSizes(S); ImGui::GetStyle().FontScaleDpi = S;
+    applyStyle();
+    for (int i = 0; i < 2; i++) std::thread(texWorker).detach();
+    makeGlowTexture();
+    plat::setMediaKeys(g_set.mediaKeys);
+    setTopmost();
+}
+
+int app::timeoutMs(bool visible, bool front) {
+    std::lock_guard lk(g_mx);
+    if (visible && g_anim) return 15;     // animations : fluide, plafonné à ~60 images/s
+    if (visible && g_animBg) return 33;   // fond animé, particules : ~30 images/s
+    if (isPlaying()) return !visible ? 1000 : g_lyricsOpen || (g_mini && g_miniLyrics) ? 80 : front ? 500 : 1000;  // progression, fin de titre
+    if (g_sleepAt > 0) return 1000;       // minuterie
+    return -1;
+}
+
+bool app::tick() {
+    int pick;
+    {
+        std::lock_guard lk(g_mx);
+        uploadTextures();
+        if (!g_ready.empty()) { audioPlay(g_ready); g_ready.clear(); g_status.clear(); }
+        if (!g_sp && g_has && !g_loading && !g_failed && plat::audioFailed()) { g_failed = true; g_status = "Impossible de lire ce titre"; }
+        if (!g_sp && g_has && !g_loading && !g_failed && plat::audioEnded()) onTrackEnd();
+        if (g_spEnded) { g_spEnded = false; onTrackEnd(); }
+        if (g_sleepAt > 0 && now() >= g_sleepAt) { g_sleepAt = 0; pausePlayback(); g_status = "Minuterie : lecture arrêtée"; }
+        if (g_webOk && g_set.source != 2 && !g_wvStarted) startWebView();  // lecteur officiel seulement s'il sert
+        if (g_wvStarted && g_set.source == 2) stopWebView();
+        for (auto& m : g_wvOut) plat::webPost(m);
+        g_wvOut.clear();
+        if (g_has) plat::nowPlaying(g_cur.title, g_cur.artist, isPlaying());
+        pick = g_pick; g_pick = 0;
+    }
+    if (!pick) return false;
+    auto paths = plat::pick(pick);  // boîte modale : hors du verrou
+    if (pick == 3) {
+        std::lock_guard lk(g_mx);
+        if (!paths.empty()) if (List* l = findList(g_pickUri)) {
+            l->image = ustr(paths[0]);
+            if (l->own) saveMine(); else { g_over[l->uri].second = l->image; saveOverrides(); }
+        }
+    } else if (!paths.empty()) addLocal(paths);
+    return true;
+}
+
+void app::frame() {
+    std::lock_guard lk(g_mx);
+    g_anim = false;
+    drawUI();
+}
+
+void app::dropped(const std::vector<fs::path>& paths) {
+    addLocal(paths);
+    std::lock_guard lk(g_mx);
+    g_view = "local"; g_lyricsOpen = false;
+}
+
+void app::onWeb(const std::string& msg) { onPlayer(msg); }
+
+void app::media(int cmd) {
+    std::lock_guard lk(g_mx);
+    if (cmd == 1) togglePlay(); else if (cmd == 2) step(1); else if (cmd == 3) step(-1);
+}
+
+bool app::caption(float x, float y, float w, float) {
+    if (g_mini) return x < 140 * S || y < 8 * S || y > 146 * S;  // pochette, bord haut, paroles = poignée
+#ifdef __APPLE__
+    return y < 42 * S && x > 70 * S && x < w - 46 * S;  // boutons ronds du Mac à gauche, mini-lecteur à droite
+#else
+    return y < 42 * S && x < w - 4 * 46 * S;
+#endif
+}
+
+bool app::mini() { return g_mini; }
+bool app::trayOn() { return g_set.tray; }

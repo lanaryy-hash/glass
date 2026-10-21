@@ -1,0 +1,4 @@
+build/
+engine/target/
+*.iconset/
+assets/Glass.icns

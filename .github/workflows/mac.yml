@@ -1,0 +1,54 @@
+# Fabrique Glass.app (Mac Intel + Apple Silicon, macOS 12+) à chaque envoi du code.
+# Le résultat se télécharge dans l'onglet « Actions » du dépôt > dernière exécution > Glass-mac.
+name: Mac
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-14
+    env:
+      MACOSX_DEPLOYMENT_TARGET: "12.0"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Moteur Spotify (Rust, les deux processeurs)
+        working-directory: engine
+        run: |
+          rustup target add aarch64-apple-darwin x86_64-apple-darwin
+          cargo build --release --target aarch64-apple-darwin
+          cargo build --release --target x86_64-apple-darwin
+          lipo -create -output ../glass-engine target/aarch64-apple-darwin/release/glass-engine target/x86_64-apple-darwin/release/glass-engine
+
+      - name: Paroles par IA (whisper.cpp)
+        run: |
+          git clone --depth 1 --branch v1.8.7 https://github.com/ggml-org/whisper.cpp
+          for a in arm64 x86_64; do
+            cmake -S whisper.cpp -B wb-$a -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=OFF -DGGML_METAL=OFF -DGGML_NATIVE=OFF \
+              -DWHISPER_BUILD_TESTS=OFF -DWHISPER_BUILD_SERVER=OFF -DCMAKE_OSX_ARCHITECTURES=$a
+            cmake --build wb-$a --config Release -j 4 --target whisper-cli
+          done
+          lipo -create -output whisper-cli $(find wb-arm64 -name whisper-cli -type f -perm +111) $(find wb-x86_64 -name whisper-cli -type f -perm +111)
+
+      - name: Icône
+        run: |
+          mkdir Glass.iconset
+          for s in 16 32 128 256 512; do
+            sips -z $s $s assets/glass-1024.png --out Glass.iconset/icon_${s}x${s}.png
+            sips -z $((s*2)) $((s*2)) assets/glass-1024.png --out Glass.iconset/icon_${s}x${s}@2x.png
+          done
+          iconutil -c icns Glass.iconset -o assets/Glass.icns
+
+      - name: Glass.app
+        run: |
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release "-DCMAKE_OSX_ARCHITECTURES=arm64;x86_64"
+          cmake --build build -j 4
+          cp glass-engine whisper-cli build/Glass.app/Contents/MacOS/
+          codesign --force --deep -s - build/Glass.app
+          ditto -c -k --keepParent build/Glass.app Glass-mac.zip
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Glass-mac
+          path: Glass-mac.zip
