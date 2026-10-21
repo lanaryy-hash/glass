@@ -130,7 +130,7 @@ static pid_t spawn(const std::vector<std::string>& args, int in, int out) {
     if (posix_spawnp(&pid, argv[0], &fa, &at, argv.data(), environ) != 0) pid = -1;
     posix_spawn_file_actions_destroy(&fa);
     posix_spawnattr_destroy(&at);
-    close(devnull);
+    ::close(devnull);
     if (pid > 0) { setpriority(PRIO_PROCESS, pid, 10); std::lock_guard lk(g_pidMx); g_pids.insert(pid); }
     return pid;
 }
@@ -157,11 +157,11 @@ static pid_t g_engPid = 0;
 bool plat::engineStart(const fs::path& exe, std::function<void(const std::string&)> onLine, std::function<void()> onExit) {
     int in[2], out[2];
     if (pipe(in)) return false;
-    if (pipe(out)) { close(in[0]); close(in[1]); return false; }
+    if (pipe(out)) { ::close(in[0]); ::close(in[1]); return false; }
     setenv("GLASS_DATA", g_dir.c_str(), 1);  // l'app est en lecture seule : le moteur range ses données ici
     pid_t pid = spawn({exe.string()}, in[0], out[1]);
-    close(in[0]); close(out[1]);
-    if (pid <= 0) { close(in[1]); close(out[0]); return false; }
+    ::close(in[0]); ::close(out[1]);
+    if (pid <= 0) { ::close(in[1]); ::close(out[0]); return false; }
     g_engIn = in[1]; g_engPid = pid;
     std::thread([fd = out[0], pid, onLine, onExit] {
         std::string buf; char c[8192]; ssize_t n;
@@ -170,7 +170,7 @@ bool plat::engineStart(const fs::path& exe, std::function<void(const std::string
             for (size_t p; (p = buf.find('\n')) != std::string::npos; buf.erase(0, p + 1)) onLine(buf.substr(0, p));
             plat::wake();
         }
-        close(fd);
+        ::close(fd);
         waitpid(pid, nullptr, 0);
         reaped(pid);
         onExit();
@@ -188,7 +188,7 @@ void plat::engineSend(const std::string& s) {
 }
 
 void plat::engineStop() {  // stdin fermé = le moteur s'arrête
-    if (g_engIn >= 0) { close(g_engIn); g_engIn = -1; }
+    if (g_engIn >= 0) { ::close(g_engIn); g_engIn = -1; }
     for (int i = 0; i < 60 && g_engPid > 0 && kill(g_engPid, 0) == 0; i++) usleep(50000);
 }
 
@@ -339,7 +339,7 @@ static ImFont* addFont(const std::string& path, bool merge = false) {
     if (fd < 0) return nullptr;
     struct stat st;
     void* data = fstat(fd, &st) == 0 ? mmap(nullptr, st.st_size, PROT_READ, MAP_PRIVATE, fd, 0) : MAP_FAILED;
-    close(fd);
+    ::close(fd);
     if (data == MAP_FAILED) return nullptr;
     ImFontConfig cfg;
     cfg.FontDataOwnedByAtlas = false;
@@ -571,7 +571,7 @@ int main(int, char**) {
             glfwSwapBuffers(g_win);
         }
 
-        if (g_engIn >= 0) close(g_engIn);  // le moteur s'arrête seul
+        if (g_engIn >= 0) ::close(g_engIn);  // le moteur s'arrête seul
         { std::lock_guard lk(g_pidMx); for (pid_t p : g_pids) kill(p, SIGTERM); }
         ImGui_ImplOpenGL3_Shutdown(); ImGui_ImplGlfw_Shutdown(); ImGui::DestroyContext();
         glfwTerminate();
