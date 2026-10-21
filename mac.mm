@@ -208,8 +208,7 @@ static id g_endObs, g_failObs;
 static std::atomic<bool> g_ended{false}, g_failed{false};
 static float g_rate = 1, g_vol = 1;
 
-void plat::audioPlay(const fs::path& file) {
-    std::string p = file.string();
+void plat::audioPlay(const std::string& p) {
     onMain(^{
         if (!g_player) g_player = [AVPlayer new];
         AVPlayerItem* it = [AVPlayerItem playerItemWithURL:[NSURL fileURLWithPath:ns(p)]];
@@ -581,20 +580,6 @@ void plat::nowPlaying(const std::string& title, const std::string& artist, bool 
     c.playbackState = playing ? MPNowPlayingPlaybackStatePlaying : MPNowPlayingPlaybackStatePaused;
 }
 
-// yt-dlp : téléchargé au premier lancement (aucune installation à faire), mis à jour chaque semaine (YouTube change souvent).
-static void ensureYtdlp() {
-    fs::path p = g_dir / "bin" / "yt-dlp";
-    std::error_code ec;
-    if (!plat::findTool("yt-dlp").empty()) {
-        auto age = fs::file_time_type::clock::now() - fs::last_write_time(p, ec);
-        if (!ec && age > std::chrono::hours(24 * 7)) std::thread([p] { plat::run({p.string(), "-U"}, 120000); fs::path q = p; std::error_code e; fs::last_write_time(q, fs::file_time_type::clock::now(), e); }).detach();
-        return;
-    }
-    std::thread([p] {
-        if (plat::download("https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp_macos", p, [](int) {})) chmod(p.c_str(), 0755);
-    }).detach();
-}
-
 static void markInput() { g_lastInput = glfwGetTime(); }
 
 int main(int, char**) {
@@ -606,7 +591,6 @@ int main(int, char**) {
         std::error_code ec;
         fs::create_directories(g_dir / "bin", ec);
         if (!glfwInit()) return 1;
-        ensureYtdlp();
         app::init();
 
         glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 3);

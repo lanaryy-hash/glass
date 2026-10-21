@@ -29,7 +29,7 @@ void engineStop();
 size_t memMB(bool engine);
 
 // son des fichiers locaux et de YouTube
-void audioPlay(const fs::path& file);
+void audioPlay(const std::string& file);  // chemin UTF-8
 void audioPause();
 void audioResume();
 bool audioPaused();

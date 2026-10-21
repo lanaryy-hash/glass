@@ -48,7 +48,11 @@ TES MUSIQUES A TOI
   "+ Fichiers" / "+ Dossier". Clic droit sur un titre > Retirer.
 
 PAROLES
-  Spotify d'abord, sinon LRCLIB. Si un titre n'en a pas, l'IA (whisper.cpp)
+  Spotify d'abord (si connecte), sinon LRCLIB sur Internet (marche aussi pour
+  Apple Music et tes fichiers). Puis la base de paroles Glass partagee
+  (https://github.com/lanaryy-hash/glass-lyrics : les paroles ecrites par
+  l'IA y sont envoyees depuis ce PC grace a l'outil "gh", et servent a tout
+  le monde). Si un titre n'en a toujours pas, l'IA (whisper.cpp)
   les ecrit sur ton PC quand tu ouvres les paroles (~10 s ; 1re fois
   ~200 Mo telecharges dans build\Release\whisper). Echoue si la voix est
   noyee (versions tres accelerees). Desactivable dans Reglages > Affichage.

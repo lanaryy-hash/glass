@@ -40,7 +40,7 @@ struct List { std::string uri, name, image; std::vector<Track> tracks; bool requ
 struct LyricLine { int t; std::string w; };
 
 struct Settings {
-    int bg = 0, prefetch = 1, lyricsSize = 30, source = 0, density = 1;  // source : 0 auto, 1 Spotify uniquement, 2 YouTube uniquement
+    int bg = 0, prefetch = 2, lyricsSize = 30, source = 0, density = 1;  // source : 0 auto, 1 Spotify uniquement, 2 YouTube uniquement
     // bg : 0 pochette floutée, 1 fond d'écran flouté, 2 uni, 3 dégradé de la pochette (Apple Music), 4 néon, 5 aurore animée
     float neon = 0;                     // intensité des lueurs néon (0 = aucune)
     int particles = 0;                  // 0 aucune, 1 pétales de sakura, 2 neige, 3 lucioles
@@ -470,17 +470,51 @@ static void logout() {  // oublie le compte Spotify et redemande la connexion
 }
 
 // ---------- YouTube : l'audio des titres Spotify / Apple Music (mode Auto ou YouTube) ----------
-#ifdef _WIN32
-static const char* kNoYtdlp = "yt-dlp introuvable : winget install yt-dlp.yt-dlp";
-#else
 static const char* kNoYtdlp = "yt-dlp en cours d'installation, réessaie dans un instant";
+
+// yt-dlp : Glass installe sa propre copie « décompressée » (démarre ~4x plus vite que la version en un seul fichier)
+// et la renouvelle chaque semaine (YouTube change souvent). La nouvelle copie remplace l'ancienne au lancement suivant.
+#ifdef _WIN32
+static const char *kYtZip = "yt-dlp_win.zip", *kYtExe = "yt-dlp.exe";
+#else
+static const char *kYtZip = "yt-dlp_macos.zip", *kYtExe = "yt-dlp_macos";
 #endif
+
+static fs::path ytdlpPath() {
+    fs::path own = g_dir / "bin" / "yt-dlp" / kYtExe;
+    return fileExists(own) ? own : plat::findTool("yt-dlp");
+}
+
+static void updateYtdlp() {  // au démarrage
+    fs::path bin = g_dir / "bin", dir = bin / "yt-dlp", fresh = bin / "yt-dlp.new";
+    std::error_code ec;
+    if (fileExists(fresh / kYtExe)) { fs::remove_all(dir, ec); fs::rename(fresh, dir, ec); }  // rien ne l'utilise encore
+    auto age = fs::file_time_type::clock::now() - fs::last_write_time(dir / kYtExe, ec);
+    if (!ec && age < std::chrono::hours(24 * 7)) return;
+    std::thread([bin, dir, fresh] {
+        std::error_code ec;
+        fs::path zip = bin / "yt-dlp.zip";
+        fs::remove_all(fresh, ec);
+        fs::create_directories(fresh, ec);
+        if (!plat::download(std::string("https://github.com/yt-dlp/yt-dlp/releases/latest/download/") + kYtZip, zip, [](int) {})) return;
+#ifdef _WIN32
+        bool ok = plat::run({"tar.exe", "-xf", ustr(zip), "-C", ustr(fresh)}, 180000);
+#else
+        bool ok = plat::run({"/usr/bin/ditto", "-x", "-k", ustr(zip), ustr(fresh)}, 180000);
+#endif
+        fs::remove(zip, ec);
+        if (!ok || !fileExists(fresh / kYtExe)) { fs::remove_all(fresh, ec); return; }
+        fs::last_write_time(fresh / kYtExe, fs::file_time_type::clock::now(), ec);  // date de l'installation, pas de la compilation
+        if (!fileExists(dir / kYtExe)) { fs::remove_all(dir, ec); fs::rename(fresh, dir, ec); }  // 1re installation : tout de suite
+        wake();
+    }).detach();
+}
 
 static fs::path cachePath(const Track& t) { return g_dir / "cache" / upath(t.uri.substr(t.uri.rfind(':') + 1) + ".m4a"); }
 
 // Télécharge l'audio d'un titre dans cache ; renvoie le chemin ou "" si introuvable.
 static fs::path ytDownload(const Track& t) {
-    fs::path path = cachePath(t), base = path, ytdlp = plat::findTool("yt-dlp");
+    fs::path path = cachePath(t), base = path, ytdlp = ytdlpPath();
     base.replace_extension();
     for (;;) {  // un seul yt-dlp par titre à la fois (lecture + préchargement)
         { std::lock_guard lk(g_mx); if (!g_inflight.count(t.uri)) { g_inflight.insert(t.uri); break; } }
@@ -540,36 +574,141 @@ static bool httpDownload(const std::string& url, const fs::path& path, const std
     return plat::download(url, path, [&](int pct) { { std::lock_guard lk(g_mx); g_status = what + " : " + std::to_string(pct) + " %"; } wake(); });
 }
 
-// Lit un .lrc, retire les inventions typiques de Whisper (sous-titres, « musique »...) et recale les temps.
-static std::vector<LyricLine> cleanLrc(const fs::path& path, double scale) {
+// Lit des paroles .lrc ; junk : retire les inventions typiques de Whisper (sous-titres, « musique »...). Recale les temps (scale).
+static std::vector<LyricLine> parseLrc(const std::string& text, double scale, bool junkFilter = true) {
     std::vector<LyricLine> out;
-    std::ifstream f(path);
+    std::istringstream f(text);
     static const char* junk[] = {"subtitle", "sous-titr", "amara", "thanks for watching", "merci d'avoir", "music", "musique", "musik",
                                  "субтитр", "редактор", "корректор", "продолжение следует", "музык", "by:whisper", "♪"};
     for (std::string l; std::getline(f, l);) {
+        if (!l.empty() && l.back() == '\r') l.pop_back();
         if (l.size() < 10 || l[0] != '[' || !isdigit((unsigned char)l[1])) continue;
         int mm = atoi(l.c_str() + 1); double ss = atof(l.c_str() + 4);
         std::string w = l.substr(l.find(']') + 1);
         w.erase(0, w.find_first_not_of(' '));
         std::string low = w;
         std::transform(low.begin(), low.end(), low.begin(), [](unsigned char c) { return (char)tolower(c); });
-        if (w.empty() || w[0] == '[' || w[0] == '(' || std::any_of(std::begin(junk), std::end(junk), [&](const char* j) { return low.find(j) != std::string::npos; })) continue;
-        if (out.size() >= 2 && out.back().w == w && out[out.size() - 2].w == w) continue;  // boucle d'hallucination
+        if (junkFilter && (w.empty() || w[0] == '[' || w[0] == '(' || std::any_of(std::begin(junk), std::end(junk), [&](const char* j) { return low.find(j) != std::string::npos; }))) continue;
+        if (junkFilter && out.size() >= 2 && out.back().w == w && out[out.size() - 2].w == w) continue;  // boucle d'hallucination
         out.push_back({(int)((mm * 60 + ss) * 1000 * scale), w});
     }
     return out;
 }
 
-static void loadLrcInto(const fs::path& path, double scale) {  // g_mx tenu
+static std::string readFile(const fs::path& p) { std::ifstream f(p, std::ios::binary); return {std::istreambuf_iterator<char>(f), {}}; }
+static std::vector<LyricLine> cleanLrc(const fs::path& path, double scale) { return parseLrc(readFile(path), scale); }
+
+static int lrcLength(const std::string& text) {  // balise [length: mm:ss.xx] (durée de la version transcrite), 0 si absente
+    size_t p = text.find("[length:");
+    if (p == std::string::npos) return 0;
+    int mm = atoi(text.c_str() + p + 8);
+    size_t c = text.find(':', p + 8);
+    return c == std::string::npos ? 0 : (int)((mm * 60 + atof(text.c_str() + c + 1)) * 1000);
+}
+
+static void loadLrcInto(const fs::path& path, double scale, const char* src = "générées par IA (Whisper)") {  // g_mx tenu
     g_lyr = cleanLrc(path, scale);
-    g_lyrSynced = true; g_lyrSrc = "générées par IA (Whisper, sur ton ordinateur)";
+    g_lyrSynced = true; g_lyrSrc = src;
     g_lyrState = g_lyr.size() >= 2 ? 2 : 3;
 }
 
-static void generateLyrics(const Track& t) {  // g_mx tenu
+// ---------- paroles sur Internet (LRCLIB), sans le moteur Spotify : Apple Music, fichiers, Spotify non connecté ----------
+static std::string urlEnc(const std::string& s) {
+    std::string o;
+    for (unsigned char c : s) { if (isalnum(c) || strchr("-_.~", c)) o += (char)c; else { char h[4]; snprintf(h, sizeof h, "%%%02X", c); o += h; } }
+    return o;
+}
+static std::string firstArtist(const std::string& a) {
+    std::string r = a.substr(0, std::min(a.find(','), a.find(" & ")));
+    while (!r.empty() && r.back() == ' ') r.pop_back();
+    return r;
+}
+static std::string baseTitle(const std::string& t) {  // sans « - Slowed », « (sped up) »... : les paroles de l'original servent aussi
+    std::string out;
+    int depth = 0;
+    for (char c : t.substr(0, t.find(" - "))) { if (c == '(' || c == '[') depth++; else if (c == ')' || c == ']') depth--; else if (depth <= 0) out += c; }
+    while (!out.empty() && out.back() == ' ') out.pop_back();
+    return out;
+}
+
+static void lyricsWeb(const Track& t) {
+    std::thread([t] {
+        auto get = [](const std::string& q) { return json::parse(plat::httpGet("https://lrclib.net/api/" + q), nullptr, false); };
+        std::string artist = firstArtist(t.artist), base = baseTitle(t.title);
+        json found = json::array();
+        json exact = get("get?artist_name=" + urlEnc(artist) + "&track_name=" + urlEnc(t.title) + "&duration=" + std::to_string(t.ms / 1000));
+        if (exact.is_object() && (exact["syncedLyrics"].is_string() || exact["plainLyrics"].is_string())) found.push_back(exact);
+        else for (const std::string& q : {"search?track_name=" + urlEnc(base) + "&artist_name=" + urlEnc(artist), "search?q=" + urlEnc(artist + " " + base)}) {
+            json r = get(q);
+            if (r.is_array() && !r.empty()) { found = r; break; }
+        }
+        // des paroles synchronisées d'abord ; version accélérée / ralentie : temps étirés selon la durée
+        const json* pick = nullptr;
+        for (auto& d : found) if (d.is_object() && !jstr(d, "syncedLyrics").empty()) { pick = &d; break; }
+        if (!pick) for (auto& d : found) if (d.is_object() && !jstr(d, "plainLyrics").empty()) { pick = &d; break; }
+        std::vector<LyricLine> lines;
+        bool synced = false;
+        std::string src = "LRCLIB";
+        if (pick) {
+            double dur = jnum(*pick, "duration") * 1000, scale = dur > 0 && t.ms > 0 && std::fabs(t.ms / dur - 1) > 0.04 ? t.ms / dur : 1;
+            if (scale != 1) { char b[64]; snprintf(b, sizeof b, "LRCLIB (version originale, tempo ajusté x%.2f)", scale); src = b; }
+            if (synced = !jstr(*pick, "syncedLyrics").empty(); synced) lines = parseLrc(jstr(*pick, "syncedLyrics"), scale, false);
+            else { std::istringstream ps(jstr(*pick, "plainLyrics")); for (std::string l; std::getline(ps, l);) lines.push_back({0, l}); }
+        }
+        std::lock_guard lk(g_mx);
+        if (g_lyrKey != t.uri) return;
+        g_lyr = std::move(lines); g_lyrSynced = synced; g_lyrSrc = src;
+        g_lyrState = g_lyr.empty() ? 3 : 2;
+        wake();
+    }).detach();
+}
+
+// ---------- base de paroles partagée (GitHub) : les paroles écrites par l'IA servent à tout le monde ----------
+// Lecture publique ; envoi seulement depuis un ordinateur où l'outil « gh » est connecté au compte du dépôt.
+static const char* kLyricsRepo = "lanaryy-hash/glass-lyrics";
+
+static std::string sharedKey(const Track& t) {  // même titre = même clé, qu'il vienne de Spotify, d'Apple Music ou d'un fichier
+    std::string k;
+    for (unsigned char c : firstArtist(t.artist) + "|" + t.title) if (isalnum(c) || c >= 0x80 || c == '|') k += (char)tolower(c);
+    uint64_t h = 1469598103934665603ull;
+    for (unsigned char c : k) { h ^= c; h *= 1099511628211ull; }
+    char b[24]; snprintf(b, sizeof b, "%016llx", (unsigned long long)h);
+    return b;
+}
+
+static std::string base64(const std::string& in) {
+    static const char* t = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    std::string o;
+    for (size_t i = 0; i < in.size(); i += 3) {
+        uint32_t n = (uint8_t)in[i] << 16 | (i + 1 < in.size() ? (uint8_t)in[i + 1] << 8 : 0) | (i + 2 < in.size() ? (uint8_t)in[i + 2] : 0);
+        o += t[n >> 18 & 63]; o += t[n >> 12 & 63];
+        o += i + 1 < in.size() ? t[n >> 6 & 63] : '='; o += i + 2 < in.size() ? t[n & 63] : '=';
+    }
+    return o;
+}
+
+static std::set<std::string> g_shared;  // déjà envoyées pendant cette session
+
+static void shareLyrics(const Track& t, const std::string& lrc) {  // g_mx tenu
+    fs::path gh = plat::findTool("gh");
+    if (gh.empty() || !g_shared.insert(t.uri).second) return;
+    std::thread([gh, t, lrc] {  // échoue sans rien casser si le fichier existe déjà ou si gh n'a pas les droits
+        plat::run({ustr(gh), "api", "-X", "PUT", std::string("repos/") + kLyricsRepo + "/contents/" + sharedKey(t) + ".lrc",
+                   "-f", "message=Paroles : " + t.artist + " - " + t.title, "-f", "content=" + base64(lrc)}, 30000);
+    }).detach();
+}
+
+static std::string lrcHeader(const Track& t) {
+    char len[32]; snprintf(len, sizeof len, "%02d:%05.2f", t.ms / 60000, (t.ms % 60000) / 1000.0);
+    return "[ar: " + t.artist + "]\n[ti: " + t.title + "]\n[length: " + len + "]\n[by: Glass (IA Whisper)]\n";
+}
+
+static std::set<std::string> g_noShared;  // titres absents de la base partagée (pas de nouvelle demande pendant la session)
+
+static void generateLyrics(const Track& t, bool ai) {  // g_mx tenu
     if (g_genRunning) return;
     g_genRunning = true; g_lyrState = 4;
-    std::thread([t] {
+    std::thread([t, ai] {
         fs::path wdir = g_dir / "whisper", model = wdir / "ggml-small-q5_1.bin";
         std::error_code ec;
         fs::create_directories(wdir, ec);
@@ -580,6 +719,26 @@ static void generateLyrics(const Track& t) {  // g_mx tenu
             if (g_lyrKey == t.uri) g_lyrState = 5;
             wake();
         };
+        { std::lock_guard lk(g_mx); g_status = "Recherche dans la base de paroles Glass..."; } wake();
+        std::string shared = plat::httpGet(std::string("https://raw.githubusercontent.com/") + kLyricsRepo + "/main/" + sharedKey(t) + ".lrc");
+        if (parseLrc(shared, 1).size() >= 2) {  // déjà écrites par l'IA chez quelqu'un d'autre
+            int len = lrcLength(shared);
+            double scale = len > 0 && t.ms > 0 && std::fabs((double)t.ms / len - 1) > 0.04 ? (double)t.ms / len : 1;
+            std::ofstream(lyricsFile(t, ".lrc"), std::ios::binary) << shared;
+            std::lock_guard lk(g_mx);
+            g_genRunning = false; g_status = "Paroles trouvées dans la base Glass";
+            g_shared.insert(t.uri);
+            if (g_lyrKey == t.uri) loadLrcInto(lyricsFile(t, ".lrc"), scale, "base de paroles Glass (écrites par l'IA)");
+            wake();
+            return;
+        }
+        if (!ai) {  // pas d'IA automatique : on s'arrête là (bouton « Générer » dans la vue paroles)
+            std::lock_guard lk(g_mx);
+            g_genRunning = false; g_status.clear(); g_noShared.insert(t.uri);
+            if (g_lyrKey == t.uri) g_lyrState = 3;
+            wake();
+            return;
+        }
 #ifdef _WIN32
         fs::path exe = wdir / "Release" / "whisper-cli.exe";
         if (!fileExists(exe)) {  // première fois : le programme (8 Mo) puis le modèle multilingue (190 Mo)
@@ -621,9 +780,11 @@ static void generateLyrics(const Track& t) {  // g_mx tenu
         std::lock_guard lk(g_mx);
         auto lines = cleanLrc(lrc, scale);
         if (lines.size() < 2) fs::rename(lrc, none, ec);
-        else {  // on garde la version propre et déjà recalée
-            std::ofstream f(lrc);
-            for (auto& l : lines) { char ts[16]; snprintf(ts, sizeof ts, "[%02d:%05.2f]", l.t / 60000, (l.t % 60000) / 1000.0); f << ts << " " << l.w << "\n"; }
+        else {  // on garde la version propre et déjà recalée, et on la partage
+            std::string text = lrcHeader(t);
+            for (auto& l : lines) { char ts[16]; snprintf(ts, sizeof ts, "[%02d:%05.2f]", l.t / 60000, (l.t % 60000) / 1000.0); text += std::string(ts) + " " + l.w + "\n"; }
+            std::ofstream(lrc, std::ios::binary) << text;
+            shareLyrics(t, text);
         }
         g_genRunning = false;
         g_status = lines.size() < 2 ? "Paroles : voix trop couverte par la musique, rien de fiable" : "Paroles générées";
@@ -637,8 +798,8 @@ static void wvPost(const json& j) { g_wvOut.push_back({0, j.dump()}); wake(); } 
 static void amPost(const json& j) { g_wvOut.push_back({1, j.dump()}); wake(); }  // page Apple Music
 static void webCmd(const json& j) { if (g_spApple) amPost(j); else wvPost(j); }  // lecteur officiel en cours
 
-static void audioPlay(const fs::path& path) {
-    plat::audioPlay(path);
+static void audioPlay(const std::string& src) {  // fichier (chemin UTF-8)
+    plat::audioPlay(src);
     plat::audioRate(g_set.speed);
     g_loading = false;
 }
@@ -682,7 +843,7 @@ static void ytPlay(const Track& t) {
     stopSp();
     plat::audioPause();
     g_loading = true;
-    if (plat::findTool("yt-dlp").empty()) {
+    if (ytdlpPath().empty()) {
         g_loading = false; g_failed = true;
         g_status = kNoYtdlp;
         return;
@@ -710,7 +871,7 @@ static bool g_dlRunning = false;
 static bool isCached(const Track& t) { return t.local || fileExists(cachePath(t)); }
 
 static void downloadAll(const List& l) {
-    if (plat::findTool("yt-dlp").empty()) { g_status = kNoYtdlp; return; }
+    if (ytdlpPath().empty()) { g_status = kNoYtdlp; return; }
     int n = 0;
     for (auto& t : l.tracks)
         if (!isCached(t) && std::none_of(g_dl.begin(), g_dl.end(), [&](const Track& x) { return x.uri == t.uri; })) { g_dl.push_back(t); n++; }
@@ -747,7 +908,7 @@ static void startTrack(const Track& t) {
     g_failed = g_spEnded = false; ++g_gen;
     g_status.clear();
     addRecent(t);
-    if (t.local) { stopSp(); audioPlay(upath(t.uri)); return; }
+    if (t.local) { stopSp(); audioPlay(t.uri); return; }
     bool spotify = t.uri.rfind("spotify:", 0) == 0, apple = t.uri.rfind("apple:song:", 0) == 0;
     bool ready = spotify ? g_sdkReady : apple && g_amReady && g_amAuth;
     if ((spotify || apple) && g_set.source != 2 && ready) {  // lecteur officiel : la vraie version (abonnement)
@@ -1663,10 +1824,18 @@ static std::map<std::string, int> g_lyrOff;  // décalage des paroles par titre 
 static void ensureLyrics(const Track& t) {
     if (g_lyrKey != t.uri) {
         g_lyrKey = t.uri; g_lyr.clear(); g_lyrState = 1;
-        if (fileExists(lyricsFile(t, ".lrc"))) loadLrcInto(lyricsFile(t, ".lrc"), 1);  // déjà générées
-        else send({{"cmd", "lyrics"}, {"key", t.uri}, {"uri", t.local ? "" : t.uri}, {"title", t.title}, {"artist", t.artist}, {"ms", t.ms}});
+        if (fileExists(lyricsFile(t, ".lrc"))) {  // déjà écrites (IA ou base partagée) : on les partage si ce n'est pas fait
+            loadLrcInto(lyricsFile(t, ".lrc"), 1);
+            std::string text = readFile(lyricsFile(t, ".lrc"));
+            if (text.find("[ar:") == std::string::npos) text = lrcHeader(t) + text;  // anciennes paroles sans en-tête
+            if (g_lyrState == 2) shareLyrics(t, text);
+        }
+        else if (t.uri.rfind("spotify:", 0) == 0 && g_spReady)  // Spotify d'abord, puis LRCLIB
+            send({{"cmd", "lyrics"}, {"key", t.uri}, {"uri", t.uri}, {"title", t.title}, {"artist", t.artist}, {"ms", t.ms}});
+        else lyricsWeb(t);  // Apple Music, fichiers, Spotify non connecté : directement sur LRCLIB
     }
-    if (g_lyrState == 3 && g_set.autoLyrics && !g_genRunning && !fileExists(lyricsFile(t, ".none"))) generateLyrics(t);
+    // rien sur Internet : base de paroles Glass, puis l'IA (si activée)
+    if (g_lyrState == 3 && !g_genRunning && !fileExists(lyricsFile(t, ".none")) && !g_noShared.count(t.uri)) generateLyrics(t, g_set.autoLyrics);
 }
 
 static void lyricsView() {
@@ -1692,7 +1861,7 @@ static void lyricsView() {
             if (ImGui::Button(g_lyrState == 5 ? "Réessayer la génération" : "Générer les paroles avec l'IA", {bw, 0})) {
                 std::error_code ec;
                 fs::remove(lyricsFile(*t, ".none"), ec);
-                generateLyrics(*t);
+                generateLyrics(*t, true);
             }
             centerText("Sur ton PC, ~10 s par titre. 1re fois : téléchargement de ~200 Mo.", ImGui::GetFont(), 14, col(1, 1, 1, 0.4f));
         }
@@ -2621,6 +2790,7 @@ void app::init() {
     plat::audioVolume(g_set.vol * g_set.vol);
     loadSaved();
     for (auto& l : g_lists) if (isApple(l.uri)) requestTracks(l);  // pas besoin du compte Spotify
+    updateYtdlp();
     startEngine();
 }
 
@@ -2651,7 +2821,7 @@ bool app::tick() {
     {
         std::lock_guard lk(g_mx);
         uploadTextures();
-        if (!g_ready.empty()) { audioPlay(g_ready); g_ready.clear(); g_status.clear(); }
+        if (!g_ready.empty()) { audioPlay(ustr(g_ready)); g_ready.clear(); g_status.clear(); }
         if (!g_sp && g_has && !g_loading && !g_failed && plat::audioFailed()) { g_failed = true; g_status = "Impossible de lire ce titre"; }
         if (!g_sp && g_has && !g_loading && !g_failed && plat::audioEnded()) onTrackEnd();
         if (g_spEnded) { g_spEnded = false; onTrackEnd(); }

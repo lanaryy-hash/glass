@@ -176,8 +176,8 @@ size_t plat::memMB(bool engine) {
 }
 
 // ---------- son : Media Foundation ----------
-void plat::audioPlay(const fs::path& path) {
-    BSTR src = SysAllocString(path.c_str());
+void plat::audioPlay(const std::string& path) {
+    BSTR src = SysAllocString(widen(path).c_str());
     g_mf->SetSource(src); SysFreeString(src);
     g_mf->Play();
 }
