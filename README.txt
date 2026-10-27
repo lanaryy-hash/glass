@@ -1,4 +1,4 @@
-GLASS - lecteur de musique leger : ta bibliotheque Spotify, Apple Music + tes fichiers
+GLASS - lecteur de musique leger : ta bibliotheque Spotify, Apple Music, SoundCloud + tes fichiers
 (Windows 10/11 et macOS 12 ou plus recent)
 
 LANCER
@@ -20,7 +20,7 @@ UTILISER
     file d'attente, favoris, ajouter a une playlist, copier le lien...
   - Glisse un titre sur une de tes playlists (a gauche) pour l'y ajouter,
     ou dans ta playlist pour changer l'ordre. Clic sur une colonne = trier.
-  - + (en haut a gauche) : nouvelle playlist, ou lien Spotify / Apple Music.
+  - + (en haut a gauche) : nouvelle playlist, ou lien Spotify / Apple Music / SoundCloud.
   - Clic droit sur une playlist : epingler en haut / desepingler,
     personnaliser (nom, pochette), dupliquer...
   - Barre du bas : coeur (favoris), micro (paroles), file d'attente,
@@ -45,6 +45,12 @@ APPLE MUSIC
   - Sans compte : + > colle le lien d'une playlist ou d'un album Apple Music
     (Partager > Copier le lien) ; le son vient alors de YouTube si tu n'es
     pas connecte.
+
+SOUNDCLOUD
+  + > colle un lien SoundCloud : titre, playlist, profil (ses titres) ou
+  profil/likes (ses likes, 1000 max). Ils apparaissent a gauche (SOUNDCLOUD).
+  Le son vient directement de SoundCloud (pas de compte ; les titres Go+
+  ne donnent que l'extrait de 30 s).
 
 TES MUSIQUES A TOI
   Glisse des fichiers ou dossiers dans la fenetre, ou "Mes musiques" >

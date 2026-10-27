@@ -157,8 +157,11 @@ static std::string toUri(const std::string& s) {
     std::smatch m;
     if (std::regex_search(s, m, std::regex(R"(music\.apple\.com/[a-z]{2}/(playlist|album)/[^?#\s"]+)"))) return "https://" + m[0].str();
     if (std::regex_search(s, m, std::regex(R"((playlist|album)[/:]([A-Za-z0-9]{22}))"))) return "spotify:" + m[1].str() + ":" + m[2].str();
+    if (std::regex_search(s, m, std::regex(R"((on\.)?soundcloud\.com/[^?#\s"]*[^?#\s"/])"))) return "https://" + m[0].str();  // m.soundcloud.com -> soundcloud.com
     return "";
 }
+// SoundCloud : lien public (titre, playlist, profil, likes) ; titres "soundcloud:track:<id>"
+static bool isSoundcloud(const std::string& uri) { return uri.rfind("https://soundcloud.com/", 0) == 0 || uri.rfind("https://on.soundcloud.com/", 0) == 0; }
 // Apple Music : lien public (https://music.apple.com/...) ou playlist de ton compte ("am:<id>")
 static bool isApple(const std::string& uri) { return uri.rfind("https://music.apple.com/", 0) == 0 || uri.rfind("am:", 0) == 0; }
 static bool isAlbum(const std::string& uri) { return uri.rfind("spotify:album", 0) == 0 || (isApple(uri) && uri.find("/album/") != std::string::npos); }
@@ -329,6 +332,25 @@ static std::string appleArt(const json& item) {  // modèle ".../{w}x{h}bb.{f}" 
     return u;
 }
 
+// Remplit une liste ajoutée par lien (Apple Music, SoundCloud) avec ce qu'on a lu.
+static void fillList(const std::string& url, const std::string& name, const std::string& image, std::vector<Track>& tracks, const char* error) {
+    {
+        std::lock_guard lk(g_mx);
+        if (List* l = findList(url)) {
+            l->loaded = true;
+            if (tracks.empty()) { l->name = "Introuvable"; g_status = error; }
+            else {
+                for (auto& t : tracks) { if (t.image.empty()) t.image = image; if (t.album.empty()) t.album = name; }  // albums : pochette et nom de l'album
+                if (!name.empty()) l->name = name;
+                if (l->image.empty()) l->image = image;
+                l->tracks = std::move(tracks);
+            }
+            applyOverride(*l);
+        }
+    }
+    wake();
+}
+
 static void loadApple(const std::string& url) {
     std::thread([url] {
         std::string html = plat::httpGet(url), name, image;
@@ -352,21 +374,85 @@ static void loadApple(const std::string& url) {
                 if (!id.empty() && !t.title.empty()) tracks.push_back(t);
             }
         }
-        {
-            std::lock_guard lk(g_mx);
-            if (List* l = findList(url)) {
-                l->loaded = true;
-                if (tracks.empty()) { l->name = "Introuvable"; g_status = "Apple Music : impossible de lire cette page"; }
-                else {
-                    for (auto& t : tracks) { if (t.image.empty()) t.image = image; if (t.album.empty()) t.album = name; }  // albums : pochette et nom de l'album
-                    if (!name.empty()) l->name = name;
-                    if (l->image.empty()) l->image = image;
-                    l->tracks = std::move(tracks);
-                }
-                applyOverride(*l);
+        fillList(url, name, image, tracks, "Apple Music : impossible de lire cette page");
+    }).detach();
+}
+
+// ---------- SoundCloud : liens publics lus via l'API du site web (comme yt-dlp) ----------
+static std::string scClientId() {  // clé publique du site SoundCloud, écrite dans un de ses scripts
+    static std::mutex mx;
+    static std::string id;
+    std::lock_guard lk(mx);
+    if (!id.empty()) return id;
+    std::string html = plat::httpGet("https://soundcloud.com/");
+    std::vector<std::string> scripts;
+    const std::string tag = "src=\"https://a-v2.sndcdn.com/assets/";
+    for (size_t p = html.find(tag); p != std::string::npos; p = html.find(tag, p + 1)) scripts.push_back(html.substr(p + 5, html.find('"', p + 5) - p - 5));
+    for (auto s = scripts.rbegin(); s != scripts.rend() && id.empty(); ++s) {  // elle est dans les derniers
+        std::string js = plat::httpGet(*s);
+        if (size_t p = js.find("client_id:\""); p != std::string::npos && p + 43 <= js.size()) id = js.substr(p + 11, 32);
+    }
+    return id;
+}
+
+static std::string scArt(const json& j) {  // pochette (sinon photo du compte) en 300 px
+    std::string u = jstr(j, "artwork_url");
+    if (u.empty()) u = jstr(jget(j, "user"), "avatar_url");
+    if (u.empty()) u = jstr(j, "avatar_url");
+    if (size_t p = u.find("-large."); p != std::string::npos) u.replace(p, 6, "-t300x300");
+    return u;
+}
+
+static Track scTrack(const json& t, const std::string& album) {
+    std::string title = jstr(t, "title"), artist = jstr(jget(t, "publisher_metadata"), "artist");
+    if (size_t d = title.find(" - "); artist.empty() && d != std::string::npos) { artist = title.substr(0, d); title = title.substr(d + 3); }  // « Artiste - Titre »
+    if (artist.empty()) artist = jstr(jget(t, "user"), "username");
+    return Track{"soundcloud:track:" + std::to_string((long long)jnum(t, "id")), title, artist, album, scArt(t), (int)jnum(t, "duration")};
+}
+
+static std::string urlEnc(const std::string& s);
+static void loadSoundcloud(const std::string& url) {
+    std::thread([url] {
+        std::string cid = scClientId(), page = url, name, image;
+        std::vector<Track> tracks;
+        auto api = [&](std::string path) {
+            if (path.rfind("https://", 0) != 0) path = "https://api-v2.soundcloud.com/" + path;
+            return json::parse(plat::httpGet(path + (path.find('?') == std::string::npos ? "?" : "&") + "client_id=" + cid), nullptr, false);
+        };
+        if (page.rfind("https://on.soundcloud.com/", 0) == 0) {  // lien court de l'appli : la page d'arrivée donne le vrai lien
+            std::string html = plat::httpGet(page);
+            if (size_t p = html.find("rel=\"canonical\" href=\""); p != std::string::npos) { p += 22; page = html.substr(p, html.find('"', p) - p); }
+        }
+        bool likes = page.size() > 6 && page.compare(page.size() - 6, 6, "/likes") == 0;
+        json r = cid.empty() ? json() : api("resolve?url=" + urlEnc(likes ? page.substr(0, page.size() - 6) : page));
+        std::string kind = jstr(r, "kind"), id = std::to_string((long long)jnum(r, "id"));
+        image = scArt(r);
+        if (kind == "track") { name = jstr(r, "title"); tracks.push_back(scTrack(r, "")); }
+        else if (kind == "playlist") {  // seuls les premiers titres sont complets : le reste par paquets de 50
+            name = jstr(r, "title");
+            std::vector<long long> ids, missing;
+            std::map<long long, json> full;
+            for (auto& t : jget(r, "tracks")) {
+                long long tid = (long long)jnum(t, "id");
+                ids.push_back(tid);
+                if (t.contains("title")) full[tid] = t; else missing.push_back(tid);
+            }
+            for (size_t i = 0; i < missing.size(); i += 50) {
+                std::string q;
+                for (size_t k = i; k < std::min(missing.size(), i + 50); k++) q += (q.empty() ? "" : ",") + std::to_string(missing[k]);
+                for (auto& t : api("tracks?ids=" + q)) if (t.is_object()) full[(long long)jnum(t, "id")] = t;
+            }
+            for (long long tid : ids) if (full.count(tid)) tracks.push_back(scTrack(full[tid], name));
+        } else if (kind == "user") {  // profil : ses titres, ou ses likes ; pages de 200, 1000 titres max
+            name = jstr(r, "username") + (likes ? " - Likes" : "");
+            for (std::string path = "users/" + id + (likes ? "/likes" : "/tracks") + "?limit=200"; !path.empty() && tracks.size() < 1000;) {
+                json c = api(path);
+                for (auto& it : jget(c, "collection")) if (const json& t = likes ? jget(it, "track") : it; t.is_object()) tracks.push_back(scTrack(t, name));
+                path = jstr(c, "next_href");
             }
         }
-        wake();
+        if (image.empty() && !tracks.empty()) image = tracks[0].image;
+        fillList(url, name, image, tracks, "SoundCloud : impossible de lire ce lien (privé ?)");
     }).detach();
 }
 
@@ -408,7 +494,6 @@ static void openCard(const Card& c) {  // g_mx tenu : page d'artiste ou album
 }
 
 static void send(const json& j);
-static std::string urlEnc(const std::string& s);
 
 static void searchCatalog(const std::string& q) {  // g_mx tenu
     g_artists.clear();
@@ -470,6 +555,7 @@ static void requestTracks(List& l) {
     if (l.uri.rfind("artist:", 0) == 0 || l.uri.rfind("itunes:album:", 0) == 0) { l.requested = true; loadCatalogList(l); return; }
     if (l.uri.rfind("am:", 0) == 0) { if (g_amAuth) { l.requested = true; amPost({{"cmd", "list"}, {"id", l.uri.substr(3)}}); } return; }
     if (isApple(l.uri)) { l.requested = true; loadApple(l.uri); return; }
+    if (isSoundcloud(l.uri)) { l.requested = true; loadSoundcloud(l.uri); return; }
     if (!g_spReady) return;
     l.requested = true;
     send({{"cmd", "tracks"}, {"uri", l.uri}});
@@ -649,7 +735,7 @@ static fs::path ytDownload(const Track& t) {
     // YouTube classique filtre certains mots (aucun résultat) : YouTube Music passe en premier.
     struct Try { std::string target; bool filtered; };
     std::string full = t.artist + " " + t.title;
-    std::vector<Try> tries = {{ytm(full), true}, {"ytsearch5:" + t.artist + " - " + t.title + " audio", true},
+    std::vector<Try> tries = t.uri.rfind("soundcloud:track:", 0) == 0 ? std::vector<Try>{{"https://api.soundcloud.com/tracks/" + t.uri.substr(17), false}} : std::vector<Try>{{ytm(full), true}, {"ytsearch5:" + t.artist + " - " + t.title + " audio", true},
                               {"ytsearch5:" + artist1 + " " + bare, true}, {ytm(full), false}, {"ytsearch1:" + t.artist + " - " + t.title, false}};
     for (auto& [target, filtered] : tries) {
         if (ytdlp.empty() || fileExists(path)) break;
@@ -661,7 +747,7 @@ static fs::path ytDownload(const Track& t) {
 #else
         std::vector<std::string> args = {ustr(ytdlp), "-f", "bestaudio[ext=m4a]"};  // sans ffmpeg : directement en m4a, lu par AVFoundation
 #endif
-        args.insert(args.end(), {"-q", "--no-warnings", "-o", ustr(base) + ".%(ext)s"});
+        args.insert(args.end(), {"-q", "--no-warnings", "-N", "8", "-o", ustr(base) + ".%(ext)s"});  // -N : morceaux en parallèle (SoundCloud : 28 s -> 2 s)
         if (filtered) args.insert(args.end(), {"--playlist-items", "1:5", "--match-filter", filter, "--max-downloads", "1"});
         else args.insert(args.end(), {"--playlist-items", "1"});
         args.push_back(q);
@@ -2086,16 +2172,16 @@ static void sidebar() {
     ImGui::SetItemTooltip("Réglages");
     ImGui::SameLine(0, 2 * S);
     if (iconBtn("add", I_ADD, 30 * S)) ImGui::OpenPopup("add");
-    ImGui::SetItemTooltip("Nouvelle playlist / ajouter un lien Spotify ou Apple Music");
+    ImGui::SetItemTooltip("Nouvelle playlist / ajouter un lien Spotify, Apple Music ou SoundCloud");
     if (ImGui::BeginPopup("add")) {
         if (ImGui::MenuItem("Nouvelle playlist...")) { g_pendingAdd.clear(); g_openNew = true; }
         ImGui::Separator();
-        ImGui::TextUnformatted("Lien d'une playlist ou d'un album Spotify ou Apple Music");
+        ImGui::TextUnformatted("Lien Spotify, Apple Music ou SoundCloud (playlist, album, titre, profil, likes)");
         ImGui::SetNextItemWidth(360 * S);
-        bool ok = ImGui::InputTextWithHint("##url", "https://open.spotify.com/... ou https://music.apple.com/...", url, sizeof url, ImGuiInputTextFlags_EnterReturnsTrue);
+        bool ok = ImGui::InputTextWithHint("##url", "https://open.spotify.com/..., music.apple.com/... ou soundcloud.com/...", url, sizeof url, ImGuiInputTextFlags_EnterReturnsTrue);
         if (ok || ImGui::Button("Ajouter")) {
             std::string u = toUri(url);
-            if (u.empty()) g_status = "Lien Spotify ou Apple Music invalide";
+            if (u.empty()) g_status = "Lien Spotify, Apple Music ou SoundCloud invalide";
             else if (!findList(u)) { List l{u, "Chargement..."}; l.custom = true; g_lists.push_back(l); saveLinks(); g_view = u; }
             else g_view = u;
             url[0] = 0; g_lyricsOpen = false; ImGui::CloseCurrentPopup();
@@ -2122,14 +2208,17 @@ static void sidebar() {
     if (std::any_of(g_lists.begin(), g_lists.end(), pinned)) header("ÉPINGLÉES");
     for (auto& u : pins) for (int i = 0; i < (int)g_lists.size(); i++) if (g_lists[i].uri == u) { sidebarItem(g_lists[i], i); break; }
     auto mine = [&](const List& l) { return (l.uri == "local" || l.own) && !pinned(l); };
-    auto spot = [&](const List& l) { return l.uri != "local" && !l.own && !l.hidden && !isApple(l.uri) && !pinned(l); };
+    auto spot = [&](const List& l) { return l.uri != "local" && !l.own && !l.hidden && !isApple(l.uri) && !isSoundcloud(l.uri) && !pinned(l); };
     auto apple = [&](const List& l) { return isApple(l.uri) && !l.hidden && !pinned(l); };
+    auto sc = [&](const List& l) { return isSoundcloud(l.uri) && !pinned(l); };
     if (std::any_of(g_lists.begin(), g_lists.end(), mine)) header("TES PLAYLISTS");
     for (int i = 0; i < (int)g_lists.size(); i++) if (mine(g_lists[i])) sidebarItem(g_lists[i], i);
     if (std::any_of(g_lists.begin(), g_lists.end(), spot)) header("SPOTIFY");
     for (int i = 0; i < (int)g_lists.size(); i++) if (spot(g_lists[i])) sidebarItem(g_lists[i], i);
     if (std::any_of(g_lists.begin(), g_lists.end(), apple)) header("APPLE MUSIC");
     for (int i = 0; i < (int)g_lists.size(); i++) if (apple(g_lists[i])) sidebarItem(g_lists[i], i);
+    if (std::any_of(g_lists.begin(), g_lists.end(), sc)) header("SOUNDCLOUD");
+    for (int i = 0; i < (int)g_lists.size(); i++) if (sc(g_lists[i])) sidebarItem(g_lists[i], i);
     ImGui::EndChild();
 }
 
@@ -3266,7 +3355,7 @@ void app::init() {
     g_accLive = {g_set.accent[0], g_set.accent[1], g_set.accent[2], 1};
     plat::audioVolume(g_set.vol * g_set.vol);
     loadSaved();
-    for (auto& l : g_lists) if (isApple(l.uri)) requestTracks(l);  // pas besoin du compte Spotify
+    for (auto& l : g_lists) if (isApple(l.uri) || isSoundcloud(l.uri)) requestTracks(l);  // pas besoin du compte Spotify
     updateYtdlp();
     startEngine();
 }
