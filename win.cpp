@@ -600,6 +600,23 @@ static void showWindowAgain() {
     SetForegroundWindow(g_hwnd);
 }
 
+static HWND findGlassOf(const wchar_t* exe) {  // fenêtre (même cachée près de l'horloge) du Glass lancé depuis ce fichier
+    struct Q { const wchar_t* exe; HWND found; } q{exe, nullptr};
+    EnumWindows([](HWND h, LPARAM p) -> BOOL {
+        auto& q = *(Q*)p;
+        wchar_t cls[16], path[MAX_PATH];
+        DWORD pid, n = MAX_PATH;
+        if (!GetClassNameW(h, cls, 16) || wcscmp(cls, L"Glass")) return TRUE;
+        GetWindowThreadProcessId(h, &pid);
+        HANDLE pr = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+        bool same = pr && QueryFullProcessImageNameW(pr, 0, path, &n) && !_wcsicmp(path, q.exe);
+        if (pr) CloseHandle(pr);
+        if (same) q.found = h;
+        return !same;
+    }, (LPARAM)&q);
+    return q.found;
+}
+
 // ---------- fenêtre sans bordure + DirectX 11 ----------
 static ID3D11DeviceContext* g_ctx;
 static IDXGISwapChain* g_swap;
@@ -618,6 +635,7 @@ static LRESULT WINAPI wndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     switch (msg) {
     case WM_APP: g_wakePending = false; return 0;
     case WM_APP + 2: g_quitting = true; DestroyWindow(hwnd); return 0;  // après une mise à jour
+    case WM_APP + 3: showWindowAgain(); return 0;                         // Glass relancé alors qu'il tournait déjà
     case WM_APP + 1:  // clic sur l'icône près de l'horloge
         if (LOWORD(lp) == WM_LBUTTONUP) showWindowAgain();
         else if (LOWORD(lp) == WM_RBUTTONUP) {
@@ -728,6 +746,22 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
 
     wchar_t exe[MAX_PATH]; GetModuleFileNameW(nullptr, exe, MAX_PATH);
     g_dir = g_bin = fs::path(exe).parent_path();
+    {  // un seul Glass par dossier : relancer Glass remontre celui qui tourne (par ex. caché près de l'horloge)
+        std::wstring key = exe;
+        CharLowerW(key.data());
+        HANDLE one = CreateMutexW(nullptr, FALSE, (L"Local\\Glass-" + std::to_wstring(std::hash<std::wstring>{}(key))).c_str());
+        if (GetLastError() == ERROR_ALREADY_EXISTS) {
+            if (wcsstr(GetCommandLineW(), L"--after-update")) WaitForSingleObject(one, 15000);  // l'ancienne version se ferme
+            else {
+                if (HWND other = findGlassOf(exe)) {
+                    DWORD pid; GetWindowThreadProcessId(other, &pid);
+                    AllowSetForegroundWindow(pid);  // c'est toi qui as lancé Glass : il a le droit de passer devant
+                    PostMessageW(other, WM_APP + 3, 0, 0);
+                }
+                return 0;
+            }
+        }
+    }
     if (wcsstr(GetCommandLineW(), L"--after-update")) Sleep(1500);  // laisse l'ancienne version se fermer
     for (const char* f : {"Glass.exe.old", "glass-engine.exe.old", "Glass.pdb.old"}) { std::error_code ec; fs::remove(g_bin / f, ec); }
     refreshPath();
