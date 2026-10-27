@@ -1242,6 +1242,22 @@ static void play(const std::string& uri, int tr, const std::vector<int>* view = 
     } else playPos((int)(it - g_order.begin()));
 }
 
+// Aléatoire pendant la lecture : mélange la suite (le titre en cours reste en tête) ou remet l'ordre de la liste.
+static void toggleShuffle() {
+    g_shuffle = !g_shuffle;
+    if (g_order.empty()) return;
+    g_pos = std::min(g_pos, (int)g_order.size() - 1);
+    int cur = g_order[g_pos];
+    if (g_shuffle) {
+        std::iter_swap(g_order.begin(), g_order.begin() + g_pos);
+        std::shuffle(g_order.begin() + 1, g_order.end(), std::mt19937{std::random_device{}()});
+        g_pos = 0;
+    } else {
+        std::sort(g_order.begin(), g_order.end());  // shortcut: oublie un tri de colonne choisi avant, rejoue la liste pour le retrouver
+        g_pos = (int)(std::find(g_order.begin(), g_order.end(), cur) - g_order.begin());
+    }
+}
+
 static void step(int d) {
     if (d == 0 && g_has) { Track t = g_cur; startTrack(t); return; }
     if (d > 0 && !g_queue.empty()) { Track t = g_queue.front(); g_queue.pop_front(); g_tr = -1; startTrack(t); return; }
@@ -2793,7 +2809,7 @@ static void mainView() {
         ImGui::SetItemTooltip("%s", tip);
         return r;
     };
-    if (btn("shuf", I_SHUFFLE, g_shuffle, "Aléatoire")) g_shuffle = !g_shuffle;
+    if (btn("shuf", I_SHUFFLE, g_shuffle, "Aléatoire")) toggleShuffle();
     if (btn("edit", I_EDIT, false, "Personnaliser (nom, pochette)")) { g_editUri = l->uri; g_openPerso = true; }
     if (btn("qadd", I_QUEUE, false, "Tout ajouter à la file d'attente")) { for (auto& t : l->tracks) g_queue.push_back(t); g_status = "Ajouté à la file d'attente"; }
     if (!local && btn("dl", I_DOWNLOAD, g_dlRunning, g_dlRunning ? "Téléchargement en cours (voir en haut)" : "Télécharger pour écouter hors ligne")) downloadAll(*l);
@@ -2870,7 +2886,7 @@ static void playerBar() {
     float bs = 36 * S, ps = 44 * S, gap = 12 * S, row = bs * 4 + ps + gap * 4;
     float bx = cx + (cw - row) * 0.5f, by = o.y + 2 * S;
     ImGui::SetCursorScreenPos({bx, by + (ps - bs) / 2});
-    if (iconBtn("shuffle", I_SHUFFLE, bs, g_shuffle)) g_shuffle = !g_shuffle;
+    if (iconBtn("shuffle", I_SHUFFLE, bs, g_shuffle)) toggleShuffle();
     ImGui::SetCursorScreenPos({bx + (bs + gap), by + (ps - bs) / 2});
     if (iconBtn("prev", I_PREV, bs)) { if (posMs() > 3000) seekMs(0); else step(-1); }
     ImGui::SetCursorScreenPos({bx + (bs + gap) * 2, by});
