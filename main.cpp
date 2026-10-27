@@ -43,7 +43,8 @@ struct Settings {
     int bg = 0, prefetch = 2, lyricsSize = 30, source = 0, density = 1;  // source : 0 auto, 1 Spotify uniquement, 2 YouTube uniquement
     // bg : 0 pochette floutée, 1 fond d'écran flouté, 2 uni, 3 dégradé de la pochette (Apple Music), 4 néon, 5 aurore animée
     float neon = 0;                     // intensité des lueurs néon (0 = aucune)
-    int particles = 0;                  // 0 aucune, 1 pétales de sakura, 2 neige, 3 lucioles
+    int particles = 0;                  // 0 aucune, 1 pétales de sakura, 2 neige, 3 lucioles, 4 citrouilles
+    int halloween = 0;                  // année où le thème Halloween a été mis tout seul
     float accent[3] = {0.12f, 0.84f, 0.38f}, tint[3] = {0.05f, 0.07f, 0.12f};
     float glass = 0.07f, dim = 0.45f, tintAmt = 0.15f, rounding = 20, textScale = 1, speed = 1, vol = 0.8f;
     bool mediaKeys = true, startup = false, animations = true, showAlbum = true, tray = false, topmost = false, lyricsCenter = false, stopAtEnd = false;
@@ -56,7 +57,7 @@ struct Settings {
 };
 static Settings g_set;
 
-struct Theme { const char* name; float acc[3], tint[3]; int bg; float glass, dim, tintAmt, rounding, neon = 0; bool accentAuto = false; };
+struct Theme { const char* name; float acc[3], tint[3]; int bg; float glass, dim, tintAmt, rounding, neon = 0; bool accentAuto = false; int particles = -1; };  // particles : -1 = on garde
 static const Theme kThemes[] = {
     {"Glass", {0.12f, 0.84f, 0.38f}, {0.05f, 0.07f, 0.12f}, 0, 0.07f, 0.45f, 0.15f, 20},
     {"Minuit", {0.30f, 0.55f, 1.00f}, {0.03f, 0.05f, 0.22f}, 1, 0.06f, 0.55f, 0.45f, 20},
@@ -73,6 +74,7 @@ static const Theme kThemes[] = {
     {"Néon Tokyo", {1.00f, 0.17f, 0.84f}, {0.06f, 0.02f, 0.12f}, 4, 0.07f, 0.15f, 0.20f, 18, 1.0f},
     {"Cyber", {0.00f, 0.95f, 1.00f}, {0.02f, 0.05f, 0.10f}, 4, 0.06f, 0.15f, 0.20f, 10, 1.0f},
     {"Aurore boréale", {0.30f, 1.00f, 0.70f}, {0.02f, 0.08f, 0.10f}, 5, 0.08f, 0.20f, 0.15f, 22, 0.5f},
+    {"Halloween", {1.00f, 0.50f, 0.05f}, {0.12f, 0.03f, 0.16f}, 2, 0.08f, 0.30f, 0.30f, 20, 0.6f, false, 4},
 };
 
 std::mutex g_mx;
@@ -174,7 +176,7 @@ static void saveSettings() {
               {"glass", s.glass}, {"dim", s.dim}, {"tintAmt", s.tintAmt}, {"rounding", s.rounding}, {"textScale", s.textScale}, {"speed", s.speed}, {"vol", s.vol},
               {"mediaKeys", s.mediaKeys}, {"startup", s.startup}, {"animations", s.animations}, {"showAlbum", s.showAlbum}, {"tray", s.tray},
               {"topmost", s.topmost}, {"lyricsCenter", s.lyricsCenter}, {"stopAtEnd", s.stopAtEnd},
-              {"neon", s.neon}, {"accentAuto", s.accentAuto}, {"autoLyrics", s.autoLyrics}, {"particles", s.particles}, {"pinned", s.pinned}, {"apple", s.apple}, {"logo", s.logo}, {"alignLyrics", s.alignLyrics}, {"seenVersion", s.seenVersion}};
+              {"neon", s.neon}, {"accentAuto", s.accentAuto}, {"autoLyrics", s.autoLyrics}, {"particles", s.particles}, {"pinned", s.pinned}, {"apple", s.apple}, {"logo", s.logo}, {"alignLyrics", s.alignLyrics}, {"seenVersion", s.seenVersion}, {"halloween", s.halloween}};
     std::ofstream((g_dir / "settings.json")) << j.dump(1);
 }
 static void loadSettings() {
@@ -187,7 +189,7 @@ static void loadSettings() {
     get("glass", s.glass); get("dim", s.dim); get("tintAmt", s.tintAmt); get("rounding", s.rounding); get("textScale", s.textScale); get("speed", s.speed); get("vol", s.vol);
     get("mediaKeys", s.mediaKeys); get("startup", s.startup); get("animations", s.animations); get("showAlbum", s.showAlbum); get("tray", s.tray);
     get("topmost", s.topmost); get("lyricsCenter", s.lyricsCenter); get("stopAtEnd", s.stopAtEnd);
-    get("neon", s.neon); get("accentAuto", s.accentAuto); get("autoLyrics", s.autoLyrics); get("particles", s.particles); get("pinned", s.pinned); get("apple", s.apple); get("logo", s.logo); get("alignLyrics", s.alignLyrics); get("seenVersion", s.seenVersion);
+    get("neon", s.neon); get("accentAuto", s.accentAuto); get("autoLyrics", s.autoLyrics); get("particles", s.particles); get("pinned", s.pinned); get("apple", s.apple); get("logo", s.logo); get("alignLyrics", s.alignLyrics); get("seenVersion", s.seenVersion); get("halloween", s.halloween);
     for (int i = 0; i < 3; i++) {
         if (j.contains("accentRGB") && j["accentRGB"].size() == 3) s.accent[i] = j["accentRGB"][i].get<float>();
         if (j.contains("tint") && j["tint"].size() == 3) s.tint[i] = j["tint"][i].get<float>();
@@ -1850,13 +1852,26 @@ static void petal(ImDrawList* dl, ImVec2 c, float s, float rot, float flip, ImU3
     dl->AddConvexPolyFilled(pts, 8, col);
 }
 
+static void pumpkin(ImDrawList* dl, ImVec2 c, float r, float rot) {  // citrouille : 3 côtes, tige, visage
+    float cs = cosf(rot), sn = sinf(rot);
+    auto at = [&](float x, float y) { return ImVec2{c.x + (x * cs - y * sn) * r, c.y + (x * sn + y * cs) * r}; };
+    ImU32 side = col(0.82f, 0.36f, 0.04f, 0.92f), face = col(0.22f, 0.07f, 0.f, 0.95f);
+    dl->AddEllipseFilled(at(-0.38f, 0), {0.62f * r, 0.78f * r}, side, rot);
+    dl->AddEllipseFilled(at(0.38f, 0), {0.62f * r, 0.78f * r}, side, rot);
+    dl->AddEllipseFilled(at(0, 0), {0.58f * r, 0.84f * r}, col(1.f, 0.52f, 0.08f, 0.95f), rot);
+    dl->AddQuadFilled(at(-0.1f, -0.72f), at(0.1f, -0.72f), at(0.18f, -1.1f), at(-0.02f, -1.12f), col(0.32f, 0.56f, 0.16f, 0.95f));
+    dl->AddTriangleFilled(at(-0.44f, -0.06f), at(-0.12f, -0.06f), at(-0.28f, -0.34f), face);
+    dl->AddTriangleFilled(at(0.12f, -0.06f), at(0.44f, -0.06f), at(0.28f, -0.34f), face);
+    dl->AddQuadFilled(at(-0.46f, 0.18f), at(0.46f, 0.18f), at(0.26f, 0.5f), at(-0.26f, 0.5f), face);
+}
+
 static void drawParticles(ImDrawList* dl, ImVec2 a, ImVec2 b) {
     if (!g_set.particles) return;
     static std::vector<Particle> ps;
     static std::mt19937 rng{7};
     static double last = ImGui::GetTime();
     auto rnd = [](float lo, float hi) { return std::uniform_real_distribution<float>(lo, hi)(rng); };
-    size_t want = g_mini ? 12 : 34;
+    size_t want = (g_mini ? 12 : 34) / (g_set.particles == 4 ? 2 : 1);  // citrouilles : plus grosses, moins nombreuses
     while (ps.size() < want) ps.push_back({rnd(0, 1), rnd(-0.1f, 1), rnd(0.035f, 0.08f), rnd(0.01f, 0.05f), rnd(0, 6.28f), rnd(0, 6.28f), rnd(-1.4f, 1.4f), rnd(5, 9.5f)});
     ps.resize(want);
     double t = ImGui::GetTime();
@@ -1871,6 +1886,7 @@ static void drawParticles(ImDrawList* dl, ImVec2 a, ImVec2 b) {
         float sz = p.size * S * (g_mini ? 0.8f : 1.f);
         if (g_set.particles == 1) petal(dl, c, sz, p.rot, cosf(p.phase * 1.7f), col(1.f, 0.74f, 0.84f, 0.8f));
         else if (g_set.particles == 2) dl->AddCircleFilled(c, sz * 0.32f, col(1, 1, 1, 0.7f));
+        else if (g_set.particles == 4) { glow(dl, c, sz * 3.f, ImVec4{1.f, 0.5f, 0.05f, 1}, 0.25f); pumpkin(dl, c, sz * 1.5f, sinf(p.phase) * 0.35f); }
         else {
             float pulse = 0.5f + 0.5f * sinf(p.phase * 2.3f);
             glow(dl, c, sz * 2.4f, acc(), 0.55f * pulse);
@@ -2464,6 +2480,7 @@ static void applyTheme(const Theme& t) {
     std::copy(t.tint, t.tint + 3, g_set.tint);
     g_set.bg = t.bg; g_set.glass = t.glass; g_set.dim = t.dim; g_set.tintAmt = t.tintAmt; g_set.rounding = t.rounding;
     g_set.neon = t.neon; g_set.accentAuto = t.accentAuto;
+    g_set.particles = t.particles >= 0 ? t.particles : g_set.particles == 4 ? 0 : g_set.particles;  // les citrouilles partent avec Halloween
     applyStyle();
 }
 
@@ -2511,7 +2528,7 @@ static void settingsView() {
     changed |= ImGui::Combo("##bg", &g_set.bg, "Pochette floutée\0Fond d'écran flouté\0Uni (teinte)\0Dégradé de la pochette (Apple Music)\0Néon\0Aurore animée\0");
     if (g_set.bg == 5) { ImGui::SameLine(); ImGui::TextDisabled("(bouge seulement quand Glass est au premier plan)"); }
     label("Particules");
-    changed |= ImGui::Combo("##part", &g_set.particles, "Aucune\0Pétales de sakura\0Neige\0Lucioles\0");
+    changed |= ImGui::Combo("##part", &g_set.particles, "Aucune\0Pétales de sakura\0Neige\0Lucioles\0Citrouilles\0");
     if (g_set.particles) { ImGui::SameLine(); ImGui::TextDisabled("(~30 images/s tant que Glass est visible)"); }
     label("Lueurs néon");
     changed |= ImGui::SliderFloat("##neon", &g_set.neon, 0, 1, g_set.neon > 0 ? "%.2f" : "aucune");
@@ -3371,6 +3388,15 @@ void app::initUI() {
     plat::setMediaKeys(g_set.mediaKeys);
     setTopmost();
     if (!g_set.logo.empty()) applyLogo();
+    {  // période d'Halloween (15 oct. - 1er nov.) : le thème se met tout seul, une fois par an (on peut en changer)
+        std::time_t tt = std::time(nullptr);
+        std::tm d = *std::localtime(&tt);
+        if (((d.tm_mon == 9 && d.tm_mday >= 15) || (d.tm_mon == 10 && d.tm_mday == 1)) && g_set.halloween != d.tm_year + 1900) {
+            g_set.halloween = d.tm_year + 1900;
+            applyTheme(kThemes[std::size(kThemes) - 1]);
+            saveSettings();
+        }
+    }
     if (GLASS_VERSION > 0 && g_set.seenVersion != GLASS_VERSION) {  // nouvelle version installée : on montre ce qui a changé
         if (g_set.seenVersion > 0) showNews(GLASS_VERSION);
         g_set.seenVersion = GLASS_VERSION;
