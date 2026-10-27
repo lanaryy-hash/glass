@@ -41,9 +41,9 @@ struct LyricLine { int t; std::string w; };
 
 struct Settings {
     int bg = 0, prefetch = 2, lyricsSize = 30, source = 0, density = 1;  // source : 0 auto, 1 Spotify uniquement, 2 YouTube uniquement
-    // bg : 0 pochette floutée, 1 fond d'écran flouté, 2 uni, 3 dégradé de la pochette (Apple Music), 4 néon, 5 aurore animée
+    // bg : 0 pochette floutée, 1 fond d'écran flouté, 2 uni, 3 dégradé de la pochette (Apple Music), 4 néon, 5 aurore animée, 6 nuit d'Halloween
     float neon = 0;                     // intensité des lueurs néon (0 = aucune)
-    int particles = 0;                  // 0 aucune, 1 pétales de sakura, 2 neige, 3 lucioles, 4 citrouilles
+    int particles = 0;                  // 0 aucune, 1 pétales de sakura, 2 neige, 3 lucioles, 4 Halloween (braises, chauves-souris)
     int halloween = 0;                  // année où le thème Halloween a été mis tout seul
     float accent[3] = {0.12f, 0.84f, 0.38f}, tint[3] = {0.05f, 0.07f, 0.12f};
     float glass = 0.07f, dim = 0.45f, tintAmt = 0.15f, rounding = 20, textScale = 1, speed = 1, vol = 0.8f;
@@ -74,7 +74,7 @@ static const Theme kThemes[] = {
     {"Néon Tokyo", {1.00f, 0.17f, 0.84f}, {0.06f, 0.02f, 0.12f}, 4, 0.07f, 0.15f, 0.20f, 18, 1.0f},
     {"Cyber", {0.00f, 0.95f, 1.00f}, {0.02f, 0.05f, 0.10f}, 4, 0.06f, 0.15f, 0.20f, 10, 1.0f},
     {"Aurore boréale", {0.30f, 1.00f, 0.70f}, {0.02f, 0.08f, 0.10f}, 5, 0.08f, 0.20f, 0.15f, 22, 0.5f},
-    {"Halloween", {1.00f, 0.50f, 0.05f}, {0.12f, 0.03f, 0.16f}, 2, 0.08f, 0.30f, 0.30f, 20, 0.6f, false, 4},
+    {"Halloween", {1.00f, 0.55f, 0.12f}, {0.10f, 0.03f, 0.14f}, 6, 0.07f, 0.10f, 0.00f, 20, 0.3f, false, 4},
 };
 
 std::mutex g_mx;
@@ -1865,17 +1865,78 @@ static void petal(ImDrawList* dl, ImVec2 c, float s, float rot, float flip, ImU3
     dl->AddConvexPolyFilled(pts, 8, col);
 }
 
-static void pumpkin(ImDrawList* dl, ImVec2 c, float r, float rot) {  // citrouille : 3 côtes, tige, visage
+// Citrouille : 3 côtes, tige, visage ; lit = bougie allumée (visage lumineux et halo).
+static void pumpkin(ImDrawList* dl, ImVec2 c, float r, float rot, bool lit = false) {
     float cs = cosf(rot), sn = sinf(rot);
     auto at = [&](float x, float y) { return ImVec2{c.x + (x * cs - y * sn) * r, c.y + (x * sn + y * cs) * r}; };
-    ImU32 side = col(0.82f, 0.36f, 0.04f, 0.92f), face = col(0.22f, 0.07f, 0.f, 0.95f);
+    if (lit) glow(dl, c, r * 3.4f, ImVec4{1.f, 0.45f, 0.08f, 1}, 0.5f);
+    ImU32 side = col(0.80f, 0.33f, 0.04f), face = lit ? col(1.f, 0.84f, 0.38f) : col(0.22f, 0.07f, 0.f, 0.95f);
     dl->AddEllipseFilled(at(-0.38f, 0), {0.62f * r, 0.78f * r}, side, rot);
     dl->AddEllipseFilled(at(0.38f, 0), {0.62f * r, 0.78f * r}, side, rot);
-    dl->AddEllipseFilled(at(0, 0), {0.58f * r, 0.84f * r}, col(1.f, 0.52f, 0.08f, 0.95f), rot);
-    dl->AddQuadFilled(at(-0.1f, -0.72f), at(0.1f, -0.72f), at(0.18f, -1.1f), at(-0.02f, -1.12f), col(0.32f, 0.56f, 0.16f, 0.95f));
+    dl->AddEllipseFilled(at(0, 0), {0.58f * r, 0.84f * r}, col(0.98f, 0.5f, 0.08f), rot);
+    dl->AddQuadFilled(at(-0.1f, -0.72f), at(0.1f, -0.72f), at(0.18f, -1.1f), at(-0.02f, -1.12f), col(0.28f, 0.42f, 0.14f));
     dl->AddTriangleFilled(at(-0.44f, -0.06f), at(-0.12f, -0.06f), at(-0.28f, -0.34f), face);
     dl->AddTriangleFilled(at(0.12f, -0.06f), at(0.44f, -0.06f), at(0.28f, -0.34f), face);
     dl->AddQuadFilled(at(-0.46f, 0.18f), at(0.46f, 0.18f), at(0.26f, 0.5f), at(-0.26f, 0.5f), face);
+}
+
+static void bat(ImDrawList* dl, ImVec2 c, float s, float flap, ImU32 k) {  // chauve-souris ; flap -1..1 = battement d'ailes
+    float w = flap * 0.55f * s;
+    dl->AddEllipseFilled(c, {0.2f * s, 0.3f * s}, k);
+    for (float d : {-1.f, 1.f}) {
+        dl->AddTriangleFilled(c + ImVec2{d * 0.16f * s, -0.2f * s}, c + ImVec2{d * 0.03f * s, -0.26f * s}, c + ImVec2{d * 0.15f * s, -0.46f * s}, k);
+        ImVec2 wing[] = {c + ImVec2{d * 0.12f * s, -0.12f * s}, c + ImVec2{d * 0.62f * s, -0.28f * s + w}, c + ImVec2{d * 1.15f * s, -0.08f * s + w * 1.4f},
+                         c + ImVec2{d * 0.92f * s, 0.1f * s + w}, c + ImVec2{d * 0.68f * s, 0.02f * s + w * 0.8f}, c + ImVec2{d * 0.42f * s, 0.18f * s + w * 0.5f}, c + ImVec2{d * 0.12f * s, 0.12f * s}};
+        dl->AddConcavePolyFilled(wing, 7, k);
+    }
+}
+
+static void deadBranch(ImDrawList* dl, ImVec2 p, float len, float ang, float w, int depth, std::mt19937& rng, ImU32 k) {
+    ImVec2 q{p.x + cosf(ang) * len, p.y + sinf(ang) * len};
+    dl->AddLine(p, q, k, w);
+    if (!depth) return;
+    std::uniform_real_distribution<float> d(-0.22f, 0.22f);
+    deadBranch(dl, q, len * 0.74f, ang - 0.5f + d(rng), w * 0.66f, depth - 1, rng, k);
+    deadBranch(dl, q, len * 0.66f, ang + 0.42f + d(rng), w * 0.66f, depth - 1, rng, k);
+}
+
+// Fond « Nuit d'Halloween » : ciel étoilé, lune, collines, arbre mort, citrouilles allumées. Fixe : rien à calculer au repos.
+static void halloweenNight(ImDrawList* dl, ImVec2 a, ImVec2 b) {
+    float W = b.x - a.x, H = b.y - a.y, M = std::min(W, H);
+    dl->AddRectFilledMultiColor(a, b, col(0.035f, 0.02f, 0.08f), col(0.05f, 0.02f, 0.10f), col(0.19f, 0.06f, 0.09f), col(0.15f, 0.05f, 0.11f));
+    glow(dl, {a.x + W * 0.55f, b.y}, std::max(W, H) * 0.55f, ImVec4{1.f, 0.4f, 0.08f, 1}, 0.3f);  // lueur orange à l'horizon
+    std::mt19937 rng{31};
+    std::uniform_real_distribution<float> u(0, 1);
+    for (int i = 0; i < 90; i++) {  // étoiles
+        ImVec2 p{a.x + u(rng) * W, a.y + u(rng) * u(rng) * H * 0.75f};
+        dl->AddCircleFilled(p, (0.5f + u(rng)) * S, col(1, 0.95f, 0.9f, 0.15f + 0.55f * u(rng)), 6);
+    }
+    ImVec2 m{a.x + W * 0.78f, a.y + H * 0.2f};
+    float r = M * 0.075f;
+    glow(dl, m, r * 7, ImVec4{1.f, 0.85f, 0.6f, 1}, 0.3f);
+    glow(dl, m, r * 2.6f, ImVec4{1.f, 0.92f, 0.75f, 1}, 0.55f);
+    dl->AddCircleFilled(m, r, col(1.f, 0.95f, 0.84f), 64);
+    dl->AddCircleFilled(m + ImVec2{-0.32f * r, -0.22f * r}, 0.22f * r, col(0.9f, 0.84f, 0.72f, 0.55f), 24);
+    dl->AddCircleFilled(m + ImVec2{0.28f * r, 0.3f * r}, 0.16f * r, col(0.9f, 0.84f, 0.72f, 0.5f), 24);
+    dl->AddCircleFilled(m + ImVec2{0.36f * r, -0.36f * r}, 0.09f * r, col(0.9f, 0.84f, 0.72f, 0.45f), 16);
+    auto hill = [&](float base, float amp, float f1, float f2, ImU32 c) {
+        std::vector<ImVec2> pts;
+        for (int i = 0; i <= 48; i++) {
+            float x = i / 48.f;
+            pts.push_back({a.x + x * W, b.y - H * base - H * amp * (sinf(x * f1 + 1.3f) * 0.6f + sinf(x * f2) * 0.4f)});
+        }
+        pts.push_back(b); pts.push_back({a.x, b.y});
+        dl->AddConcavePolyFilled(pts.data(), (int)pts.size(), c);
+        return pts;
+    };
+    hill(0.27f, 0.05f, 5.f, 11.f, col(0.09f, 0.035f, 0.11f));  // au-dessus de la barre du lecteur
+    ImU32 ink = col(0.025f, 0.01f, 0.04f);
+    auto near = hill(0.18f, 0.035f, 3.f, 8.f, ink);
+    auto ground = [&](float x) { return near[(int)(x * 48)].y; };
+    deadBranch(dl, {a.x + W * 0.1f, ground(0.1f) + 4 * S}, H * 0.1f, -1.6f, 8 * S, 6, rng, ink);
+    pumpkin(dl, {a.x + W * 0.6f, ground(0.6f) - 10 * S}, 14 * S, -0.08f, true);
+    pumpkin(dl, {a.x + W * 0.66f, ground(0.66f) - 7 * S}, 9 * S, 0.12f, true);
+    pumpkin(dl, {a.x + W * 0.88f, ground(0.88f) - 13 * S}, 18 * S, 0.05f, true);
 }
 
 static void drawParticles(ImDrawList* dl, ImVec2 a, ImVec2 b) {
@@ -1884,7 +1945,7 @@ static void drawParticles(ImDrawList* dl, ImVec2 a, ImVec2 b) {
     static std::mt19937 rng{7};
     static double last = ImGui::GetTime();
     auto rnd = [](float lo, float hi) { return std::uniform_real_distribution<float>(lo, hi)(rng); };
-    size_t want = (g_mini ? 12 : 34) / (g_set.particles == 4 ? 2 : 1);  // citrouilles : plus grosses, moins nombreuses
+    size_t want = g_mini ? 12 : 34;
     while (ps.size() < want) ps.push_back({rnd(0, 1), rnd(-0.1f, 1), rnd(0.035f, 0.08f), rnd(0.01f, 0.05f), rnd(0, 6.28f), rnd(0, 6.28f), rnd(-1.4f, 1.4f), rnd(5, 9.5f)});
     ps.resize(want);
     double t = ImGui::GetTime();
@@ -1892,14 +1953,25 @@ static void drawParticles(ImDrawList* dl, ImVec2 a, ImVec2 b) {
     last = t;
     for (auto& p : ps) {
         p.phase += dt; p.rot += p.spin * dt;
-        if (g_set.particles == 3) p.y -= p.speed * 0.25f * dt; else p.y += p.speed * dt;  // les lucioles montent doucement
+        if (g_set.particles == 4 && &p - ps.data() < 3) {  // Halloween : 3 chauves-souris traversent le ciel
+            p.x += p.speed * 0.45f * dt;
+            if (p.x > 1.1f) { p.x = -0.1f; p.y = rnd(0.08f, 0.45f); }
+            ImVec2 c{a.x + p.x * W, a.y + (p.y + sinf(p.phase * 1.1f) * 0.025f) * H};
+            bat(dl, c, (10 + p.size) * S * (g_mini ? 0.6f : 1.f), sinf(p.phase * 9), col(0.01f, 0.f, 0.02f, 0.9f));
+            continue;
+        }
+        if (g_set.particles >= 3) p.y -= p.speed * 0.25f * dt; else p.y += p.speed * dt;  // lucioles et braises montent doucement
         if (p.y > 1.05f) { p.y = -0.05f; p.x = rnd(0, 1); }
         if (p.y < -0.05f) { p.y = 1.05f; p.x = rnd(0, 1); }
         ImVec2 c{a.x + (p.x + sinf(p.phase * 0.8f) * p.sway) * W, a.y + p.y * H};
         float sz = p.size * S * (g_mini ? 0.8f : 1.f);
         if (g_set.particles == 1) petal(dl, c, sz, p.rot, cosf(p.phase * 1.7f), col(1.f, 0.74f, 0.84f, 0.8f));
         else if (g_set.particles == 2) dl->AddCircleFilled(c, sz * 0.32f, col(1, 1, 1, 0.7f));
-        else if (g_set.particles == 4) { glow(dl, c, sz * 3.f, ImVec4{1.f, 0.5f, 0.05f, 1}, 0.25f); pumpkin(dl, c, sz * 1.5f, sinf(p.phase) * 0.35f); }
+        else if (g_set.particles == 4) {  // braises
+            float pulse = 0.5f + 0.5f * sinf(p.phase * 2.7f);
+            glow(dl, c, sz * 1.8f, ImVec4{1.f, 0.45f, 0.08f, 1}, 0.5f * pulse);
+            dl->AddCircleFilled(c, sz * 0.14f, col(1, 0.78f, 0.4f, 0.95f * pulse));
+        }
         else {
             float pulse = 0.5f + 0.5f * sinf(p.phase * 2.3f);
             glow(dl, c, sz * 2.4f, acc(), 0.55f * pulse);
@@ -1915,6 +1987,7 @@ static void drawBackground(ImGuiViewport* vp) {
     ImVec4 tint{g_set.tint[0], g_set.tint[1], g_set.tint[2], 1};
     int bg = g_set.bg;
     g_animBg = false;
+    if (bg == 6) { halloweenNight(dl, a, b); drawParticles(dl, a, b); return; }
     if (bg == 2) {  // fond uni : dégradé de la teinte du thème
         ImU32 top = ImGui::GetColorU32(tint), bot = ImGui::GetColorU32(scale(tint, 0.4f));
         dl->AddRectFilledMultiColor(a, b, top, top, bot, bot);
@@ -2526,6 +2599,7 @@ static void settingsView() {
             dl->AddRect(p, p + ImVec2{cw, chh}, hov ? IM_COL32_WHITE : col(1, 1, 1, 0.15f), 0, 0, hov ? 2 * S : 1 * S);
             dl->AddCircleFilled(p + ImVec2{20 * S, 22 * S}, 9 * S, ImGui::GetColorU32(ImVec4{t.acc[0], t.acc[1], t.acc[2], 1}));
             dl->AddRectFilled(p + ImVec2{36 * S, 16 * S}, p + ImVec2{cw - 14 * S, 28 * S}, col(1, 1, 1, t.glass + 0.08f), 4 * S);
+            if (t.bg == 6) pumpkin(dl, p + ImVec2{cw - 22 * S, chh - 22 * S}, 11 * S, 0.1f, true);
             dl->AddText(g_bold, 14 * S, p + ImVec2{12 * S, chh - 26 * S}, IM_COL32_WHITE, t.name);
             ImGui::PopID();
         }
@@ -2538,10 +2612,10 @@ static void settingsView() {
     label("Force de la teinte");
     changed |= ImGui::SliderFloat("##tamt", &g_set.tintAmt, 0, 0.8f, "%.2f");
     label("Fond");
-    changed |= ImGui::Combo("##bg", &g_set.bg, "Pochette floutée\0Fond d'écran flouté\0Uni (teinte)\0Dégradé de la pochette (Apple Music)\0Néon\0Aurore animée\0");
+    changed |= ImGui::Combo("##bg", &g_set.bg, "Pochette floutée\0Fond d'écran flouté\0Uni (teinte)\0Dégradé de la pochette (Apple Music)\0Néon\0Aurore animée\0Nuit d'Halloween\0");
     if (g_set.bg == 5) { ImGui::SameLine(); ImGui::TextDisabled("(bouge seulement quand Glass est au premier plan)"); }
     label("Particules");
-    changed |= ImGui::Combo("##part", &g_set.particles, "Aucune\0Pétales de sakura\0Neige\0Lucioles\0Citrouilles\0");
+    changed |= ImGui::Combo("##part", &g_set.particles, "Aucune\0Pétales de sakura\0Neige\0Lucioles\0Halloween (braises, chauves-souris)\0");
     if (g_set.particles) { ImGui::SameLine(); ImGui::TextDisabled("(~30 images/s tant que Glass est visible)"); }
     label("Lueurs néon");
     changed |= ImGui::SliderFloat("##neon", &g_set.neon, 0, 1, g_set.neon > 0 ? "%.2f" : "aucune");
@@ -3212,9 +3286,9 @@ static bool newsWindow(const char* id, const char* heading, const std::string& s
     glow(dl, p + ImVec2{sz.x * 0.15f, hh}, hh * 1.2f, ImVec4{0.55f, 0.3f, 1.f, 1}, 0.35f);
     if (g_spooky) {
         float k = (float)ImGui::GetTime();  // elles se balancent un peu
-        pumpkin(dl, p + ImVec2{sz.x - 152 * S, hh * 0.36f}, 10 * S, 0.3f + sinf(k * 1.3f) * 0.12f);
-        pumpkin(dl, p + ImVec2{sz.x - 108 * S, hh * 0.7f}, 17 * S, -0.2f + sinf(k * 1.1f + 1) * 0.1f);
-        pumpkin(dl, p + ImVec2{sz.x - 54 * S, hh * 0.6f}, 27 * S, 0.1f + sinf(k * 0.9f + 2) * 0.08f);
+        pumpkin(dl, p + ImVec2{sz.x - 152 * S, hh * 0.36f}, 10 * S, 0.3f + sinf(k * 1.3f) * 0.12f, true);
+        pumpkin(dl, p + ImVec2{sz.x - 108 * S, hh * 0.7f}, 17 * S, -0.2f + sinf(k * 1.1f + 1) * 0.1f, true);
+        pumpkin(dl, p + ImVec2{sz.x - 54 * S, hh * 0.6f}, 27 * S, 0.1f + sinf(k * 0.9f + 2) * 0.08f, true);
         g_animBg = true;
     }
     dl->PopClipRect();
@@ -3428,6 +3502,7 @@ void app::initUI() {
         std::time_t tt = std::time(nullptr);
         std::tm d = *std::localtime(&tt);
         g_spooky = (d.tm_mon == 9 && d.tm_mday >= 15) || (d.tm_mon == 10 && d.tm_mday == 1);
+        if (g_set.particles == 4 && g_set.bg == 2) applyTheme(kThemes[std::size(kThemes) - 1]);  // ancien thème Halloween -> nouveau
         if (g_spooky && g_set.halloween != d.tm_year + 1900) {
             g_set.halloween = d.tm_year + 1900;
             applyTheme(kThemes[std::size(kThemes) - 1]);

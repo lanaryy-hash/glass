@@ -72,7 +72,7 @@ PAROLES
 
 THEMES
   Reglages > Themes : Apple Music, Apple Clear, Neon Glass, Neon Tokyo, Cyber,
-  Aurore boreale, Halloween (se met tout seul du 15 oct. au 1er nov.,
+  Aurore boreale, Halloween (nuit, lune, citrouilles allumees ; se met tout seul du 15 oct. au 1er nov.,
   une fois par an)... + fonds (pochette, fond d'ecran, uni, degrade de la
   pochette, neon, aurore animee), lueurs neon, couleur d'apres la pochette.
 
