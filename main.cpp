@@ -490,6 +490,11 @@ static Track spTrack(json t) {  // copie : champs absents = null
     return Track{jstr(t, "uri"), jstr(t, "name"), artists, jstr(t["album"], "name"), spImage(t["album"]["images"]), (int)jnum(t, "duration_ms")};
 }
 
+static bool byArtist(const json& item, const std::string& artistId) {  // titre ou album dont l'artiste fait partie
+    const json& a = jget(item, "artists");
+    return a.is_array() && std::any_of(a.begin(), a.end(), [&](const json& x) { return jstr(x, "id") == artistId; });
+}
+
 static void openCard(const Card& c) {  // g_mx tenu : page d'artiste ou album
     if (!findList(c.uri)) { List l{c.uri, c.name, c.image}; l.hidden = true; g_lists.push_back(l); }
     g_view = c.uri; g_lyricsOpen = false;
@@ -524,9 +529,14 @@ static void searchCatalog(const std::string& q) {  // g_mx tenu
 
 static void loadCatalogList(List& l) {  // g_mx tenu : titres d'une page d'artiste ou d'un album iTunes
     if (l.uri.rfind("artist:sp:", 0) == 0) {
-        std::string id = l.uri.substr(10);
-        send({{"cmd", "get"}, {"id", "top:" + l.uri}, {"path", "/v1/artists/" + id + "/top-tracks?market=from_token"}});
-        send({{"cmd", "get"}, {"id", "albums:" + l.uri}, {"path", "/v1/artists/" + id + "/albums?include_groups=album,single&limit=30"}});
+        // les apps Spotify « développeur » n'ont plus droit aux titres populaires d'un artiste : on passe par la recherche
+        // (10 résultats max par page), en gardant ce qui est vraiment de lui
+        std::string q = urlEnc("artist:\"" + l.name + "\"");
+        g_albums[l.uri].clear();
+        for (int off = 0; off < 50; off += 10)
+            send({{"cmd", "get"}, {"id", "top:" + l.uri}, {"path", "/v1/search?type=track&limit=10&offset=" + std::to_string(off) + "&q=" + q}});
+        for (int off = 0; off < 30; off += 10)
+            send({{"cmd", "get"}, {"id", "albums:" + l.uri}, {"path", "/v1/search?type=album&limit=10&offset=" + std::to_string(off) + "&q=" + q}});
         return;
     }
     std::thread([uri = l.uri] {
@@ -611,15 +621,18 @@ static void onEngine(const std::string& line) try {
         if (id == "artists:" + g_searchSent && d.is_object()) {
             g_artists.clear();
             for (auto& a : d["artists"]["items"]) g_artists.push_back({"artist:sp:" + jstr(a, "id"), jstr(a, "name"), spImage(a["images"])});
-        } else if (id.rfind("top:", 0) == 0 && d.is_object()) {
+        } else if (id.rfind("top:", 0) == 0) {  // une page de la recherche « artist:nom »
             if (List* l = findList(id.substr(4))) {
-                l->tracks.clear(); l->loaded = true;
-                for (auto& t : d["tracks"]) l->tracks.push_back(spTrack(t));
+                l->loaded = true;
+                for (auto& t : d["tracks"]["items"])
+                    if (byArtist(t, l->uri.substr(10)) && std::none_of(l->tracks.begin(), l->tracks.end(), [&](const Track& y) { return y.uri == jstr(t, "uri"); }))
+                        l->tracks.push_back(spTrack(t));
             }
-        } else if (id.rfind("albums:", 0) == 0 && d.is_object()) {
+        } else if (id.rfind("albums:", 0) == 0) {
             auto& v = g_albums[id.substr(7)];
-            v.clear();
-            for (auto& a : d["items"]) v.push_back({jstr(a, "uri"), jstr(a, "name"), spImage(a["images"])});
+            for (auto& a : d["albums"]["items"])
+                if (byArtist(a, id.substr(17)) && std::none_of(v.begin(), v.end(), [&](const Card& c) { return c.uri == jstr(a, "uri"); }))
+                    v.push_back({jstr(a, "uri"), jstr(a, "name"), spImage(a["images"])});
         }
     } else if (ev == "search" && jstr(j, "q") == g_searchSent) {
         // résultats du catalogue ajoutés après ceux de ta bibliothèque
