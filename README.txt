@@ -87,6 +87,8 @@ SI CA PLANTE
 MISES A JOUR
   Chaque envoi du code sur GitHub fabrique Glass pour Windows ET pour Mac et
   publie une version (https://github.com/lanaryy-hash/glass/releases).
+  Journal des mises a jour : Reglages > Version > Journal des mises a jour,
+  puis "< Older" / "Newer >" pour voir les anciennes versions.
   Les Glass installees depuis ces versions affichent "Mise a jour disponible"
   en haut : un clic telecharge, remplace et relance Glass (sur Mac, la
   commande xattr est faite automatiquement). Une Glass compilee sur ce PC

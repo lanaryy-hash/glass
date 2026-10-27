@@ -2627,7 +2627,7 @@ static void settingsView() {
     if (g_update.version > GLASS_VERSION) {
         if (ImGui::Button(g_update.busy ? "Installation..." : "Voir et installer la mise à jour") && !g_update.busy) g_openUpdate = true;
     } else if (ImGui::Button("Rechercher une mise à jour")) { g_updT = now(); checkUpdate(true); }
-    if (GLASS_VERSION > 0) { ImGui::SameLine(); if (ImGui::Button("Nouveautés de cette version")) showNews(GLASS_VERSION); }
+    if (GLASS_VERSION > 0) { ImGui::SameLine(); if (ImGui::Button("Journal des mises à jour")) showNews(GLASS_VERSION); }
     if (!g_updMsg.empty()) { ImGui::SameLine(); ImGui::TextDisabled("%s", g_updMsg.c_str()); }
     label("Dossier de Glass");
     if (ImGui::Button("Ouvrir")) plat::openUrl(ustr(g_dir));
@@ -3178,7 +3178,7 @@ static void notesText(const std::string& notes) {
 }
 
 // Fenêtre des nouveautés / de la mise à jour : bandeau aux couleurs du thème, notes, bouton principal.
-static bool newsWindow(const char* id, const char* heading, const std::string& sub, const std::string& notes, const char* primary, const char* secondary, bool& primaryClicked) {
+static bool newsWindow(const char* id, const char* heading, const std::string& sub, const std::string& notes, const char* primary, const char* secondary, bool& primaryClicked, int nav = 0) {  // nav : version affichée, pour voir les plus anciennes
     primaryClicked = false;
     ImGui::SetNextWindowSize({560 * S, 0});
     ImGui::SetNextWindowPos(ImGui::GetMainViewport()->GetCenter(), ImGuiCond_Always, {0.5f, 0.5f});  // ouverte pendant que Glass est réduit : sinon collée en haut à gauche
@@ -3216,6 +3216,17 @@ static bool newsWindow(const char* id, const char* heading, const std::string& s
     ImGui::EndChild();
     // boutons
     ImGui::Dummy({0, 10 * S});
+    if (nav) {  // journal : versions précédentes / suivantes
+        ImGui::SetCursorPosX(24 * S);
+        ImGui::BeginDisabled(nav <= 1);
+        if (ImGui::Button("< Older", {100 * S, 38 * S})) showNews(nav - 1);
+        ImGui::EndDisabled();
+        ImGui::SameLine(0, 8 * S);
+        ImGui::BeginDisabled(nav >= std::max(GLASS_VERSION, g_update.version));
+        if (ImGui::Button("Newer >", {100 * S, 38 * S})) showNews(nav + 1);
+        ImGui::EndDisabled();
+        ImGui::SameLine();
+    }
     float bw = 170 * S, sw = secondary ? 110 * S : 0, x = sz.x - 24 * S - bw - (secondary ? sw + 10 * S : 0);
     ImGui::SetCursorPosX(x);
     if (secondary) { if (ImGui::Button(secondary, {sw, 38 * S})) ImGui::CloseCurrentPopup(); ImGui::SameLine(0, 10 * S); }
@@ -3243,7 +3254,7 @@ static void dialogs() {
     newsWindow("Mise à jour", "Update available", "Glass " + std::to_string(g_update.version) + " is ready (you have " + std::to_string(GLASS_VERSION) + "). Glass restarts by itself.",
                g_update.notes, g_update.busy ? "Installing..." : "Install & restart", "Later", go);
     if (go && !g_update.busy) installUpdate();
-    newsWindow("Nouveautés", "What's new in Glass", "Version " + std::to_string(g_newsVersion), g_newsText, "Got it", nullptr, go);
+    newsWindow("Nouveautés", "What's new in Glass", "Version " + std::to_string(g_newsVersion), g_newsText, "Got it", nullptr, go, g_newsVersion);
     ImGui::SetNextWindowSize({460 * S, 0});
     if (ImGui::BeginPopupModal("Personnaliser", nullptr, ImGuiWindowFlags_NoResize)) {
         List* l = findList(g_editUri);
