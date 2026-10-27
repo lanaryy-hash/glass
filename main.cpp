@@ -3144,6 +3144,9 @@ static void miniPlayer(ImGuiViewport* vp) {  // fenêtre compacte, toujours au p
     }
 }
 
+static bool g_spooky = false;  // période d'Halloween : fenêtres des nouveautés en orange, avec des citrouilles
+static ImVec4 newsAcc() { return g_spooky ? ImVec4{1.f, 0.5f, 0.05f, 1} : acc(); }
+
 // Notes de version (texte des versions GitHub) : 1re ligne = titre, « ## New / Improved / Fixed » = sections, « - » = puces.
 static void notesText(const std::string& notes) {
     std::istringstream in(notes);
@@ -3154,7 +3157,7 @@ static void notesText(const std::string& notes) {
         if (first) { first = false; ImGui::PushFont(g_bold, 17); ImGui::TextWrapped("%s", l.c_str()); ImGui::PopFont(); ImGui::Spacing(); continue; }
         if (l.rfind("## ", 0) == 0) {  // section : pastille colorée
             std::string name = l.substr(3);
-            ImVec4 c = name == "Fixed" ? ImVec4{1.f, 0.55f, 0.35f, 1} : name == "Improved" ? ImVec4{0.35f, 0.75f, 1.f, 1} : acc();
+            ImVec4 c = name == "Fixed" ? ImVec4{1.f, 0.55f, 0.35f, 1} : name == "Improved" ? ImVec4{0.35f, 0.75f, 1.f, 1} : newsAcc();
             ImGui::Dummy({0, 6 * S});
             ImVec2 p = ImGui::GetCursorScreenPos(), ts = g_bold->CalcTextSizeA(12 * S, FLT_MAX, 0, name.c_str());
             dl->AddRectFilled(p, p + ImVec2{ts.x + 20 * S, 22 * S}, ImGui::GetColorU32(ImVec4{c.x, c.y, c.z, 0.22f}), 11 * S);
@@ -3164,7 +3167,7 @@ static void notesText(const std::string& notes) {
         }
         bool bullet = l.rfind("- ", 0) == 0 || l.rfind("* ", 0) == 0;
         ImVec2 p = ImGui::GetCursorScreenPos();
-        if (bullet) dl->AddCircleFilled(p + ImVec2{6 * S, ImGui::GetTextLineHeight() * 0.5f + 1 * S}, 3 * S, accU());
+        if (bullet) dl->AddCircleFilled(p + ImVec2{6 * S, ImGui::GetTextLineHeight() * 0.5f + 1 * S}, 3 * S, ImGui::GetColorU32(newsAcc()));
         ImGui::Indent(18 * S);
         ImGui::PushStyleColor(ImGuiCol_Text, ImVec4{1, 1, 1, bullet ? 0.88f : 0.7f});
         ImGui::TextWrapped("%s", l.c_str() + (bullet ? 2 : 0));
@@ -3178,6 +3181,7 @@ static void notesText(const std::string& notes) {
 static bool newsWindow(const char* id, const char* heading, const std::string& sub, const std::string& notes, const char* primary, const char* secondary, bool& primaryClicked) {
     primaryClicked = false;
     ImGui::SetNextWindowSize({560 * S, 0});
+    ImGui::SetNextWindowPos(ImGui::GetMainViewport()->GetCenter(), ImGuiCond_Always, {0.5f, 0.5f});  // ouverte pendant que Glass est réduit : sinon collée en haut à gauche
     ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, {0, 0});
     ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 18 * S);
     bool open = ImGui::BeginPopupModal(id, nullptr, ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove);
@@ -3186,12 +3190,20 @@ static bool newsWindow(const char* id, const char* heading, const std::string& s
     ImDrawList* dl = ImGui::GetWindowDrawList();
     ImVec2 p = ImGui::GetWindowPos(), sz = ImGui::GetWindowSize();
     float hh = 96 * S;
-    ImVec4 a = acc();
-    // bandeau : dégradé de l'accent, halo, logo
-    dl->AddRectFilled(p, p + ImVec2{sz.x, hh}, ImGui::GetColorU32(ImVec4{a.x * 0.35f, a.y * 0.35f, a.z * 0.35f, 1}), 18 * S, ImDrawFlags_RoundCornersTop);
+    ImVec4 a = newsAcc();
+    // bandeau : dégradé de l'accent, halo, logo (Halloween : nuit violette et citrouilles)
+    ImU32 sky = g_spooky ? col(0.14f, 0.04f, 0.2f) : ImGui::GetColorU32(ImVec4{a.x * 0.35f, a.y * 0.35f, a.z * 0.35f, 1});
+    dl->AddRectFilled(p, p + ImVec2{sz.x, hh}, sky, 18 * S, ImDrawFlags_RoundCornersTop);
     dl->PushClipRect(p, p + ImVec2{sz.x, hh}, true);
-    glow(dl, p + ImVec2{sz.x * 0.85f, hh * 0.2f}, hh * 1.6f, a, 0.55f);
+    glow(dl, p + ImVec2{sz.x * 0.85f, hh * 0.2f}, hh * 1.6f, a, g_spooky ? 0.4f : 0.55f);
     glow(dl, p + ImVec2{sz.x * 0.15f, hh}, hh * 1.2f, ImVec4{0.55f, 0.3f, 1.f, 1}, 0.35f);
+    if (g_spooky) {
+        float k = (float)ImGui::GetTime();  // elles se balancent un peu
+        pumpkin(dl, p + ImVec2{sz.x - 152 * S, hh * 0.36f}, 10 * S, 0.3f + sinf(k * 1.3f) * 0.12f);
+        pumpkin(dl, p + ImVec2{sz.x - 108 * S, hh * 0.7f}, 17 * S, -0.2f + sinf(k * 1.1f + 1) * 0.1f);
+        pumpkin(dl, p + ImVec2{sz.x - 54 * S, hh * 0.6f}, 27 * S, 0.1f + sinf(k * 0.9f + 2) * 0.08f);
+        g_animBg = true;
+    }
     dl->PopClipRect();
     if (ImTextureID logo = tex(logoSrc(), 64)) dl->AddImageRounded(logo, p + ImVec2{24 * S, hh * 0.5f - 24 * S}, p + ImVec2{72 * S, hh * 0.5f + 24 * S}, {0, 0}, {1, 1}, IM_COL32_WHITE, 12 * S);
     dl->AddText(g_bold, 24 * S, p + ImVec2{88 * S, hh * 0.5f - 26 * S}, IM_COL32_WHITE, heading);
@@ -3391,7 +3403,8 @@ void app::initUI() {
     {  // période d'Halloween (15 oct. - 1er nov.) : le thème se met tout seul, une fois par an (on peut en changer)
         std::time_t tt = std::time(nullptr);
         std::tm d = *std::localtime(&tt);
-        if (((d.tm_mon == 9 && d.tm_mday >= 15) || (d.tm_mon == 10 && d.tm_mday == 1)) && g_set.halloween != d.tm_year + 1900) {
+        g_spooky = (d.tm_mon == 9 && d.tm_mday >= 15) || (d.tm_mon == 10 && d.tm_mday == 1);
+        if (g_spooky && g_set.halloween != d.tm_year + 1900) {
             g_set.halloween = d.tm_year + 1900;
             applyTheme(kThemes[std::size(kThemes) - 1]);
             saveSettings();
