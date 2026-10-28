@@ -262,7 +262,7 @@ async fn lyrics(s: Session, http: reqwest::Client, v: Value) {
 const WEB_REDIRECT: &str = "http://127.0.0.1:5589/callback";
 const WEB_SCOPES: &[&str] = &[
     "streaming", "user-read-email", "user-read-private", "user-read-playback-state", "user-modify-playback-state",
-    "playlist-modify-public", "playlist-modify-private",  // ajouter des titres à tes playlists
+    "playlist-modify-public", "playlist-modify-private", "user-library-modify",  // tes playlists et tes titres likés
 ];
 
 struct Auth { client_id: String, refresh: String, access: String, expires: Instant }

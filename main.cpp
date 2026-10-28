@@ -55,6 +55,7 @@ struct Settings {
     bool accentAuto = false, autoLyrics = true;  // couleur prise sur la pochette ; paroles générées si introuvables
     int fade = 0;                                // fondu enchaîné entre les titres (secondes, 0 = aucun)
     bool discord = true;                         // statut « Écoute » sur Discord
+    bool radio = true;                           // à la fin d'une liste : des titres proches
     bool alignLyrics = true;                     // l'IA écoute le titre une fois pour caler les paroles trouvées sur le son
     int seenVersion = 0;                         // dernière version dont les nouveautés ont été montrées
     bool apple = false;                          // compte Apple Music connecté (page music.apple.com lancée au démarrage)
@@ -183,7 +184,7 @@ static void saveSettings() {
               {"mediaKeys", s.mediaKeys}, {"startup", s.startup}, {"animations", s.animations}, {"showAlbum", s.showAlbum}, {"tray", s.tray},
               {"topmost", s.topmost}, {"lyricsCenter", s.lyricsCenter}, {"stopAtEnd", s.stopAtEnd},
               {"neon", s.neon}, {"accentAuto", s.accentAuto}, {"autoLyrics", s.autoLyrics}, {"particles", s.particles}, {"pinned", s.pinned}, {"apple", s.apple}, {"logo", s.logo}, {"alignLyrics", s.alignLyrics}, {"seenVersion", s.seenVersion}, {"halloween", s.halloween},
-              {"fade", s.fade}, {"discord", s.discord}};
+              {"fade", s.fade}, {"discord", s.discord}, {"radio", s.radio}};
     std::ofstream((g_dir / "settings.json")) << j.dump(1);
 }
 static void loadSettings() {
@@ -196,7 +197,7 @@ static void loadSettings() {
     get("glass", s.glass); get("dim", s.dim); get("tintAmt", s.tintAmt); get("rounding", s.rounding); get("textScale", s.textScale); get("speed", s.speed); get("vol", s.vol);
     get("mediaKeys", s.mediaKeys); get("startup", s.startup); get("animations", s.animations); get("showAlbum", s.showAlbum); get("tray", s.tray);
     get("topmost", s.topmost); get("lyricsCenter", s.lyricsCenter); get("stopAtEnd", s.stopAtEnd);
-    get("neon", s.neon); get("accentAuto", s.accentAuto); get("autoLyrics", s.autoLyrics); get("particles", s.particles); get("pinned", s.pinned); get("apple", s.apple); get("logo", s.logo); get("alignLyrics", s.alignLyrics); get("seenVersion", s.seenVersion); get("halloween", s.halloween); get("fade", s.fade); get("discord", s.discord);
+    get("neon", s.neon); get("accentAuto", s.accentAuto); get("autoLyrics", s.autoLyrics); get("particles", s.particles); get("pinned", s.pinned); get("apple", s.apple); get("logo", s.logo); get("alignLyrics", s.alignLyrics); get("seenVersion", s.seenVersion); get("halloween", s.halloween); get("fade", s.fade); get("discord", s.discord); get("radio", s.radio);
     for (int i = 0; i < 3; i++) {
         if (j.contains("accentRGB") && j["accentRGB"].size() == 3) s.accent[i] = j["accentRGB"][i].get<float>();
         if (j.contains("tint") && j["tint"].size() == 3) s.tint[i] = j["tint"][i].get<float>();
@@ -264,14 +265,31 @@ static void loadSaved() {
     for (auto& l : g_lists) applyOverride(l);
 }
 
-static bool isFav(const std::string& uri) {
-    List* f = findList("glass:favoris");
-    return f && std::any_of(f->tracks.begin(), f->tracks.end(), [&](const Track& t) { return t.uri == uri; });
+static void send(const json& j);
+static std::string urlEnc(const std::string& s);
+// Modifie ton compte Spotify (Web API du lecteur officiel) ; la réponse revient dans onEngine (ev "api").
+// done : message si ça marche ; list : liste à recharger depuis Spotify si ça échoue.
+static void spWrite(const char* method, const std::string& path, const json& body, const std::string& done, const std::string& list) {
+    send({{"cmd", "api"}, {"id", {{"done", done}, {"list", list}}}, {"method", method}, {"path", path}, {"body", body}});
 }
+static bool isSpotifyTrack(const Track& t) { return t.uri.rfind("spotify:track:", 0) == 0; }
+static bool inList(const char* list, const std::string& uri) {
+    List* l = findList(list);
+    return l && std::any_of(l->tracks.begin(), l->tracks.end(), [&](const Track& t) { return t.uri == uri; });
+}
+
+static bool isFav(const std::string& uri) { return inList("glass:favoris", uri) || inList("spotify:collection", uri); }  // ou liké sur Spotify
 static void toggleFav(const Track& t) {
-    List* f = findList("glass:favoris");
-    auto it = std::find_if(f->tracks.begin(), f->tracks.end(), [&](const Track& x) { return x.uri == t.uri; });
-    if (it != f->tracks.end()) f->tracks.erase(it); else f->tracks.insert(f->tracks.begin(), t);
+    bool on = !isFav(t.uri);
+    List *f = findList("glass:favoris"), *liked = findList("spotify:collection");
+    for (List* l : {f, liked})
+        if (l) l->tracks.erase(std::remove_if(l->tracks.begin(), l->tracks.end(), [&](const Track& x) { return x.uri == t.uri; }), l->tracks.end());
+    if (on) f->tracks.insert(f->tracks.begin(), t);
+    if (isSpotifyTrack(t) && g_webOk) {  // aussi dans tes titres likés Spotify
+        spWrite(on ? "PUT" : "DELETE", "/v1/me/library?uris=" + urlEnc(t.uri), {{"uris", {t.uri}}},
+                on ? "Ajouté à tes titres likés (Spotify)" : "Retiré de tes titres likés (Spotify)", "spotify:collection");
+        if (on && liked && liked->loaded) liked->tracks.insert(liked->tracks.begin(), t);
+    }
     saveMine();
 }
 static void addRecent(const Track& t) {
@@ -282,20 +300,15 @@ static void addRecent(const Track& t) {
     if (r->tracks.size() > 100) r->tracks.resize(100);
     saveMine();
 }
-static void send(const json& j);
 // Tes playlists Glass, ou tes playlists Spotify (titres Spotify seulement, via le lecteur officiel connecté).
 static bool canAdd(const List& l, const Track& t) {
-    return (l.own && l.uri != "glass:recent") || (l.editable && g_webOk && t.uri.rfind("spotify:track:", 0) == 0);
-}
-static void spAdd(const std::string& list, const std::string& track, const char* path) {  // Spotify a renommé /tracks en /items
-    send({{"cmd", "api"}, {"id", {{"add", list}, {"track", track}, {"path", path}}}, {"method", "POST"},
-          {"path", "/v1/playlists/" + list.substr(17) + "/" + path}, {"body", {{"uris", {track}}}}});
+    return (l.own && l.uri != "glass:recent") || (l.editable && g_webOk && isSpotifyTrack(t));
 }
 static void addToList(List& l, const Track& t) {
     bool has = std::any_of(l.tracks.begin(), l.tracks.end(), [&](const Track& x) { return x.uri == t.uri; });
     if (l.editable) {  // sur ton compte Spotify : visible aussi dans l'app Spotify
         if (has) { g_status = "Déjà dans « " + l.name + " »"; return; }
-        spAdd(l.uri, t.uri, "items");
+        spWrite("POST", "/v1/playlists/" + l.uri.substr(17) + "/items", {{"uris", {t.uri}}}, "Ajouté à « " + l.name + " » (Spotify)", l.uri);
         if (l.loaded) l.tracks.push_back(t);
         g_status = "Ajout à « " + l.name + " »...";
         return;
@@ -436,7 +449,6 @@ static Track scTrack(const json& t, const std::string& album) {
     return Track{"soundcloud:track:" + std::to_string((long long)jnum(t, "id")), title, artist, album, scArt(t), (int)jnum(t, "duration")};
 }
 
-static std::string urlEnc(const std::string& s);
 static void loadSoundcloud(const std::string& url) {
     std::thread([url] {
         std::string cid = scClientId(), page = url, name, image;
@@ -668,16 +680,13 @@ static void onEngine(const std::string& line) try {
         else if (g_webOk && g_status.rfind("Accepte", 0) == 0) g_status = "Spotify officiel connecté";
     } else if (ev == "token") {
         wvPost({{"token", jstr(j, "token")}});
-    } else if (ev == "api" && j["id"].is_object()) {  // ajout à une playlist Spotify
+    } else if (ev == "api" && j["id"].is_object()) {  // modification de ton compte Spotify (spWrite)
         const json& id = j["id"];
         int st = (int)jnum(j, "status");
-        List* l = findList(jstr(id, "add"));
-        std::string name = l ? l->name : "la playlist", track = jstr(id, "track");
-        if (st >= 200 && st < 300) { g_status = "Ajouté à « " + name + " » (Spotify)"; return; }
-        if (st != 401 && jstr(id, "path") == "items") { spAdd(jstr(id, "add"), track, "tracks"); return; }  // on retente à l'ancienne adresse
-        if (l) l->tracks.erase(std::remove_if(l->tracks.begin(), l->tracks.end(), [&](const Track& x) { return x.uri == track; }), l->tracks.end());
+        if (st >= 200 && st < 300) { g_status = jstr(id, "done"); return; }
+        if (List* l = findList(jstr(id, "list"))) { l->requested = false; requestTracks(*l); }  // on reprend la vraie liste
         std::string why = jstr(j, "msg").empty() ? "erreur " + std::to_string(st) : jstr(j, "msg");
-        g_status = st == 401 || st == 403 ? "Spotify refuse l'ajout (" + why + ") : Réglages > Lecture > « Autoriser les ajouts »" : "Spotify : " + why;
+        g_status = st == 401 || st == 403 ? "Spotify refuse (" + why + ") : Réglages > Lecture > « Autoriser les modifications »" : "Spotify : " + why;
     } else if (ev == "api") {
         int st = (int)jnum(j, "status");
         if (st < 200 || st >= 300) {
@@ -1393,6 +1402,46 @@ static void toggleShuffle() {
     }
 }
 
+// ---------- radio : à la fin d'une liste, des titres proches (radio d'artiste de Deezer : publique, sans compte) ----------
+static std::set<std::string> g_radioSeen;  // titres déjà proposés pendant la session
+static bool g_radioBusy = false;
+
+static void startRadio(const Track& seed) {  // g_mx tenu
+    if (g_radioBusy) return;
+    g_radioBusy = true;
+    std::string artist = firstArtist(seed.artist);
+    g_status = "Radio : des titres proches de " + artist + "...";
+    std::thread([artist, gen = g_gen.load()] {
+        json a = json::parse(plat::httpGet("https://api.deezer.com/search/artist?limit=1&q=" + urlEnc(artist)), nullptr, false);
+        const json& found = jget(a, "data");
+        json r = found.is_array() && !found.empty() && found[0].is_object() && found[0]["id"].is_number()
+                     ? json::parse(plat::httpGet("https://api.deezer.com/artist/" + std::to_string(found[0]["id"].get<long long>()) + "/radio?limit=50"), nullptr, false)
+                     : json();
+        std::lock_guard lk(g_mx);
+        g_radioBusy = false;
+        List radio{"glass:radio", "Radio · " + artist};
+        for (auto& x : jget(r, "data")) {
+            if (!x.is_object()) continue;
+            Track t;
+            t.uri = "deezer:track:" + std::to_string(x.value("id", 0LL));
+            t.title = jstr(x, "title"); t.artist = jstr(jget(x, "artist"), "name");
+            t.album = jstr(jget(x, "album"), "title"); t.image = jstr(jget(x, "album"), "cover_medium");
+            t.ms = (int)jnum(x, "duration") * 1000;
+            std::string low = t.title;
+            std::transform(low.begin(), low.end(), low.begin(), [](unsigned char c) { return (char)tolower(c); });
+            if (t.title.empty() || low.find("karaoke") != std::string::npos) continue;  // reprises karaoké
+            if (radio.tracks.size() < 25 && g_radioSeen.insert(t.uri).second) radio.tracks.push_back(t);
+        }
+        if (gen != g_gen) return;  // tu as lancé autre chose entre-temps
+        if (radio.tracks.empty()) { g_status = "Radio : rien trouvé, la liste recommence"; playPos(0); wake(); return; }
+        radio.loaded = radio.requested = radio.hidden = true;
+        if (List* old = findList(radio.uri)) *old = std::move(radio); else g_lists.push_back(std::move(radio));
+        g_status.clear();
+        play("glass:radio", 0);
+        wake();
+    }).detach();
+}
+
 static void step(int d) {
     if (d == 0 && g_has) { Track t = g_cur; startTrack(t); return; }
     if (d > 0 && !g_queue.empty()) { Track t = g_queue.front(); g_queue.pop_front(); g_tr = -1; startTrack(t); return; }
@@ -1400,6 +1449,7 @@ static void step(int d) {
     if (!l || g_order.empty()) return;
     int n = (int)g_order.size();
     if (d > 0 && g_pos + 1 >= n && g_set.stopAtEnd) { pausePlayback(); g_status = "Fin de la liste"; return; }
+    if (d > 0 && g_pos + 1 >= n && g_set.radio && g_has && !g_cur.artist.empty()) { startRadio(g_cur); return; }
     playPos(((g_pos + d) % n + n) % n);
 }
 
@@ -2785,11 +2835,11 @@ static void settingsView() {
         else {
             ImGui::TextDisabled(g_sdkReady ? "lecteur prêt" : "démarrage du lecteur...");
             ImGui::SameLine();
-            if (ImGui::SmallButton("Autoriser les ajouts")) {  // anciennes connexions : sans le droit de modifier tes playlists
+            if (ImGui::SmallButton("Autoriser les modifications")) {  // anciennes connexions : sans le droit de modifier tes playlists et tes likes
                 send({{"cmd", "webauth"}, {"client_id", ""}});
                 g_status = "Accepte la connexion dans la page qui s'ouvre...";
             }
-            ImGui::SetItemTooltip("Reconnecte Spotify pour pouvoir ajouter des titres à tes playlists Spotify");
+            ImGui::SetItemTooltip("Reconnecte Spotify pour pouvoir modifier tes playlists et tes titres likés depuis Glass");
         }
         webSetup();
     }
@@ -2817,6 +2867,9 @@ static void settingsView() {
     label("Statut Discord");
     changed |= ImGui::Checkbox("##dc", &g_set.discord);
     ImGui::SameLine(); ImGui::TextDisabled("(« Écoute Glass » sur ton profil ; le Spotify officiel s'y affiche déjà tout seul)");
+    label("Radio à la fin de la liste");
+    changed |= ImGui::Checkbox("##radio", &g_set.radio);
+    ImGui::SameLine(); ImGui::TextDisabled("(des titres proches du dernier artiste ; sinon la liste recommence)");
     label("S'arrêter à la fin de la liste");
     changed |= ImGui::Checkbox("##sae", &g_set.stopAtEnd);
     label("Touches multimédia du clavier");
@@ -2901,6 +2954,11 @@ static void trackMenu(List& l, int i, int& removeAt) {
     if (!t.local && t.uri.rfind("spotify:track:", 0) == 0 && ImGui::MenuItem("Copier le lien Spotify"))
         ImGui::SetClipboardText(("https://open.spotify.com/track/" + t.uri.substr(14)).c_str());
     if (l.own && ImGui::MenuItem("Retirer de cette playlist")) removeAt = i;
+    if (l.editable && g_webOk && ImGui::MenuItem("Retirer de cette playlist")) {  // aussi sur ton compte Spotify
+        json item = {{"uri", t.uri}};
+        spWrite("DELETE", "/v1/playlists/" + l.uri.substr(17) + "/items", {{"items", json::array({item})}}, "Retiré de « " + l.name + " » (Spotify)", l.uri);
+        removeAt = i;
+    }
     if (l.uri == "local" && ImGui::MenuItem("Retirer de Mes musiques")) removeAt = i;
 }
 
