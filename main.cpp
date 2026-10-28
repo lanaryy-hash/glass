@@ -21,7 +21,11 @@
 #include <nlohmann/json.hpp>
 #define IMGUI_DEFINE_MATH_OPERATORS
 #include "platform.h"
-#ifndef _WIN32
+#ifdef _WIN32
+#include <process.h>
+#define getpid _getpid
+#else
+#include <unistd.h>
 #include <strings.h>
 #define _stricmp strcasecmp
 #endif
@@ -36,7 +40,7 @@ static const char* kRepo = "lanaryy-hash/glass";  // versions publiées par GitH
 // ---------- données ----------
 struct Track { std::string uri, title, artist, album, image; int ms = 0; bool local = false; };
 // custom : playlist Spotify ajoutée par lien ; own : playlist créée dans Glass (uri "glass:...")
-struct List { std::string uri, name, image; std::vector<Track> tracks; bool requested = false, loaded = false, custom = false, own = false, hidden = false; };
+struct List { std::string uri, name, image; std::vector<Track> tracks; bool requested = false, loaded = false, custom = false, own = false, hidden = false, editable = false; };  // editable : ta playlist Spotify
 struct LyricLine { int t; std::string w; };
 
 struct Settings {
@@ -49,6 +53,8 @@ struct Settings {
     float glass = 0.07f, dim = 0.45f, tintAmt = 0.15f, rounding = 20, textScale = 1, speed = 1, vol = 0.8f;
     bool mediaKeys = true, startup = false, animations = true, showAlbum = true, tray = false, topmost = false, lyricsCenter = false, stopAtEnd = false;
     bool accentAuto = false, autoLyrics = true;  // couleur prise sur la pochette ; paroles générées si introuvables
+    int fade = 0;                                // fondu enchaîné entre les titres (secondes, 0 = aucun)
+    bool discord = true;                         // statut « Écoute » sur Discord
     bool alignLyrics = true;                     // l'IA écoute le titre une fois pour caler les paroles trouvées sur le son
     int seenVersion = 0;                         // dernière version dont les nouveautés ont été montrées
     bool apple = false;                          // compte Apple Music connecté (page music.apple.com lancée au démarrage)
@@ -176,7 +182,8 @@ static void saveSettings() {
               {"glass", s.glass}, {"dim", s.dim}, {"tintAmt", s.tintAmt}, {"rounding", s.rounding}, {"textScale", s.textScale}, {"speed", s.speed}, {"vol", s.vol},
               {"mediaKeys", s.mediaKeys}, {"startup", s.startup}, {"animations", s.animations}, {"showAlbum", s.showAlbum}, {"tray", s.tray},
               {"topmost", s.topmost}, {"lyricsCenter", s.lyricsCenter}, {"stopAtEnd", s.stopAtEnd},
-              {"neon", s.neon}, {"accentAuto", s.accentAuto}, {"autoLyrics", s.autoLyrics}, {"particles", s.particles}, {"pinned", s.pinned}, {"apple", s.apple}, {"logo", s.logo}, {"alignLyrics", s.alignLyrics}, {"seenVersion", s.seenVersion}, {"halloween", s.halloween}};
+              {"neon", s.neon}, {"accentAuto", s.accentAuto}, {"autoLyrics", s.autoLyrics}, {"particles", s.particles}, {"pinned", s.pinned}, {"apple", s.apple}, {"logo", s.logo}, {"alignLyrics", s.alignLyrics}, {"seenVersion", s.seenVersion}, {"halloween", s.halloween},
+              {"fade", s.fade}, {"discord", s.discord}};
     std::ofstream((g_dir / "settings.json")) << j.dump(1);
 }
 static void loadSettings() {
@@ -189,7 +196,7 @@ static void loadSettings() {
     get("glass", s.glass); get("dim", s.dim); get("tintAmt", s.tintAmt); get("rounding", s.rounding); get("textScale", s.textScale); get("speed", s.speed); get("vol", s.vol);
     get("mediaKeys", s.mediaKeys); get("startup", s.startup); get("animations", s.animations); get("showAlbum", s.showAlbum); get("tray", s.tray);
     get("topmost", s.topmost); get("lyricsCenter", s.lyricsCenter); get("stopAtEnd", s.stopAtEnd);
-    get("neon", s.neon); get("accentAuto", s.accentAuto); get("autoLyrics", s.autoLyrics); get("particles", s.particles); get("pinned", s.pinned); get("apple", s.apple); get("logo", s.logo); get("alignLyrics", s.alignLyrics); get("seenVersion", s.seenVersion); get("halloween", s.halloween);
+    get("neon", s.neon); get("accentAuto", s.accentAuto); get("autoLyrics", s.autoLyrics); get("particles", s.particles); get("pinned", s.pinned); get("apple", s.apple); get("logo", s.logo); get("alignLyrics", s.alignLyrics); get("seenVersion", s.seenVersion); get("halloween", s.halloween); get("fade", s.fade); get("discord", s.discord);
     for (int i = 0; i < 3; i++) {
         if (j.contains("accentRGB") && j["accentRGB"].size() == 3) s.accent[i] = j["accentRGB"][i].get<float>();
         if (j.contains("tint") && j["tint"].size() == 3) s.tint[i] = j["tint"][i].get<float>();
@@ -275,8 +282,25 @@ static void addRecent(const Track& t) {
     if (r->tracks.size() > 100) r->tracks.resize(100);
     saveMine();
 }
+static void send(const json& j);
+// Tes playlists Glass, ou tes playlists Spotify (titres Spotify seulement, via le lecteur officiel connecté).
+static bool canAdd(const List& l, const Track& t) {
+    return (l.own && l.uri != "glass:recent") || (l.editable && g_webOk && t.uri.rfind("spotify:track:", 0) == 0);
+}
+static void spAdd(const std::string& list, const std::string& track, const char* path) {  // Spotify a renommé /tracks en /items
+    send({{"cmd", "api"}, {"id", {{"add", list}, {"track", track}, {"path", path}}}, {"method", "POST"},
+          {"path", "/v1/playlists/" + list.substr(17) + "/" + path}, {"body", {{"uris", {track}}}}});
+}
 static void addToList(List& l, const Track& t) {
-    if (std::none_of(l.tracks.begin(), l.tracks.end(), [&](const Track& x) { return x.uri == t.uri; })) l.tracks.push_back(t);
+    bool has = std::any_of(l.tracks.begin(), l.tracks.end(), [&](const Track& x) { return x.uri == t.uri; });
+    if (l.editable) {  // sur ton compte Spotify : visible aussi dans l'app Spotify
+        if (has) { g_status = "Déjà dans « " + l.name + " »"; return; }
+        spAdd(l.uri, t.uri, "items");
+        if (l.loaded) l.tracks.push_back(t);
+        g_status = "Ajout à « " + l.name + " »...";
+        return;
+    }
+    if (!has) l.tracks.push_back(t);
     if (l.image.empty()) l.image = t.image;
     g_status = "Ajouté à « " + l.name + " »";
     saveMine();
@@ -500,7 +524,6 @@ static void openCard(const Card& c) {  // g_mx tenu : page d'artiste ou album
     g_view = c.uri; g_lyricsOpen = false;
 }
 
-static void send(const json& j);
 
 static void searchCatalog(const std::string& q) {  // g_mx tenu
     g_artists.clear();
@@ -592,6 +615,7 @@ static void onEngine(const std::string& line) try {
         std::vector<List> next;
         for (auto& it : j["items"]) {
             List l{jstr(it, "uri"), jstr(it, "name"), jstr(it, "image")};
+            l.editable = it.value("edit", false);
             if (List* old = findList(l.uri)) { l.tracks = std::move(old->tracks); l.loaded = old->loaded; l.requested = old->requested; }
             applyOverride(l);
             next.push_back(std::move(l));
@@ -644,6 +668,16 @@ static void onEngine(const std::string& line) try {
         else if (g_webOk && g_status.rfind("Accepte", 0) == 0) g_status = "Spotify officiel connecté";
     } else if (ev == "token") {
         wvPost({{"token", jstr(j, "token")}});
+    } else if (ev == "api" && j["id"].is_object()) {  // ajout à une playlist Spotify
+        const json& id = j["id"];
+        int st = (int)jnum(j, "status");
+        List* l = findList(jstr(id, "add"));
+        std::string name = l ? l->name : "la playlist", track = jstr(id, "track");
+        if (st >= 200 && st < 300) { g_status = "Ajouté à « " + name + " » (Spotify)"; return; }
+        if (st != 401 && jstr(id, "path") == "items") { spAdd(jstr(id, "add"), track, "tracks"); return; }  // on retente à l'ancienne adresse
+        if (l) l->tracks.erase(std::remove_if(l->tracks.begin(), l->tracks.end(), [&](const Track& x) { return x.uri == track; }), l->tracks.end());
+        std::string why = jstr(j, "msg").empty() ? "erreur " + std::to_string(st) : jstr(j, "msg");
+        g_status = st == 401 || st == 403 ? "Spotify refuse l'ajout (" + why + ") : Réglages > Lecture > « Autoriser les ajouts »" : "Spotify : " + why;
     } else if (ev == "api") {
         int st = (int)jnum(j, "status");
         if (st < 200 || st >= 300) {
@@ -1395,6 +1429,65 @@ static void setVolume() {
     json v = {{"cmd", "volume"}, {"v", std::max(g_set.vol * g_set.vol, 0.0001f)}};  // le SDK Spotify ignore 0
     if (g_wvStarted) wvPost(v);
     if (g_amStarted) amPost(v);
+}
+
+// Fondu enchaîné : près de la fin d'un titre joué par Glass, le suivant démarre pendant que celui-ci s'éteint.
+static void crossfade() {  // g_mx tenu
+    double dur = plat::audioDur(), left = (dur - plat::audioPos()) / g_set.speed;
+    if (g_set.fade <= 0 || g_sp || !isPlaying() || dur < 3 * g_set.fade || left > g_set.fade) return;
+    plat::audioFade(std::max(left, 0.5));
+    onTrackEnd();
+}
+
+// ---------- statut Discord « Écoute ... » (Rich Presence) ----------
+// Pas pour le lecteur Spotify officiel : Discord affiche déjà le statut Spotify du compte.
+static const char* kDiscordApp = "1564833215842095114";  // identifiant de l'application « Glass » (portail développeurs Discord) ; vide = désactivé
+static std::string g_rpcWant = "null";  // activité voulue (JSON), envoyée par discordLoop
+static std::condition_variable g_rpcCv;
+
+static std::string cut128(std::string s) {  // Discord : 2 à 128 caractères
+    size_t n = 128;
+    if (s.size() > n) { while (n && (s[n] & 0xC0) == 0x80) n--; s.resize(n); }  // sans couper un caractère en deux
+    return s.size() < 2 ? s + "  " : s;
+}
+
+static void updateDiscord() {  // g_mx tenu
+    static long long start = 0;
+    json a;  // null = rien
+    if (g_set.discord && *kDiscordApp && isPlaying() && !(g_sp && !g_spApple)) {
+        double rate = g_sp ? 1 : g_set.speed;
+        long long s = nowId() - (long long)(posMs() / rate);
+        if (std::abs(s - start) > 1500) start = s;  // ne change qu'après un saut dans le titre
+        a = {{"type", 2}, {"details", cut128(g_cur.title)}, {"timestamps", {{"start", start}, {"end", start + (long long)(durMs() / rate)}}}};
+        if (!g_cur.artist.empty()) a["state"] = cut128(g_cur.artist);
+        if (g_cur.image.rfind("https://", 0) == 0) a["assets"] = {{"large_image", g_cur.image}, {"large_text", cut128(g_cur.album.empty() ? g_cur.title : g_cur.album)}};
+    }
+    std::string want = a.dump();
+    if (want != g_rpcWant) { g_rpcWant = want; g_rpcCv.notify_one(); }
+}
+
+static void discordLoop() {  // thread : garde la connexion à Discord et lui envoie l'activité voulue
+    auto frame = [](int op, const json& j) {  // envoie un message, lit la réponse
+        std::string s = j.dump();
+        uint32_t h[2] = {(uint32_t)op, (uint32_t)s.size()};
+        if (!plat::ipcWrite(h, 8) || !plat::ipcWrite(s.data(), s.size()) || !plat::ipcRead(h, 8) || h[1] > 1 << 20) return false;
+        std::string r(h[1], '\0');
+        return plat::ipcRead(r.data(), r.size()) && h[0] == 1;  // 2 = Discord ferme (identifiant refusé...)
+    };
+    bool open = false;
+    for (std::string sent = "null";;) {
+        std::string want;
+        {
+            std::unique_lock lk(g_mx);
+            g_rpcCv.wait(lk, [&] { return g_rpcWant != sent; });
+            want = g_rpcWant;
+        }
+        if (!open) open = plat::ipcOpen() && frame(0, {{"v", 1}, {"client_id", kDiscordApp}});
+        json act = json::parse(want);
+        if (open && frame(1, {{"cmd", "SET_ACTIVITY"}, {"args", {{"pid", getpid()}, {"activity", act}}}, {"nonce", std::to_string(nowId())}})) sent = want;
+        else { plat::ipcClose(); open = false; std::this_thread::sleep_for(std::chrono::seconds(15)); }  // Discord pas lancé : on réessaie plus tard
+        std::this_thread::sleep_for(std::chrono::seconds(1));  // Discord limite à 5 changements / 20 s
+    }
 }
 
 // ---------- lecteur Spotify officiel : Web Playback SDK dans une page web invisible (WebView2 / WKWebView) ----------
@@ -2258,7 +2351,7 @@ static void sidebarItem(List& l, int index) {
     ImVec2 p = ImGui::GetCursorScreenPos();
     float h = (g_set.density == 0 ? 46 : 56) * S, iw = ImGui::GetContentRegionAvail().x, cs = h - 12 * S;
     if (ImGui::Selectable("##it", g_view == l.uri && !g_lyricsOpen, 0, {iw, h})) { g_view = l.uri; g_lyricsOpen = false; }
-    if (l.own && l.uri != "glass:recent" && ImGui::BeginDragDropTarget()) {  // glisser un titre sur une de tes playlists
+    if (canAdd(l, g_dragTrack) && ImGui::BeginDragDropTarget()) {  // glisser un titre sur une de tes playlists
         if (ImGui::AcceptDragDropPayload("TRACK")) addToList(l, g_dragTrack);
         ImGui::EndDragDropTarget();
     }
@@ -2689,7 +2782,15 @@ static void settingsView() {
     if (g_set.source != 2) {
         ImGui::SameLine();
         if (!g_webOk) { if (ImGui::Button("Connecter Spotify")) ImGui::OpenPopup("websetup"); }
-        else ImGui::TextDisabled(g_sdkReady ? "lecteur prêt" : "démarrage du lecteur...");
+        else {
+            ImGui::TextDisabled(g_sdkReady ? "lecteur prêt" : "démarrage du lecteur...");
+            ImGui::SameLine();
+            if (ImGui::SmallButton("Autoriser les ajouts")) {  // anciennes connexions : sans le droit de modifier tes playlists
+                send({{"cmd", "webauth"}, {"client_id", ""}});
+                g_status = "Accepte la connexion dans la page qui s'ouvre...";
+            }
+            ImGui::SetItemTooltip("Reconnecte Spotify pour pouvoir ajouter des titres à tes playlists Spotify");
+        }
         webSetup();
     }
     label("");
@@ -2710,6 +2811,12 @@ static void settingsView() {
     } else ImGui::TextDisabled("Clic droit sur une playlist > Télécharger pour écouter hors ligne");
     label("Vitesse (fichiers / YouTube)");
     if (ImGui::SliderFloat("##spd", &g_set.speed, 0.5f, 2.0f, "x%.2f")) { plat::audioRate(g_set.speed); changed = true; }
+    label("Fondu entre les titres");
+    changed |= ImGui::SliderInt("##fade", &g_set.fade, 0, 12, g_set.fade ? "%d s" : "aucun");
+    ImGui::SameLine(); ImGui::TextDisabled("(fichiers, SoundCloud, YouTube ; pas le lecteur officiel)");
+    label("Statut Discord");
+    changed |= ImGui::Checkbox("##dc", &g_set.discord);
+    ImGui::SameLine(); ImGui::TextDisabled("(« Écoute Glass » sur ton profil ; le Spotify officiel s'y affiche déjà tout seul)");
     label("S'arrêter à la fin de la liste");
     changed |= ImGui::Checkbox("##sae", &g_set.stopAtEnd);
     label("Touches multimédia du clavier");
@@ -2781,7 +2888,12 @@ static void trackMenu(List& l, int i, int& removeAt) {
     if (ImGui::MenuItem("Ajouter à la file d'attente")) g_queue.push_back(t);
     if (ImGui::MenuItem(isFav(t.uri) ? "Retirer des favoris" : "Ajouter aux favoris")) toggleFav(t);
     if (ImGui::BeginMenu("Ajouter à la playlist")) {
-        for (auto& p : g_lists) if (p.own && p.uri != "glass:recent" && ImGui::MenuItem(p.name.c_str())) addToList(p, t);
+        for (auto& p : g_lists) if (p.own && canAdd(p, t) && ImGui::MenuItem(p.name.c_str())) addToList(p, t);
+        bool sp = false;
+        for (auto& p : g_lists) if (p.editable && canAdd(p, t)) {
+            if (!sp) { sp = true; ImGui::SeparatorText("Spotify"); }
+            if (ImGui::MenuItem(p.name.c_str())) addToList(p, t);
+        }
         ImGui::Separator();
         if (ImGui::MenuItem("Nouvelle playlist...")) { g_pendingAdd = {t}; g_openNew = true; }
         ImGui::EndMenu();
@@ -3515,6 +3627,7 @@ void app::init() {
     for (auto& l : g_lists) if (isApple(l.uri) || isSoundcloud(l.uri)) requestTracks(l);  // pas besoin du compte Spotify
     updateYtdlp();
     startEngine();
+    if (*kDiscordApp) std::thread(discordLoop).detach();
 }
 
 void app::initUI() {
@@ -3562,6 +3675,7 @@ bool app::tick() {
         uploadTextures();
         if (!g_ready.empty()) { audioPlay(ustr(g_ready)); g_ready.clear(); g_status.clear(); }
         if (!g_sp && g_has && !g_loading && !g_failed && plat::audioFailed()) { g_failed = true; g_status = "Impossible de lire ce titre"; }
+        crossfade();
         if (!g_sp && g_has && !g_loading && !g_failed && plat::audioEnded()) onTrackEnd();
         if (g_spEnded) { g_spEnded = false; onTrackEnd(); }
         if (g_sleepAt > 0 && now() >= g_sleepAt) { g_sleepAt = 0; pausePlayback(); g_status = "Minuterie : lecture arrêtée"; }
@@ -3572,6 +3686,7 @@ bool app::tick() {
         for (auto& [id, m] : g_wvOut) plat::webPost(id, m);
         g_wvOut.clear();
         if (g_has) plat::nowPlaying(g_cur.title, g_cur.artist, isPlaying());
+        updateDiscord();
         if (now() - g_updT > 6 * 3600) { g_updT = now(); checkUpdate(); }
         pick = g_pick; g_pick = 0;
     }

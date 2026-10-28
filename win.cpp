@@ -30,7 +30,7 @@ extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(HWND, UINT, WPARAM,
 
 static HWND g_hwnd;
 static HANDLE g_job, g_engIn, g_engProc;
-static IMFMediaEngine* g_mf;
+static IMFMediaEngine *g_mf, *g_tail;  // g_tail : le titre précédent qui s'éteint (fondu enchaîné)
 static ID3D11Device* g_dev;
 static std::atomic<bool> g_wakePending{false};
 static double g_lastInput = 0;
@@ -194,8 +194,47 @@ bool plat::audioFailed() {
 double plat::audioPos() { return g_mf->GetCurrentTime(); }
 double plat::audioDur() { double d = g_mf->GetDuration(); return d > 0 && std::isfinite(d) ? d : 0; }
 void plat::audioSeek(double s) { g_mf->SetCurrentTime(s); }
-void plat::audioVolume(float v) { g_mf->SetVolume(v); }
+static std::atomic<float> g_vol{1};
+static std::mutex g_fadeMx;
+static int g_fadeGen = 0;
+void plat::audioVolume(float v) { g_vol = v; g_mf->SetVolume(v); }
 void plat::audioRate(float r) { g_mf->SetDefaultPlaybackRate(r); g_mf->SetPlaybackRate(r); }
+void plat::audioFade(double secs) {
+    IMFMediaEngine *out, *in;
+    int gen;
+    {
+        std::lock_guard lk(g_fadeMx);
+        std::swap(g_mf, g_tail);
+        out = g_tail; in = g_mf; gen = ++g_fadeGen;
+        in->SetVolume(0);
+    }
+    std::thread([=] {
+        for (ULONGLONG t0 = GetTickCount64();;) {
+            Sleep(30);
+            double k = std::min(1.0, (GetTickCount64() - t0) / 1000.0 / secs);
+            std::lock_guard lk(g_fadeMx);
+            if (gen != g_fadeGen) return;  // un autre fondu a commencé
+            out->SetVolume(g_vol * cos(k * 1.5708));  // puissance constante : pas de creux au milieu
+            in->SetVolume(g_vol * sin(k * 1.5708));
+            if (k >= 1) { out->Pause(); return; }
+        }
+    }).detach();
+}
+
+// ---------- Discord : canal nommé local ----------
+static HANDLE g_ipc = INVALID_HANDLE_VALUE;
+bool plat::ipcOpen() {
+    for (int i = 0; i < 10 && g_ipc == INVALID_HANDLE_VALUE; i++)
+        g_ipc = CreateFileW((L"\\\\.\\pipe\\discord-ipc-" + std::to_wstring(i)).c_str(), GENERIC_READ | GENERIC_WRITE, 0, nullptr, OPEN_EXISTING, 0, nullptr);
+    return g_ipc != INVALID_HANDLE_VALUE;
+}
+bool plat::ipcWrite(const void* p, size_t n) { DWORD w; return WriteFile(g_ipc, p, (DWORD)n, &w, nullptr) && w == n; }
+bool plat::ipcRead(void* p, size_t n) {
+    for (DWORD r; n; n -= r, p = (char*)p + r)
+        if (!ReadFile(g_ipc, p, (DWORD)n, &r, nullptr) || !r) return false;
+    return true;
+}
+void plat::ipcClose() { if (g_ipc != INVALID_HANDLE_VALUE) CloseHandle(g_ipc); g_ipc = INVALID_HANDLE_VALUE; }
 
 struct Notify : IMFMediaEngineNotify {  // fin de piste / erreur : on réveille la boucle principale
     STDMETHODIMP QueryInterface(REFIID r, void** p) override {
@@ -775,7 +814,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
     CoCreateInstance(CLSID_MFMediaEngineClassFactory, nullptr, CLSCTX_ALL, IID_PPV_ARGS(&factory));
     MFCreateAttributes(&attr, 1);
     attr->SetUnknown(MF_MEDIA_ENGINE_CALLBACK, &g_notify);
-    if (FAILED(factory->CreateInstance(MF_MEDIA_ENGINE_AUDIOONLY, attr, &g_mf))) { MessageBoxW(nullptr, L"Media Foundation indisponible.", L"Glass", MB_ICONERROR); return 1; }
+    if (FAILED(factory->CreateInstance(MF_MEDIA_ENGINE_AUDIOONLY, attr, &g_mf)) || FAILED(factory->CreateInstance(MF_MEDIA_ENGINE_AUDIOONLY, attr, &g_tail))) { MessageBoxW(nullptr, L"Media Foundation indisponible.", L"Glass", MB_ICONERROR); return 1; }
     attr->Release(); factory->Release();
 
     app::init();

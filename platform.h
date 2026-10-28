@@ -40,6 +40,13 @@ double audioDur();  // secondes, 0 si inconnue
 void audioSeek(double s);
 void audioVolume(float v);
 void audioRate(float r);
+void audioFade(double s);  // fondu enchaîné : le son en cours s'éteint en s secondes pendant que le prochain audioPlay monte
+
+// Discord (statut « Écoute ») : connexion locale à l'application Discord
+bool ipcOpen();  // false si Discord n'est pas lancé
+bool ipcWrite(const void* p, size_t n);
+bool ipcRead(void* p, size_t n);  // n octets exactement
+void ipcClose();
 
 // lecteurs officiels dans des pages web invisibles ; leurs messages vont à app::onWeb
 // id 0 = Spotify (page locale html), id 1 = Apple Music (url + script injecté dans la page)

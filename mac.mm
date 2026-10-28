@@ -19,7 +19,9 @@
 #include <spawn.h>
 #include <sys/mman.h>
 #include <sys/resource.h>
+#include <sys/socket.h>
 #include <sys/stat.h>
+#include <sys/un.h>
 #include <sys/wait.h>
 #include <unistd.h>
 #include <objc/message.h>
@@ -203,14 +205,15 @@ size_t plat::memMB(bool engine) {
 }
 
 // ---------- son : AVPlayer (appelé parfois depuis d'autres threads : on passe par le thread principal) ----------
-static AVPlayer* g_player;
+static AVPlayer *g_player, *g_tail;  // g_tail : le titre précédent qui s'éteint (fondu enchaîné)
 static id g_endObs, g_failObs;
 static std::atomic<bool> g_ended{false}, g_failed{false};
 static float g_rate = 1, g_vol = 1;
+static int g_fadeGen = 0;  // thread principal
 
 void plat::audioPlay(const std::string& p) {
     onMain(^{
-        if (!g_player) g_player = [AVPlayer new];
+        if (!g_player) { g_player = [AVPlayer new]; g_player.volume = g_vol; }
         AVPlayerItem* it = [AVPlayerItem playerItemWithURL:[NSURL fileURLWithPath:ns(p)]];
         NSNotificationCenter* nc = [NSNotificationCenter defaultCenter];
         if (g_endObs) [nc removeObserver:g_endObs];
@@ -219,7 +222,6 @@ void plat::audioPlay(const std::string& p) {
         g_failObs = [nc addObserverForName:AVPlayerItemFailedToPlayToEndTimeNotification object:it queue:nil usingBlock:^(NSNotification*) { g_failed = true; plat::wake(); }];
         g_ended = g_failed = false;
         [g_player replaceCurrentItemWithPlayerItem:it];
-        g_player.volume = g_vol;
         g_player.rate = g_rate;  // lance la lecture
     });
 }
@@ -233,6 +235,57 @@ double plat::audioDur() { double s = g_player.currentItem ? CMTimeGetSeconds(g_p
 void plat::audioSeek(double s) { g_ended = false; onMain(^{ [g_player seekToTime:CMTimeMakeWithSeconds(s, 1000) toleranceBefore:kCMTimeZero toleranceAfter:kCMTimeZero]; }); }
 void plat::audioVolume(float v) { g_vol = v; onMain(^{ g_player.volume = v; }); }
 void plat::audioRate(float r) { g_rate = r; onMain(^{ if (g_player.rate != 0) g_player.rate = r; }); }
+static void fadeStep(AVPlayer* out, AVPlayer* in, int gen, double t0, double secs) {  // thread principal, toutes les 30 ms
+    if (gen != g_fadeGen) return;  // un autre fondu a commencé
+    double k = std::min(1.0, (CFAbsoluteTimeGetCurrent() - t0) / secs);
+    out.volume = g_vol * cos(k * 1.5708);  // puissance constante : pas de creux au milieu
+    in.volume = g_vol * sin(k * 1.5708);
+    if (k >= 1) { [out pause]; return; }
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 30 * NSEC_PER_MSEC), dispatch_get_main_queue(), ^{ fadeStep(out, in, gen, t0, secs); });
+}
+void plat::audioFade(double secs) {
+    onMain(^{
+        NSNotificationCenter* nc = [NSNotificationCenter defaultCenter];
+        if (g_endObs) [nc removeObserver:g_endObs];  // la fin du titre qui s'éteint ne compte plus
+        if (g_failObs) [nc removeObserver:g_failObs];
+        g_endObs = g_failObs = nil;
+        g_ended = false;
+        std::swap(g_player, g_tail);
+        if (!g_player) g_player = [AVPlayer new];
+        g_player.volume = 0;
+        fadeStep(g_tail, g_player, ++g_fadeGen, CFAbsoluteTimeGetCurrent(), secs);
+    });
+}
+
+// ---------- Discord : socket local ----------
+static int g_ipc = -1;
+bool plat::ipcOpen() {
+    const char* tmp = getenv("TMPDIR");
+    std::string dir = tmp ? tmp : "/tmp/";
+    if (dir.back() != '/') dir += '/';
+    for (int i = 0; i < 10 && g_ipc < 0; i++) {
+        sockaddr_un a{};
+        a.sun_family = AF_UNIX;
+        snprintf(a.sun_path, sizeof a.sun_path, "%sdiscord-ipc-%d", dir.c_str(), i);
+        int fd = socket(AF_UNIX, SOCK_STREAM, 0);
+        if (fd < 0) continue;
+        int one = 1;
+        setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &one, sizeof one);  // Discord fermé : erreur, pas d'arrêt de Glass
+        if (connect(fd, (sockaddr*)&a, sizeof a) == 0) g_ipc = fd; else close(fd);
+    }
+    return g_ipc >= 0;
+}
+bool plat::ipcWrite(const void* p, size_t n) {
+    for (ssize_t w; n; n -= w, p = (const char*)p + w)
+        if ((w = send(g_ipc, p, n, 0)) <= 0) return false;
+    return true;
+}
+bool plat::ipcRead(void* p, size_t n) {
+    for (ssize_t r; n; n -= r, p = (char*)p + r)
+        if ((r = recv(g_ipc, p, n, 0)) <= 0) return false;
+    return true;
+}
+void plat::ipcClose() { if (g_ipc >= 0) close(g_ipc); g_ipc = -1; }
 
 // ---------- lecteurs officiels (Spotify, Apple Music) : pages web dans des WKWebView ----------
 // shortcut: dépend du DRM du WKWebView ; s'il refuse, le lecteur signale une erreur et Glass joue via YouTube (mode Auto).

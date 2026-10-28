@@ -163,7 +163,7 @@ async fn load_library(s: Session) {
                             if let Some(t) = track_json(&s, first).await { image = t["image"].as_str().unwrap_or("").into(); }
                         }
                     }
-                    Some(json!({"uri": u, "name": p.name(), "image": image}))
+                    Some(json!({"uri": u, "name": p.name(), "image": image, "edit": p.capabilities.can_edit_items}))
                 }
             }).buffered(8).filter_map(|v| async { v }).collect().await;
             items.extend(lists);
@@ -262,6 +262,7 @@ async fn lyrics(s: Session, http: reqwest::Client, v: Value) {
 const WEB_REDIRECT: &str = "http://127.0.0.1:5589/callback";
 const WEB_SCOPES: &[&str] = &[
     "streaming", "user-read-email", "user-read-private", "user-read-playback-state", "user-modify-playback-state",
+    "playlist-modify-public", "playlist-modify-private",  // ajouter des titres à tes playlists
 ];
 
 struct Auth { client_id: String, refresh: String, access: String, expires: Instant }
@@ -408,8 +409,11 @@ async fn main() {
                 });
             }
             "webauth" => {
-                let (web, cid) = (web.clone(), s("client_id"));
+                let (web, mut cid) = (web.clone(), s("client_id"));
                 tokio::spawn(async move {
+                    if cid.is_empty() {  // reconnexion (nouvelles autorisations) avec l'app déjà enregistrée
+                        cid = web.auth.lock().await.as_ref().map(|a| a.client_id.clone()).unwrap_or_default();
+                    }
                     let r: Result<Auth, String> = async {
                         let c = OAuthClientBuilder::new(&cid, WEB_REDIRECT, WEB_SCOPES.to_vec())
                             .open_in_browser()
