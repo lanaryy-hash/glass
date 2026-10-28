@@ -1900,6 +1900,30 @@ static void deadBranch(ImDrawList* dl, ImVec2 p, float len, float ang, float w, 
     deadBranch(dl, q, len * 0.66f, ang + 0.42f + d(rng), w * 0.66f, depth - 1, rng, k);
 }
 
+// Toile d'araignée posée dans un coin c ; d = vers l'intérieur de la fenêtre (±1, ±1).
+static void cobweb(ImDrawList* dl, ImVec2 c, ImVec2 d, float R, ImU32 k) {
+    const int spokes = 7, rings = 6;
+    auto at = [&](int s, float r) { float t = s * 1.5708f / (spokes - 1); return ImVec2{c.x + d.x * cosf(t) * r, c.y + d.y * sinf(t) * r}; };
+    for (int s = 0; s < spokes; s++) dl->AddLine(c, at(s, R), k, S);
+    for (int i = 1; i <= rings; i++)
+        for (int s = 0; s + 1 < spokes; s++) {
+            float r = R * (i - 0.15f * (s % 2)) / rings;
+            ImVec2 p = at(s, r), q = at(s + 1, r), m = (p + q) * 0.5f;
+            dl->AddBezierQuadratic(p, m + (c - m) * 0.14f, q, k, S);  // le fil pend vers le coin
+        }
+}
+
+static void spider(ImDrawList* dl, ImVec2 c, float s, ImU32 k) {
+    dl->AddCircleFilled(c, s * 0.5f, k, 16);
+    dl->AddCircleFilled(c + ImVec2{0, -s * 0.6f}, s * 0.3f, k, 12);
+    for (float d : {-1.f, 1.f})
+        for (int i = 0; i < 4; i++) {
+            ImVec2 o = c + ImVec2{0, (i - 1.5f) * s * 0.22f}, kn = o + ImVec2{d * s * 0.8f, -s * 0.4f + i * s * 0.12f};
+            dl->AddLine(o, kn, k, 1.5f * S);
+            dl->AddLine(kn, kn + ImVec2{d * s * 0.3f, s * (0.5f + i * 0.1f)}, k, 1.5f * S);
+        }
+}
+
 // Fond « Nuit d'Halloween » : ciel étoilé, lune, collines, arbre mort, citrouilles allumées. Fixe : rien à calculer au repos.
 static void halloweenNight(ImDrawList* dl, ImVec2 a, ImVec2 b) {
     float W = b.x - a.x, H = b.y - a.y, M = std::min(W, H);
@@ -1919,6 +1943,12 @@ static void halloweenNight(ImDrawList* dl, ImVec2 a, ImVec2 b) {
     dl->AddCircleFilled(m + ImVec2{-0.32f * r, -0.22f * r}, 0.22f * r, col(0.9f, 0.84f, 0.72f, 0.55f), 24);
     dl->AddCircleFilled(m + ImVec2{0.28f * r, 0.3f * r}, 0.16f * r, col(0.9f, 0.84f, 0.72f, 0.5f), 24);
     dl->AddCircleFilled(m + ImVec2{0.36f * r, -0.36f * r}, 0.09f * r, col(0.9f, 0.84f, 0.72f, 0.45f), 16);
+    ImU32 silk = col(0.88f, 0.86f, 0.96f, 0.3f);
+    cobweb(dl, {b.x, a.y}, {-1, 1}, M * 0.3f, silk);
+    cobweb(dl, a, {1, 1}, M * 0.22f, silk);
+    ImVec2 sp = m + ImVec2{-0.25f * r, 0.3f * r};  // araignée suspendue devant la lune
+    dl->AddLine({sp.x, a.y}, sp, silk, S);
+    spider(dl, sp, r * 0.28f, col(0.04f, 0.015f, 0.06f));
     auto hill = [&](float base, float amp, float f1, float f2, ImU32 c) {
         std::vector<ImVec2> pts;
         for (int i = 0; i <= 48; i++) {
