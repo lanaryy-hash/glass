@@ -271,7 +271,7 @@ bool plat::ipcOpen() {
         if (fd < 0) continue;
         int one = 1;
         setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &one, sizeof one);  // Discord fermé : erreur, pas d'arrêt de Glass
-        if (connect(fd, (sockaddr*)&a, sizeof a) == 0) g_ipc = fd; else close(fd);
+        if (connect(fd, (sockaddr*)&a, sizeof a) == 0) g_ipc = fd; else ::close(fd);
     }
     return g_ipc >= 0;
 }
@@ -285,7 +285,7 @@ bool plat::ipcRead(void* p, size_t n) {
         if ((r = recv(g_ipc, p, n, 0)) <= 0) return false;
     return true;
 }
-void plat::ipcClose() { if (g_ipc >= 0) close(g_ipc); g_ipc = -1; }
+void plat::ipcClose() { if (g_ipc >= 0) ::close(g_ipc); g_ipc = -1; }
 
 // ---------- lecteurs officiels (Spotify, Apple Music) : pages web dans des WKWebView ----------
 // shortcut: dépend du DRM du WKWebView ; s'il refuse, le lecteur signale une erreur et Glass joue via YouTube (mode Auto).
