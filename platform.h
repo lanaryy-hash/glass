@@ -59,6 +59,7 @@ void webShow(int id, bool show);                // fenêtre visible (connexion a
 bool decodeImage(const std::string& src, int size, std::vector<uint8_t>& px, int& w, int& h);
 ImTextureID makeTexture(const uint8_t* px, int w, int h);  // thread de la fenêtre
 void loadFonts(ImFont** regular, ImFont** bold, ImFont** icons);
+ImFont* loadFont(const std::string& path);  // un fichier de police (UTF-8) + les polices de secours (CJK, symboles) ; nullptr si illisible
 
 void readTags(const fs::path& file, std::string& title, std::string& artist, std::string& album, int& ms);
 std::vector<fs::path> pick(int kind);  // 1 fichiers audio, 2 dossier, 3 image

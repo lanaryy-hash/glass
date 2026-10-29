@@ -464,13 +464,23 @@ static ImFont* addFont(const std::string& path, bool merge = false) {
     return ImGui::GetIO().Fonts->AddFontFromMemoryTTF(data, (int)st.st_size, 16, &cfg);
 }
 
+static void addFallbacks() {  // cyrillique déjà dans Inter ; chinois, japonais, coréen, symboles
+    for (const char* fb : {"/System/Library/Fonts/Supplemental/Arial Unicode.ttf", "/System/Library/Fonts/Hiragino Sans GB.ttc", "/System/Library/Fonts/AppleSDGothicNeo.ttc"})
+        addFont(fb, true);
+}
+
+ImFont* plat::loadFont(const std::string& path) {  // police choisie dans les réglages, avec les mêmes secours
+    ImFont* f = addFont(path);
+    if (f) addFallbacks();
+    return f;
+}
+
 void plat::loadFonts(ImFont** regular, ImFont** bold, ImFont** icons) {
     std::string res = [NSBundle mainBundle].resourcePath.UTF8String;
     auto font = [&](const char* file) {
         ImFont* f = addFont(res + "/" + file);
         if (!f) f = ImGui::GetIO().Fonts->AddFontDefault();
-        for (const char* fb : {"/System/Library/Fonts/Supplemental/Arial Unicode.ttf", "/System/Library/Fonts/Hiragino Sans GB.ttc", "/System/Library/Fonts/AppleSDGothicNeo.ttc"})
-            addFont(fb, true);  // cyrillique déjà dans Inter ; chinois, japonais, coréen, symboles
+        addFallbacks();
         return f;
     };
     *regular = font("Inter-Regular.ttf");
@@ -584,16 +594,16 @@ std::string plat::installUpdate(const fs::path& zip) {
     fs::path app = [NSBundle mainBundle].bundlePath.UTF8String, tmp = app.parent_path() / "Glass-update";
     std::error_code ec;
     fs::remove_all(tmp, ec);
-    if (!plat::run({"/usr/bin/ditto", "-x", "-k", zip.string(), tmp.string()}, 120000)) return "impossible d'écrire dans " + app.parent_path().string();
+    if (!plat::run({"/usr/bin/ditto", "-x", "-k", zip.string(), tmp.string()}, 120000)) return "couldn't write to " + app.parent_path().string();
     fs::path fresh = tmp / "Glass.app", old = app;
     old += ".old";
-    if (!fs::exists(fresh)) return "archive invalide";
+    if (!fs::exists(fresh)) return "invalid archive";
     plat::run({"/usr/bin/xattr", "-cr", fresh.string()}, 60000);
     fs::remove_all(old, ec);
     fs::rename(app, old, ec);
-    if (ec) return "remplacement impossible : " + ec.message();
+    if (ec) return "couldn't replace the app: " + ec.message();
     fs::rename(fresh, app, ec);
-    if (ec) { std::error_code e2; fs::rename(old, app, e2); return "remplacement impossible : " + ec.message(); }
+    if (ec) { std::error_code e2; fs::rename(old, app, e2); return "couldn't replace the app: " + ec.message(); }
     fs::remove_all(old, ec);
     fs::remove_all(tmp, ec);
     fs::remove(zip, ec);

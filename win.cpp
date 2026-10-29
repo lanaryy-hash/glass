@@ -325,7 +325,7 @@ void plat::webStart(int id, const std::string& html, const std::string& url, con
     std::wstring winject = widen(inject);
     HRESULT hr = CreateCoreWebView2EnvironmentWithOptions(nullptr, (g_dir / "webview-data").c_str(), opts.Get(),
         Callback<ICoreWebView2CreateCoreWebView2EnvironmentCompletedHandler>([id, web, nav, winject](HRESULT hr, ICoreWebView2Environment* env) -> HRESULT {
-            if (FAILED(hr) || !env) { app::onWeb(id, R"({"t":"error","msg":"WebView2 indisponible : son via YouTube"})"); return S_OK; }
+            if (FAILED(hr) || !env) { app::onWeb(id, R"({"t":"error","msg":"WebView2 unavailable: audio via YouTube"})"); return S_OK; }
             env->CreateCoreWebView2Controller(g_webs[id].host, Callback<ICoreWebView2CreateCoreWebView2ControllerCompletedHandler>(
                 [id, web, nav, winject](HRESULT hr, ICoreWebView2Controller* c) -> HRESULT {
                     Web& w = g_webs[id];
@@ -352,7 +352,7 @@ void plat::webStart(int id, const std::string& html, const std::string& url, con
                 }).Get());
             return S_OK;
         }).Get());
-    if (FAILED(hr)) app::onWeb(id, R"({"t":"error","msg":"WebView2 indisponible : son via YouTube"})");
+    if (FAILED(hr)) app::onWeb(id, R"({"t":"error","msg":"WebView2 unavailable: audio via YouTube"})");
 }
 
 // ---------- images : WIC ----------
@@ -419,9 +419,9 @@ ImTextureID plat::makeTexture(const uint8_t* px, int w, int h) {
 }
 
 // Police lue directement depuis le fichier (mappé en mémoire) : pas de copie, Windows ne charge que les pages utilisées.
-static ImFont* addFont(const char* file, bool merge = false) {
-    std::string p = std::string("C:\\Windows\\Fonts\\") + file;
-    HANDLE f = CreateFileA(p.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, nullptr);
+static ImFont* addFont(const char* file, bool merge = false) {  // nom d'une police de Windows, ou chemin complet (UTF-8)
+    std::string p = strchr(file, ':') ? file : std::string("C:\\Windows\\Fonts\\") + file;
+    HANDLE f = CreateFileW(widen(p).c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, nullptr);
     if (f == INVALID_HANDLE_VALUE) return nullptr;
     LARGE_INTEGER sz; GetFileSizeEx(f, &sz);
     HANDLE m = CreateFileMappingA(f, nullptr, PAGE_READONLY, 0, 0, nullptr);
@@ -435,11 +435,19 @@ static ImFont* addFont(const char* file, bool merge = false) {
     return ImGui::GetIO().Fonts->AddFontFromMemoryTTF(data, (int)sz.QuadPart, 16, &cfg);
 }
 
+static void addFallbacks() { for (const char* fb : {"msyh.ttc", "YuGothM.ttc", "malgun.ttf", "seguisym.ttf", "seguiemj.ttf"}) addFont(fb, true); }  // chinois, japonais, coréen, symboles
+
+ImFont* plat::loadFont(const std::string& path) {  // police choisie dans les réglages, avec les mêmes secours
+    ImFont* f = addFont(path.c_str());
+    if (f) addFallbacks();
+    return f;
+}
+
 void plat::loadFonts(ImFont** regular, ImFont** bold, ImFont** icons) {
     auto font = [](const char* file, const char* old) {  // police de Windows 11, sinon celle de Windows 10
         ImFont* f = addFont(file);
         if (!f) f = addFont(old);
-        for (const char* fb : {"msyh.ttc", "YuGothM.ttc", "malgun.ttf", "seguisym.ttf", "seguiemj.ttf"}) addFont(fb, true);  // chinois, japonais, coréen, symboles
+        addFallbacks();
         return f;
     };
     *regular = font("SegUIVar.ttf", "segoeui.ttf");  // Segoe UI Variable
@@ -472,7 +480,7 @@ std::vector<fs::path> plat::pick(int kind) {
     std::vector<fs::path> paths;
     IFileOpenDialog* d;
     if (FAILED(CoCreateInstance(CLSID_FileOpenDialog, nullptr, CLSCTX_ALL, IID_PPV_ARGS(&d)))) return paths;
-    COMDLG_FILTERSPEC audio{L"Audio", L"*.mp3;*.m4a;*.aac;*.flac;*.wav;*.wma;*.ogg;*.opus"}, image{L"Images", L"*.jpg;*.jpeg;*.png;*.bmp;*.gif;*.webp"}, theme{L"Thème Glass", L"*.glasstheme;*.json"};
+    COMDLG_FILTERSPEC audio{L"Audio", L"*.mp3;*.m4a;*.aac;*.flac;*.wav;*.wma;*.ogg;*.opus"}, image{L"Images", L"*.jpg;*.jpeg;*.png;*.bmp;*.gif;*.webp"}, theme{L"Glass theme", L"*.glasstheme;*.json"};
     DWORD o; d->GetOptions(&o);
     d->SetOptions(o | (kind == 1 ? FOS_ALLOWMULTISELECT : 0) | (kind == 2 ? FOS_PICKFOLDERS : 0));
     if (kind != 2) d->SetFileTypes(1, kind == 1 ? &audio : kind == 6 ? &theme : &image);
@@ -615,15 +623,15 @@ std::string plat::installUpdate(const fs::path& zip) {
     std::error_code ec;
     fs::remove_all(tmp, ec);
     fs::create_directories(tmp, ec);
-    if (!plat::run({"tar.exe", "-xf", zip.u8string(), "-C", tmp.u8string()}, 120000)) return "décompression impossible";
-    if (!fs::exists(tmp / "Glass.exe")) return "archive invalide";
+    if (!plat::run({"tar.exe", "-xf", zip.u8string(), "-C", tmp.u8string()}, 120000)) return "couldn't extract the archive";
+    if (!fs::exists(tmp / "Glass.exe")) return "invalid archive";
     for (auto& e : fs::directory_iterator(tmp, ec)) {
         fs::path dst = g_bin / e.path().filename(), old = dst;
         old += ".old";
         fs::remove(old, ec);
-        if (fs::exists(dst)) { fs::rename(dst, old, ec); if (ec) return "impossible de remplacer " + dst.filename().u8string(); }
+        if (fs::exists(dst)) { fs::rename(dst, old, ec); if (ec) return "couldn't replace " + dst.filename().u8string(); }
         fs::copy_file(e.path(), dst, fs::copy_options::overwrite_existing, ec);
-        if (ec) { fs::rename(old, dst, ec); return "impossible de copier " + dst.filename().u8string(); }
+        if (ec) { fs::rename(old, dst, ec); return "couldn't copy " + dst.filename().u8string(); }
     }
     fs::remove_all(tmp, ec);
     fs::remove(zip, ec);
@@ -681,12 +689,12 @@ static LRESULT WINAPI wndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         if (LOWORD(lp) == WM_LBUTTONUP) showWindowAgain();
         else if (LOWORD(lp) == WM_RBUTTONUP) {
             HMENU m = CreatePopupMenu();
-            AppendMenuW(m, MF_STRING, 1, L"Lecture / pause");
-            AppendMenuW(m, MF_STRING, 2, L"Suivant");
-            AppendMenuW(m, MF_STRING, 3, L"Précédent");
+            AppendMenuW(m, MF_STRING, 1, L"Play / pause");
+            AppendMenuW(m, MF_STRING, 2, L"Next");
+            AppendMenuW(m, MF_STRING, 3, L"Previous");
             AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
-            AppendMenuW(m, MF_STRING, 4, L"Afficher Glass");
-            AppendMenuW(m, MF_STRING, 5, L"Quitter");
+            AppendMenuW(m, MF_STRING, 4, L"Show Glass");
+            AppendMenuW(m, MF_STRING, 5, L"Quit");
             POINT pt; GetCursorPos(&pt);
             SetForegroundWindow(hwnd);
             int c = TrackPopupMenu(m, TPM_RETURNCMD | TPM_RIGHTBUTTON, pt.x, pt.y, 0, hwnd, nullptr);
@@ -753,7 +761,7 @@ static void refreshPath() {
 static void writeCrash(const char* what, CONTEXT* ctx) {
     FILE* f = _wfopen((g_dir / "crash.txt").c_str(), L"w");
     if (!f) return;
-    fprintf(f, "Glass a planté : %s\n\n", what);
+    fprintf(f, "Glass crashed: %s\n\n", what);
     HANDLE proc = GetCurrentProcess(), th = GetCurrentThread();
     SymSetOptions(SYMOPT_LOAD_LINES | SYMOPT_UNDNAME);
     SymInitialize(proc, nullptr, TRUE);
@@ -782,7 +790,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
         writeCrash(what, e->ContextRecord);
         return EXCEPTION_EXECUTE_HANDLER;
     });
-    std::set_terminate([] { writeCrash("std::terminate (exception C++ non attrapée)", nullptr); abort(); });
+    std::set_terminate([] { writeCrash("std::terminate (uncaught C++ exception)", nullptr); abort(); });
     ImGui_ImplWin32_EnableDpiAwareness();
 
     wchar_t exe[MAX_PATH]; GetModuleFileNameW(nullptr, exe, MAX_PATH);
@@ -816,7 +824,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
     CoCreateInstance(CLSID_MFMediaEngineClassFactory, nullptr, CLSCTX_ALL, IID_PPV_ARGS(&factory));
     MFCreateAttributes(&attr, 1);
     attr->SetUnknown(MF_MEDIA_ENGINE_CALLBACK, &g_notify);
-    if (FAILED(factory->CreateInstance(MF_MEDIA_ENGINE_AUDIOONLY, attr, &g_mf)) || FAILED(factory->CreateInstance(MF_MEDIA_ENGINE_AUDIOONLY, attr, &g_tail))) { MessageBoxW(nullptr, L"Media Foundation indisponible.", L"Glass", MB_ICONERROR); return 1; }
+    if (FAILED(factory->CreateInstance(MF_MEDIA_ENGINE_AUDIOONLY, attr, &g_mf)) || FAILED(factory->CreateInstance(MF_MEDIA_ENGINE_AUDIOONLY, attr, &g_tail))) { MessageBoxW(nullptr, L"Media Foundation unavailable.", L"Glass", MB_ICONERROR); return 1; }
     attr->Release(); factory->Release();
 
     app::init();
@@ -837,7 +845,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
     sd.OutputWindow = g_hwnd; sd.SampleDesc.Count = 1; sd.Windowed = TRUE; sd.SwapEffect = DXGI_SWAP_EFFECT_DISCARD;
     if (FAILED(D3D11CreateDeviceAndSwapChain(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, 0, nullptr, 0, D3D11_SDK_VERSION, &sd, &g_swap, &g_dev, nullptr, &g_ctx)) &&
         FAILED(D3D11CreateDeviceAndSwapChain(nullptr, D3D_DRIVER_TYPE_WARP, nullptr, 0, nullptr, 0, D3D11_SDK_VERSION, &sd, &g_swap, &g_dev, nullptr, &g_ctx))) {
-        MessageBoxW(nullptr, L"DirectX 11 indisponible.", L"Glass", MB_ICONERROR); return 1;
+        MessageBoxW(nullptr, L"DirectX 11 unavailable.", L"Glass", MB_ICONERROR); return 1;
     }
     createRTV();
     ShowWindow(g_hwnd, SW_SHOWDEFAULT); UpdateWindow(g_hwnd);

@@ -120,7 +120,7 @@ async fn load_tracks(s: Session, uri: String) {
     let res: Result<(String, Vec<SpotifyUri>), String> = async {
         if uri == "spotify:collection" {
             let all = collection(&s).await?;
-            return Ok(("Titres likés".into(), all.into_iter().filter(|u| matches!(u, SpotifyUri::Track { .. })).collect()));
+            return Ok(("Liked Songs".into(), all.into_iter().filter(|u| matches!(u, SpotifyUri::Track { .. })).collect()));
         }
         let id = SpotifyUri::from_uri(&uri).map_err(|e| e.to_string())?;
         match id {
@@ -145,7 +145,7 @@ async fn load_tracks(s: Session, uri: String) {
 }
 
 async fn load_library(s: Session) {
-    let mut items = vec![json!({"uri": "spotify:collection", "name": "Titres likés", "image": ""})];
+    let mut items = vec![json!({"uri": "spotify:collection", "name": "Liked Songs", "image": ""})];
     if let Ok(bytes) = s.spclient().get_rootlist(0, Some(500)).await {
         if let Ok(root) = SelectedListContent::parse_from_bytes(&bytes) {
             let uris: Vec<String> = root.contents.items.iter().map(|i| i.uri().to_string())
@@ -247,7 +247,7 @@ async fn lyrics(s: Session, http: reqwest::Client, v: Value) {
     if let Some(d) = pick {
         let dur = d["duration"].as_f64().unwrap_or(0.0) * 1000.0;
         let scale = if dur > 0.0 && ms > 0.0 && ((ms / dur) - 1.0).abs() > 0.04 { ms / dur } else { 1.0 };
-        let src = if scale == 1.0 { "LRCLIB".to_string() } else { format!("LRCLIB (version originale, tempo ajusté x{:.2})", scale) };
+        let src = if scale == 1.0 { "LRCLIB".to_string() } else { format!("LRCLIB (original version, tempo adjusted x{:.2})", scale) };
         if let Some(lrc) = d["syncedLyrics"].as_str().filter(|x| !x.is_empty()) {
             return emit(json!({"ev": "lyrics", "key": key, "synced": true, "lines": parse_lrc(lrc, scale), "src": src}));
         }
@@ -285,7 +285,7 @@ impl Web {
     async fn token(&self) -> Result<String, String> {
         let mut g = self.auth.lock().await;
         let (cid, rt) = match g.as_ref() {
-            None => return Err("Spotify officiel non configuré".into()),
+            None => return Err("Official Spotify not set up".into()),
             Some(a) if a.expires > Instant::now() + Duration::from_secs(60) => return Ok(a.access.clone()),
             Some(a) => (a.client_id.clone(), a.refresh.clone()),
         };
@@ -322,25 +322,25 @@ async fn main() {
         let c = match creds.take() {
             Some(c) => c,
             None => {
-                emit(json!({"ev": "status", "msg": "Connecte-toi à Spotify dans la page qui vient de s'ouvrir"}));
+                emit(json!({"ev": "status", "msg": "Sign in to Spotify in the page that just opened"}));
                 let client = OAuthClientBuilder::new(&config.client_id, "http://127.0.0.1:5588/login", SCOPES.to_vec())
                     .open_in_browser()
-                    .with_custom_message("Connecté ! Tu peux fermer cette page et retourner sur Glass.")
+                    .with_custom_message("Connected! You can close this page and go back to Glass.")
                     .build();
                 match client {
                     Ok(c) => match c.get_access_token_async().await {
                         Ok(t) => Credentials::with_access_token(t.access_token),
-                        Err(e) => { emit(json!({"ev": "error", "msg": format!("Connexion refusée : {e}")})); return; }
+                        Err(e) => { emit(json!({"ev": "error", "msg": format!("Sign-in refused: {e}")})); return; }
                     },
                     Err(e) => { emit(json!({"ev": "error", "msg": e.to_string()})); return; }
                 }
             }
         };
-        emit(json!({"ev": "status", "msg": "Connexion à Spotify..."}));
+        emit(json!({"ev": "status", "msg": "Connecting to Spotify..."}));
         let s = Session::new(config.clone(), cache.clone());
         match s.connect(c, true).await {
             Ok(()) => break s,
-            Err(e) => emit(json!({"ev": "status", "msg": format!("Session expirée ({e}), reconnexion...")})),
+            Err(e) => emit(json!({"ev": "status", "msg": format!("Session expired ({e}), reconnecting...")})),
         }
     };
     emit(json!({"ev": "ready", "user": session.username()}));
@@ -355,7 +355,7 @@ async fn main() {
             match saved {
                 Some(v) => match web.refresh(v["client_id"].as_str().unwrap_or(""), v["refresh_token"].as_str().unwrap_or("")).await {
                     Ok(a) => { web.save(&a); *web.auth.lock().await = Some(a); emit(json!({"ev": "web", "ok": true})); }
-                    Err(e) => emit(json!({"ev": "web", "ok": false, "msg": format!("Reconnexion Spotify : {e}")})),
+                    Err(e) => emit(json!({"ev": "web", "ok": false, "msg": format!("Spotify reconnect: {e}")})),
                 },
                 None => emit(json!({"ev": "web", "ok": false})),
             }
@@ -417,14 +417,14 @@ async fn main() {
                     let r: Result<Auth, String> = async {
                         let c = OAuthClientBuilder::new(&cid, WEB_REDIRECT, WEB_SCOPES.to_vec())
                             .open_in_browser()
-                            .with_custom_message("Glass est connecté à Spotify ! Tu peux fermer cette page.")
+                            .with_custom_message("Glass is connected to Spotify! You can close this page.")
                             .build().map_err(|e| e.to_string())?;
                         let t = c.get_access_token_async().await.map_err(|e| e.to_string())?;
                         Ok(Auth { client_id: cid.clone(), refresh: t.refresh_token, access: t.access_token, expires: t.expires_at })
                     }.await;
                     match r {
                         Ok(a) => { web.save(&a); *web.auth.lock().await = Some(a); emit(json!({"ev": "web", "ok": true})); }
-                        Err(e) => emit(json!({"ev": "web", "ok": false, "msg": format!("Connexion refusée : {e}")})),
+                        Err(e) => emit(json!({"ev": "web", "ok": false, "msg": format!("Sign-in refused: {e}")})),
                     }
                 });
             }
