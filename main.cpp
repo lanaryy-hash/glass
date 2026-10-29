@@ -111,6 +111,7 @@ static bool g_sleepEnd = false;         // minuterie « à la fin du titre »
 static bool g_webOk = false, g_sp = false, g_wvStarted = false, g_sdkReady = false, g_spPaused = true, g_spEnded = false;
 static bool g_spApple = false;                                                      // le lecteur officiel en cours est celui d'Apple
 static bool g_amStarted = false, g_amReady = false, g_amAuth = false, g_amLogin = false;  // Apple Music : page lancée, prête, connectée, fenêtre de connexion
+static bool g_amPreview = false;  // Apple n'a donné qu'un extrait de 30 s (pas d'abonnement actif) : titres suivants via YouTube
 static std::string g_amDiag;  // ce que le lecteur d'Apple peut faire ici (titres entiers ou extraits)
 static std::string g_sdkDevice;
 static double g_spPos = 0, g_spT = 0, g_spDur = 0;
@@ -1341,7 +1342,7 @@ static void startTrack(const Track& t) {
     addRecent(t);
     if (t.local) { stopSp(); audioPlay(t.uri); return; }
     bool spotify = t.uri.rfind("spotify:", 0) == 0, apple = t.uri.rfind("apple:song:", 0) == 0;
-    bool ready = spotify ? g_sdkReady : apple && g_amReady && g_amAuth;
+    bool ready = spotify ? g_sdkReady : apple && g_amReady && g_amAuth && !g_amPreview;
     if ((spotify || apple) && g_set.source != 2 && ready) {  // lecteur officiel : la vraie version (abonnement)
         plat::audioPause();
         if (g_sp && g_spApple != apple) stopSp();  // on change de lecteur
@@ -1693,6 +1694,7 @@ static void onApple(const json& j) {  // messages de la page Apple Music (g_mx t
         g_amAuth = j.value("ok", false);
         if (t == "ready") setVolume();
         if (g_amAuth && !was) {  // connecté : on cache la fenêtre et on charge ses playlists
+            g_amPreview = false;
             if (g_amLogin) { plat::webShow(1, false); g_amLogin = false; g_status = "Apple Music connecté"; }
             amPost({{"cmd", "lib"}});
         }
@@ -1721,7 +1723,14 @@ static void onApple(const json& j) {  // messages de la page Apple Music (g_mx t
         }
     }
     else if (t == "ended" && mine) g_spEnded = true;
-    else if (t == "state" && mine) webState(j);
+    else if (t == "state" && mine) {
+        double dur = jnum(j, "dur");
+        if (dur > 0 && dur < 35000 && g_cur.ms > 45000) {  // extrait de 30 s au lieu du titre entier
+            g_amPreview = true; g_loading = false;
+            g_status = "Apple Music ne donne que des extraits (connecte un compte avec abonnement)";
+            if (g_set.source == 0) ytPlay(g_cur); else { stopSp(); g_failed = true; }
+        } else webState(j);
+    }
 }
 
 static void stopWebView() { plat::webStop(0); g_wvStarted = g_sdkReady = false; if (!g_spApple) g_sp = false; }
