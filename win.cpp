@@ -436,14 +436,16 @@ static ImFont* addFont(const char* file, bool merge = false) {
 }
 
 void plat::loadFonts(ImFont** regular, ImFont** bold, ImFont** icons) {
-    auto font = [](const char* file) {
+    auto font = [](const char* file, const char* old) {  // police de Windows 11, sinon celle de Windows 10
         ImFont* f = addFont(file);
+        if (!f) f = addFont(old);
         for (const char* fb : {"msyh.ttc", "YuGothM.ttc", "malgun.ttf", "seguisym.ttf", "seguiemj.ttf"}) addFont(fb, true);  // chinois, japonais, coréen, symboles
         return f;
     };
-    *regular = font("segoeui.ttf");
-    *bold = font("segoeuib.ttf");
-    *icons = addFont("segmdl2.ttf");
+    *regular = font("SegUIVar.ttf", "segoeui.ttf");  // Segoe UI Variable
+    *bold = font("seguisb.ttf", "segoeuib.ttf");     // demi-gras : titres plus doux que le gras
+    *icons = addFont("SegoeIcons.ttf");              // Segoe Fluent Icons (mêmes codes que MDL2, dessin arrondi)
+    if (!*icons) *icons = addFont("segmdl2.ttf");
 }
 
 // ---------- fichiers locaux ----------
@@ -470,10 +472,10 @@ std::vector<fs::path> plat::pick(int kind) {
     std::vector<fs::path> paths;
     IFileOpenDialog* d;
     if (FAILED(CoCreateInstance(CLSID_FileOpenDialog, nullptr, CLSCTX_ALL, IID_PPV_ARGS(&d)))) return paths;
-    COMDLG_FILTERSPEC audio{L"Audio", L"*.mp3;*.m4a;*.aac;*.flac;*.wav;*.wma;*.ogg;*.opus"}, image{L"Images", L"*.jpg;*.jpeg;*.png;*.bmp;*.gif;*.webp"};
+    COMDLG_FILTERSPEC audio{L"Audio", L"*.mp3;*.m4a;*.aac;*.flac;*.wav;*.wma;*.ogg;*.opus"}, image{L"Images", L"*.jpg;*.jpeg;*.png;*.bmp;*.gif;*.webp"}, theme{L"Thème Glass", L"*.glasstheme;*.json"};
     DWORD o; d->GetOptions(&o);
     d->SetOptions(o | (kind == 1 ? FOS_ALLOWMULTISELECT : 0) | (kind == 2 ? FOS_PICKFOLDERS : 0));
-    if (kind != 2) d->SetFileTypes(1, kind == 1 ? &audio : &image);
+    if (kind != 2) d->SetFileTypes(1, kind == 1 ? &audio : kind == 6 ? &theme : &image);
     IShellItemArray* arr;
     if (SUCCEEDED(d->Show(g_hwnd)) && SUCCEEDED(d->GetResults(&arr))) {
         DWORD n = 0; arr->GetCount(&n);

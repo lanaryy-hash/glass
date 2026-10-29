@@ -502,7 +502,7 @@ std::vector<fs::path> plat::pick(int kind) {
     p.canChooseDirectories = kind == 2;
     p.allowsMultipleSelection = kind == 1;
     if (kind == 1) p.allowedContentTypes = @[UTTypeAudio];
-    if (kind >= 3) p.allowedContentTypes = @[UTTypeImage];
+    if (kind >= 3 && kind != 6) p.allowedContentTypes = @[UTTypeImage];  // 6 : thème Glass (.glasstheme), sans filtre
     std::vector<fs::path> out;
     if ([p runModal] == NSModalResponseOK)
         for (NSURL* u in p.URLs) out.push_back(u.path.UTF8String);

@@ -20,29 +20,36 @@ function sdEllipse(x, y, cx, cy, rx, ry, ang) {  // approximation suffisante pou
   const u = dx * c + dy * s, v = -dx * s + dy * c;
   return (Math.hypot(u / rx, v / ry) - 1) * Math.min(rx, ry);
 }
-function sdNote(x, y) {
+function sdNote(x, y) {  // croche : tête penchée, hampe, crochet
   return Math.min(
-    sdEllipse(x, y, 0.355, 0.705, 0.108, 0.080, -0.35),
-    sdEllipse(x, y, 0.655, 0.635, 0.108, 0.080, -0.35),
-    sdCapsule(x, y, 0.448, 0.690, 0.448, 0.335, 0.024),
-    sdCapsule(x, y, 0.748, 0.620, 0.748, 0.265, 0.024),
-    sdCapsule(x, y, 0.448, 0.345, 0.748, 0.275, 0.046));
+    sdEllipse(x, y, 0.462, 0.598, 0.072, 0.054, -0.38),
+    sdCapsule(x, y, 0.522, 0.585, 0.522, 0.372, 0.019),
+    sdCapsule(x, y, 0.522, 0.372, 0.598, 0.430, 0.019));
 }
+const squircle = (x, y) => Math.pow(Math.abs(x - 0.5) / 0.44, 5) + Math.pow(Math.abs(y - 0.5) / 0.44, 5) - 1;  // < 0 : dedans (forme des icônes iPhone)
+const conic = a => {  // couleur de l'anneau selon l'angle : rose -> violet -> cyan -> rose
+  const t = (a / (2 * Math.PI) + 1.125) % 1 * 3, i = Math.floor(t), f = t - i, cs = [PINK, VIOLET, CYAN, PINK];
+  return mix(cs[i], cs[i + 1], f * f * (3 - 2 * f));
+};
 
-// Couleur (RGBA prémultipliée non, simple « over ») d'un point du logo dans [0,1]².
+// Couleur (simple « over ») d'un point du logo dans [0,1]² : fond sombre, anneau de verre en dégradé, croche blanche.
 function sample(x, y) {
-  const dBox = sdRoundBox(x, y, 0.5, 0.5, 0.44, 0.44, 0.23);
-  if (dBox > 0) return [0, 0, 0, 0];
-  const t = clamp((x * 0.55 + y * 0.45));
-  let c = t < 0.5 ? mix(PINK, VIOLET, t * 2) : mix(VIOLET, CYAN, (t - 0.5) * 2);
-  // reflet de verre en haut
-  const hl = clamp(1 - Math.hypot((x - 0.5) / 0.62, (y + 0.05) / 0.42)) ;
-  c = mix(c, [1, 1, 1], 0.28 * Math.pow(hl, 0.7));
-  // liseré lumineux sur le bord
-  if (dBox > -0.03) c = mix(c, [1, 1, 1], 0.35 * (1 + dBox / 0.03));
-  // ombre douce de la note puis la note
-  const sh = sdNote(x - 0.018, y - 0.028);
-  if (sh < 0.02) c = mix(c, [0.12, 0.02, 0.25], 0.28 * clamp(1 - (sh + 0.02) / 0.04));
+  const sq = squircle(x, y);
+  if (sq > 0) return [0, 0, 0, 0];
+  let c = mix([0.11, 0.07, 0.21], [0.03, 0.025, 0.07], clamp(x * 0.4 + y * 0.6));
+  const dx = x - 0.5, dy = y - 0.5, r = Math.hypot(dx, dy), ang = Math.atan2(dy, dx);
+  c = mix(c, conic(ang), 0.45 * Math.pow(clamp(1 - Math.abs(r - 0.27) / 0.2), 2));  // halo coloré autour de l'anneau
+  if (r < 0.245) {  // disque de verre dépoli, reflet en haut à gauche
+    c = mix(c, [1, 1, 1], 0.07 + 0.16 * Math.pow(clamp(1 - Math.hypot(x - 0.4, y - 0.36) / 0.22), 1.5));
+  }
+  const ring = Math.abs(r - 0.27) - 0.034;
+  if (ring < 0) {
+    c = conic(ang);
+    c = mix(c, [1, 1, 1], 0.55 * Math.pow(clamp(-(dx + dy) / r * 0.7), 3) * clamp(-ring / 0.02));  // lumière sur le haut gauche de l'anneau
+  }
+  if (sq > -0.06) c = mix(c, [1, 1, 1], 0.12 * clamp(1 + sq / 0.06));  // liseré fin du verre
+  const sh = sdNote(x - 0.008, y - 0.014);
+  if (sh < 0.012) c = mix(c, [0.05, 0.02, 0.12], 0.4 * clamp(1 - (sh + 0.012) / 0.024));  // ombre de la note
   if (sdNote(x, y) < 0) c = [1, 1, 1];
   return [...c, 1];
 }
