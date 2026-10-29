@@ -1,4 +1,4 @@
-// Génère assets/glass.ico (logo de Glass) : carré arrondi en dégradé néon, reflet de verre, double croche blanche.
+// Génère assets/glass.ico (logo de Glass, « onde » par défaut) et assets/logos/*.png (logos au choix dans Réglages).
 // Usage : node assets/make_logo.js   (le .ico est ensuite intégré à Glass.exe via glass.rc ; glass-1024.png sert à l'icône Mac)
 const fs = require('fs'), zlib = require('zlib'), path = require('path');
 
@@ -32,8 +32,35 @@ const conic = a => {  // couleur de l'anneau selon l'angle : rose -> violet -> c
   return mix(cs[i], cs[i + 1], f * f * (3 - 2 * f));
 };
 
+const smooth = (a, b, v) => { const t = clamp((v - a) / (b - a)); return t * t * (3 - 2 * t); };
+const grad3 = t => t < 0.5 ? mix(PINK, VIOLET, t * 2) : mix(VIOLET, CYAN, (t - 0.5) * 2);
+
+// Les logos proposés : blanc sur noir, un seul symbole musical.
+// Chacun donne la couleur d'un point (x, y) de [0,1]², [r, g, b, a].
+const BLACK = [0.06, 0.06, 0.06], WHITE = [1, 1, 1];
+const mono = shape => (x, y) => squircle(x, y) > 0 ? [0, 0, 0, 0] : [...(shape(x, y) ? WHITE : BLACK), 1];
+const VARIANTS = {
+  onde: mono((x, y) => [0.18, 0.34, 0.46, 0.3, 0.2].some((h, i) => sdCapsule(x, y, 0.3 + i * 0.1, 0.5 - h / 2, 0.3 + i * 0.1, 0.5 + h / 2, 0.034) < 0)),
+  vinyle: mono((x, y) => {
+    const r = Math.hypot(x - 0.5, y - 0.5);
+    return r < 0.3 && Math.abs(r - 0.2) > 0.009 && r > 0.04;  // disque, un sillon, le trou
+  }),
+  casque: mono((x, y) => {
+    const r = Math.hypot(x - 0.5, y - 0.52);
+    const band = r > 0.2 && r < 0.245 && y < 0.56;
+    const cup = sdRoundBox(x, y, 0.315, 0.62, 0.045, 0.1, 0.04) < 0 || sdRoundBox(x, y, 0.685, 0.62, 0.045, 0.1, 0.04) < 0;
+    return band || cup;
+  }),
+  son: mono((x, y) => {
+    const cx = 0.34, dx = x - cx, dy = y - 0.5, r = Math.hypot(dx, dy), a = Math.abs(Math.atan2(dy, dx));
+    return r < 0.065 || (a < 0.85 && (Math.abs(r - 0.18) < 0.032 || Math.abs(r - 0.3) < 0.032));
+  }),
+};
+const ALL = {anneau: sampleRing, ...VARIANTS};
+const DEFAULT = process.argv[2] || 'onde';  // logo intégré à Glass.exe / Glass.app
+
 // Couleur (simple « over ») d'un point du logo dans [0,1]² : fond sombre, anneau de verre en dégradé, croche blanche.
-function sample(x, y) {
+function sampleRing(x, y) {
   const sq = squircle(x, y);
   if (sq > 0) return [0, 0, 0, 0];
   let c = mix([0.11, 0.07, 0.21], [0.03, 0.025, 0.07], clamp(x * 0.4 + y * 0.6));
@@ -54,7 +81,7 @@ function sample(x, y) {
   return [...c, 1];
 }
 
-function render(n) {
+function render(n, sample = (x, y) => ALL[DEFAULT](x, y)) {
   const ss = n <= 32 ? 6 : 4, px = Buffer.alloc(n * n * 4);
   for (let py = 0; py < n; py++) for (let pxx = 0; pxx < n; pxx++) {
     let r = 0, g = 0, b = 0, a = 0;
@@ -96,4 +123,8 @@ const dir = sizes.map((n, i) => {
 fs.writeFileSync(path.join(__dirname, 'glass.ico'), Buffer.concat([head, ...dir, ...pngs]));
 fs.writeFileSync(path.join(__dirname, 'glass-256.png'), pngs[pngs.length - 1]);
 fs.writeFileSync(path.join(__dirname, 'glass-1024.png'), png(1024, render(1024)));  // icône Mac (Glass.icns, fabriquée par la compilation Mac)
-console.log('glass.ico :', sizes.join(', '));
+console.log('glass.ico :', sizes.join(', '), '(' + DEFAULT + ')');
+// tous les logos, au choix dans Réglages > Logo de Glass (téléchargés depuis GitHub quand on en choisit un)
+fs.mkdirSync(path.join(__dirname, 'logos'), {recursive: true});
+for (const [name, f] of Object.entries(VARIANTS)) fs.writeFileSync(path.join(__dirname, 'logos', name + '.png'), png(256, render(256, f)));
+console.log('logos :', Object.keys(VARIANTS).join(', '));

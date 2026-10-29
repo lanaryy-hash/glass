@@ -171,6 +171,9 @@ static std::string toUri(const std::string& s) {
     if (s.find("youtu") != std::string::npos) {  // YouTube / YouTube Music : playlist (list=) sinon vidéo (v=, youtu.be/, shorts/)
         if (std::regex_search(s, m, std::regex(R"([?&]list=([A-Za-z0-9_-]+))"))) return "https://www.youtube.com/playlist?list=" + m[1].str();
         if (std::regex_search(s, m, std::regex(R"((youtu\.be/|[?&]v=|/shorts/)([A-Za-z0-9_-]{11}))"))) return "https://www.youtube.com/watch?v=" + m[2].str();
+        // chaîne (@nom, channel/, c/) : ses vidéos ; album ou artiste de YouTube Music (browse/) : tel quel, yt-dlp sait le lire
+        if (std::regex_search(s, m, std::regex(R"(music\.youtube\.com/browse/[^/?#\s"]+)"))) return "https://" + m[0].str();
+        if (std::regex_search(s, m, std::regex(R"(youtube\.com/((@|channel/|c/)[^/?#\s"]+))"))) return "https://www.youtube.com/" + m[1].str() + "/videos";
     }
     if (std::regex_search(s, m, std::regex(R"(music\.apple\.com/[a-z]{2}/(playlist|album)/[^?#\s"]+)"))) return "https://" + m[0].str();
     if (std::regex_search(s, m, std::regex(R"((playlist|album)[/:]([A-Za-z0-9]{22}))"))) return "spotify:" + m[1].str() + ":" + m[2].str();
@@ -181,7 +184,7 @@ static std::string toUri(const std::string& s) {
 static bool isSoundcloud(const std::string& uri) { return uri.rfind("https://soundcloud.com/", 0) == 0 || uri.rfind("https://on.soundcloud.com/", 0) == 0; }
 // Apple Music : lien public (https://music.apple.com/...) ou playlist de ton compte ("am:<id>")
 // YouTube : lien de playlist ou de vidéo ; titres "youtube:video:<id>"
-static bool isYoutube(const std::string& uri) { return uri.rfind("https://www.youtube.com/", 0) == 0; }
+static bool isYoutube(const std::string& uri) { return uri.rfind("https://www.youtube.com/", 0) == 0 || uri.rfind("https://music.youtube.com/", 0) == 0; }
 static bool isApple(const std::string& uri) { return uri.rfind("https://music.apple.com/", 0) == 0 || uri.rfind("am:", 0) == 0; }
 static bool isAlbum(const std::string& uri) { return uri.rfind("spotify:album", 0) == 0 || (isApple(uri) && uri.find("/album/") != std::string::npos); }
 
@@ -900,8 +903,9 @@ static void loadYoutube(const std::string& url) {
         if (!y.empty()) {
             std::error_code ec;
             fs::create_directories(items.parent_path(), ec);
-            plat::run({ustr(y), "-q", "--no-warnings", "--flat-playlist", "--skip-download", "--print-to-file", "%()j", ustr(items),
-                       "--print-to-file", "playlist:%(title)s", ustr(title), url}, 120000);
+            for (int attempt = 0; attempt < 2 && !fileExists(items); attempt++)  // YouTube refuse parfois la 1re demande : on réessaie une fois
+                plat::run({ustr(y), "-q", "--no-warnings", "--flat-playlist", "--skip-download", "--print-to-file", "%()j", ustr(items),
+                           "--print-to-file", "playlist:%(title)s", ustr(title), url}, 120000);
             std::istringstream in(readFile(items));
             for (std::string line; std::getline(in, line);) {
                 json v = json::parse(line, nullptr, false);
@@ -916,7 +920,8 @@ static void loadYoutube(const std::string& url) {
             fs::remove(items, ec); fs::remove(title, ec);
         }
         if (name.empty() && tracks.size() == 1) name = tracks[0].title;
-        fillList(url, name, tracks.empty() ? "" : tracks[0].image, tracks, y.empty() ? kNoYtdlp : "YouTube : impossible de lire ce lien (privé ?)");
+        fillList(url, name, tracks.empty() ? "" : tracks[0].image, tracks, y.empty() ? kNoYtdlp : url.size() > 7 && url.compare(url.size() - 7, 7, "/videos") == 0 ? "YouTube : cette chaîne n'a pas de vidéos, colle le lien d'un album ou d'une playlist"
+                                                                                           : "YouTube : impossible de lire ce lien (privé ?)");
     }).detach();
 }
 static std::vector<LyricLine> cleanLrc(const fs::path& path, double scale) { return parseLrc(readFile(path), scale); }
@@ -2509,6 +2514,7 @@ static void toggleMiniLyrics() {  // agrandit le mini-lecteur vers le haut pour 
 }
 
 // ---------- logo (choisi dans les réglages) ----------
+static bool g_logoDirty = false;  // un logo vient d'être téléchargé : à appliquer
 static std::string logoSrc() { return g_set.logo.empty() ? std::string("icon:") : g_set.logo; }
 
 static void applyLogo() {  // icône de la fenêtre / barre des tâches / Dock
@@ -2598,22 +2604,25 @@ static void titleBar(ImGuiViewport* vp, float tb) {
 #ifdef __APPLE__
     ImVec2 o = vp->Pos + ImVec2{70 * S, 0};
     const int nb = 1;
+    const float cy = 14 * S;  // à la hauteur des boutons ronds du Mac (barre de titre standard de 28 points)
 #else
     ImVec2 o = vp->Pos;
     const int nb = 4;
+    const float cy = tb * 0.5f;
 #endif
     std::string ls = logoSrc();
     if (ImTextureID logo = tex(ls, 64)) {
         ImVec2 d = g_texDim[ls + "|64"], uv0{0, 0}, uv1{1, 1};  // image pas carrée : on garde le centre
         if (d.x > d.y && d.x > 0) { uv0.x = (1 - d.y / d.x) / 2; uv1.x = 1 - uv0.x; }
         if (d.y > d.x && d.y > 0) { uv0.y = (1 - d.x / d.y) / 2; uv1.y = 1 - uv0.y; }
-        dl->AddImageRounded(logo, o + ImVec2{14 * S, tb * 0.5f - 10 * S}, o + ImVec2{34 * S, tb * 0.5f + 10 * S}, uv0, uv1, IM_COL32_WHITE, 5 * S);
-    } else dl->AddCircleFilled(o + ImVec2{24 * S, tb * 0.5f}, 7 * S, accU());
-    dl->AddText(g_bold, 15 * S, o + ImVec2{38 * S, tb * 0.5f - 10 * S}, col(1, 1, 1, 0.95f), "Glass");
+        dl->AddImageRounded(logo, o + ImVec2{14 * S, cy - 10 * S}, o + ImVec2{34 * S, cy + 10 * S}, uv0, uv1, IM_COL32_WHITE, 5 * S);
+    } else dl->AddCircleFilled(o + ImVec2{24 * S, cy}, 7 * S, accU());
+    float th = g_bold->CalcTextSizeA(15 * S, FLT_MAX, 0, "Glass").y;  // centré quelle que soit la police (Segoe UI, Inter)
+    dl->AddText(g_bold, 15 * S, o + ImVec2{40 * S, cy - th * 0.5f}, col(1, 1, 1, 0.95f), "Glass");
     o = vp->Pos;
     if (!g_status.empty()) {
         ImVec2 ts = ImGui::CalcTextSize(g_status.c_str());
-        textAt(dl, o + ImVec2{std::max(120 * S, (vp->Size.x - ts.x) * 0.5f), tb * 0.5f - 9 * S}, vp->Size.x * 0.5f, col(1, 1, 1, 0.6f), g_status);
+        textAt(dl, o + ImVec2{std::max(120 * S, (vp->Size.x - ts.x) * 0.5f), cy - ImGui::GetFontSize() * 0.5f}, vp->Size.x * 0.5f, col(1, 1, 1, 0.6f), g_status);
     }
     float bw = 46 * S;
     g_updRect = {};
@@ -3268,6 +3277,38 @@ static void settingsView() {
     label("Lueurs néon");
     changed |= ImGui::SliderFloat("##neon", &g_set.neon, 0, 1, g_set.neon > 0 ? "%.2f" : "aucune");
     label("Logo de Glass");
+    {  // logos dessinés pour Glass (assets/logos du dépôt GitHub) : clic = téléchargé une fois, puis appliqué
+        static const char* logos[] = {"onde", "vinyle", "casque", "son"};
+        float ls = 46 * S;
+        for (int i = 0; i < (int)std::size(logos); i++) {
+            if (i) ImGui::SameLine(0, 8 * S);
+            std::string url = std::string("https://raw.githubusercontent.com/") + kRepo + "/main/assets/logos/" + logos[i] + ".png";
+            fs::path file = g_dir / "logos" / (std::string(logos[i]) + ".png");
+            ImGui::PushID(i);
+            ImVec2 p = ImGui::GetCursorScreenPos();
+            if (ImGui::InvisibleButton("##lg", {ls, ls})) {
+                if (fileExists(file)) { g_set.logo = ustr(file); applyLogo(); changed = true; }
+                else std::thread([url, file] {
+                    std::string png = plat::httpGet(url);
+                    std::error_code ec;
+                    fs::create_directories(file.parent_path(), ec);
+                    if (png.rfind("\x89PNG", 0) == 0) std::ofstream(file, std::ios::binary) << png;  // une vraie image, pas une page d'erreur
+                    std::lock_guard lk(g_mx);
+                    if (fileExists(file)) { g_set.logo = ustr(file); g_logoDirty = true; } else g_status = "Logo : téléchargement impossible";
+                    wake();
+                }).detach();
+            }
+            ImGui::SetItemTooltip("%s", logos[i]);
+            bool on = g_set.logo == ustr(file), hov = ImGui::IsItemHovered();
+            ImDrawList* dl = ImGui::GetWindowDrawList();
+            if (ImTextureID t = tex(fileExists(file) ? ustr(file) : url, 96)) dl->AddImage(t, p, p + ImVec2{ls, ls});
+            else dl->AddRectFilled(p, p + ImVec2{ls, ls}, col(1, 1, 1, 0.06f), 10 * S);
+            if (on || hov) dl->AddRect(p - ImVec2{3 * S, 3 * S}, p + ImVec2{ls + 3 * S, ls + 3 * S}, on ? accU() : col(1, 1, 1, 0.5f), 12 * S, 0, (on ? 2.5f : 1.5f) * S);
+            ImGui::PopID();
+        }
+        ImGui::SameLine(0, 14 * S);
+        ImGui::SetCursorPosY(ImGui::GetCursorPosY() + (ls - ImGui::GetFrameHeight()) * 0.5f);
+    }
     if (ImGui::Button("Choisir une image...##logo")) g_pick = 4;
     if (!g_set.logo.empty()) { ImGui::SameLine(); if (ImGui::Button("Logo d'origine")) { g_set.logo.clear(); applyLogo(); changed = true; } }
     ImGui::SameLine(); ImGui::TextDisabled("(barre de titre, barre des tâches / Dock ; image carrée conseillée)");
@@ -4536,6 +4577,7 @@ bool app::tick() {
         for (auto& [id, m] : g_wvOut) plat::webPost(id, m);
         g_wvOut.clear();
         if (g_has) plat::nowPlaying(g_cur.title, g_cur.artist, isPlaying());
+        if (g_logoDirty) { g_logoDirty = false; applyLogo(); saveSettings(); }  // logo téléchargé : appliqué depuis le fil de la fenêtre (Dock du Mac)
         updateDiscord();
         if (now() - g_updT > 6 * 3600) { g_updT = now(); checkUpdate(); }
         pick = g_pick; g_pick = 0;
