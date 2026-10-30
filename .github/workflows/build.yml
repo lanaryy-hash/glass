@@ -32,7 +32,7 @@ jobs:
           path: Glass-windows.zip
 
   mac:
-    runs-on: macos-14
+    runs-on: macos-15  # macos-14 retiré par GitHub (nov. 2026)
     env:
       MACOSX_DEPLOYMENT_TARGET: "12.0"
     steps:
