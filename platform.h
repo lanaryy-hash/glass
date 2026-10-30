@@ -68,6 +68,7 @@ std::vector<fs::path> pick(int kind);  // 1 fichiers audio, 2 dossier, 3 image
 bool maximized();
 void minimize();
 void toggleMaximize();
+void setFullscreen(bool on);  // tout l'écran (lecteur plein écran), puis la taille d'avant
 void close();
 void setTopmost(bool on);
 void enterMini(int w, int h);

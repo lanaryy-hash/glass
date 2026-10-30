@@ -526,6 +526,16 @@ static bool g_wasZoomed = false;
 bool plat::maximized() { return IsZoomed(g_hwnd); }
 void plat::minimize() { ShowWindow(g_hwnd, SW_MINIMIZE); }
 void plat::toggleMaximize() { ShowWindow(g_hwnd, IsZoomed(g_hwnd) ? SW_RESTORE : SW_MAXIMIZE); }
+void plat::setFullscreen(bool on) {  // fenêtre sur tout l'écran (barre des tâches comprise), puis remise exactement comme avant
+    static WINDOWPLACEMENT saved{sizeof saved};
+    if (!on) { SetWindowPlacement(g_hwnd, &saved); return; }
+    GetWindowPlacement(g_hwnd, &saved);
+    MONITORINFO mi{sizeof mi};
+    GetMonitorInfoW(MonitorFromWindow(g_hwnd, MONITOR_DEFAULTTONEAREST), &mi);
+    if (IsZoomed(g_hwnd)) ShowWindow(g_hwnd, SW_RESTORE);
+    const RECT& r = mi.rcMonitor;
+    SetWindowPos(g_hwnd, HWND_TOP, r.left, r.top, r.right - r.left, r.bottom - r.top, SWP_FRAMECHANGED);
+}
 void plat::close() { PostMessageW(g_hwnd, WM_CLOSE, 0, 0); }
 void plat::setTopmost(bool on) { SetWindowPos(g_hwnd, on ? HWND_TOPMOST : HWND_NOTOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE); }
 

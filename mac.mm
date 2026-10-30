@@ -559,6 +559,9 @@ static void trafficLights(bool show) {  // boutons ronds du Mac : cachés dans l
 bool plat::maximized() { return glfwGetWindowAttrib(g_win, GLFW_MAXIMIZED); }
 void plat::minimize() { glfwIconifyWindow(g_win); }
 void plat::toggleMaximize() { if (maximized()) glfwRestoreWindow(g_win); else glfwMaximizeWindow(g_win); }
+void plat::setFullscreen(bool on) {  // plein écran du Mac (son propre Space), comme Apple Music
+    if (((g_ns.styleMask & NSWindowStyleMaskFullScreen) != 0) != on) [g_ns toggleFullScreen:nil];
+}
 void plat::close() { glfwSetWindowShouldClose(g_win, GLFW_TRUE); }
 void plat::setTopmost(bool on) { glfwSetWindowAttrib(g_win, GLFW_FLOATING, on); }
 

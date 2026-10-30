@@ -128,6 +128,7 @@ static std::vector<std::pair<int, std::string>> g_wvOut;  // messages JSON pour 
 // interface
 static int g_pick = 0;                  // boîtes de dialogue (hors du verrou) : 1 fichiers, 2 dossier, 3 image de pochette, 4 logo, 5 fond Evangelion, 6 importer un thème, 7 exporter un thème, 8 pochette d'un titre
 static std::string g_pickUri;           // liste dont on choisit la pochette
+static bool g_full = false;             // lecteur plein écran (façon Apple Music)
 static bool g_lyricsOpen = false, g_mini = false, g_openPerso = false, g_openNew = false, g_focusSearch = false;
 static std::string g_editUri;           // liste en cours de personnalisation
 static std::vector<Track> g_pendingAdd; // titres à mettre dans la nouvelle playlist
@@ -2534,6 +2535,21 @@ static void drawBackground(ImGuiViewport* vp) {
     ImVec4 tint{g_set.tint[0], g_set.tint[1], g_set.tint[2], 1};
     int bg = g_set.bg;
     g_animBg = false;
+    if (g_full) {  // plein écran : la pochette floutée en grand, qui dérive lentement (comme Apple Music)
+        Track* t = current();
+        float tm = g_set.animations ? (float)ImGui::GetTime() : 0, W = b.x - a.x, H = b.y - a.y, R = std::max(W, H) * 0.75f;
+        if (g_set.animations) g_animBg = true;
+        ImVec2 c{a.x + W * (0.5f + 0.06f * sinf(tm * 0.07f)), a.y + H * (0.5f + 0.06f * cosf(tm * 0.05f))};
+        float z = R * (1.0f + 0.08f * sinf(tm * 0.04f));
+        dl->AddRectFilled(a, b, col(0.02f, 0.02f, 0.03f));
+        if (ImTextureID tx = t ? tex(t->image, 64, true) : 0) {
+            dl->AddImage(tx, c - ImVec2{z, z}, c + ImVec2{z, z});
+            if (auto it = g_pal.find(t->image); it != g_pal.end())  // deux taches de couleur de la pochette qui tournent
+                for (int i = 0; i < 2; i++) glow(dl, {a.x + W * (0.5f + 0.35f * cosf(tm * 0.09f + i * 3.1f)), a.y + H * (0.5f + 0.3f * sinf(tm * 0.11f + i * 3.1f))}, R * 0.7f, it->second.c[i], 0.35f);
+        }
+        dl->AddRectFilledMultiColor(a, b, col(0, 0, 0, 0.55f), col(0, 0, 0, 0.45f), col(0, 0, 0, 0.62f), col(0, 0, 0, 0.72f));  // pochettes claires : texte lisible
+        return;
+    }
     if (g_mini) {  // mini-lecteur : toujours la pochette floutée (comme le lecteur d'Apple), assombrie pour le texte
         Track* t = current();
         float v = std::max(0.f, (1 - (b.y - a.y) / (b.x - a.x)) * 0.5f);  // fenêtre large : on garde la bande du milieu
@@ -2609,7 +2625,9 @@ static void setTopmost() { plat::setTopmost(g_set.topmost || g_mini); }
 static bool g_miniLyrics = false;
 static int miniHeight() { return (int)((g_miniLyrics ? 272 : 156) * S); }
 
+static void toggleFull();
 static void toggleMini() {
+    if (g_full) toggleFull();  // on quitte le plein écran d'abord (taille de fenêtre d'avant)
     g_mini = !g_mini;
     if (g_mini) plat::enterMini((int)(440 * S), miniHeight());  // en bas à droite de l'écran
     else plat::leaveMini();                                      // taille d'avant, même si la fenêtre était agrandie
@@ -3017,16 +3035,18 @@ static void ensureLyrics(const Track& t) {
     else if (g_lyrState == 3 && !fileExists(lyricsFile(t, ".none"))) listenLyrics(t, {}, g_set.autoLyrics);
 }
 
-static void lyricsView() {
+static void lyricsView(bool header = true) {  // header = false : colonne des paroles du lecteur plein écran
     Track* t = current();
     if (!t) { ImGui::Dummy({0, 80 * S}); centerText("Play a song to see its lyrics.", g_bold, 22, col(1, 1, 1, 0.6f)); return; }
     ensureLyrics(*t);
-    ImDrawList* dl = ImGui::GetWindowDrawList();
-    ImVec2 p = ImGui::GetCursorScreenPos();
-    coverAt(dl, t->image, "", p, 64 * S, 8 * S);
-    textAt(dl, p + ImVec2{80 * S, 8 * S}, ImGui::GetContentRegionAvail().x - 90 * S, col(1, 1, 1), t->title, g_bold, 22);
-    textAt(dl, p + ImVec2{80 * S, 38 * S}, ImGui::GetContentRegionAvail().x - 90 * S, col(1, 1, 1, 0.6f), t->artist);
-    ImGui::Dummy({0, 76 * S});
+    if (header) {
+        ImDrawList* dl = ImGui::GetWindowDrawList();
+        ImVec2 p = ImGui::GetCursorScreenPos();
+        coverAt(dl, t->image, "", p, 64 * S, 8 * S);
+        textAt(dl, p + ImVec2{80 * S, 8 * S}, ImGui::GetContentRegionAvail().x - 90 * S, col(1, 1, 1), t->title, g_bold, 22);
+        textAt(dl, p + ImVec2{80 * S, 38 * S}, ImGui::GetContentRegionAvail().x - 90 * S, col(1, 1, 1, 0.6f), t->artist);
+        ImGui::Dummy({0, 76 * S});
+    }
     if (g_lyrState != 2) {
         ImGui::Dummy({0, 60 * S});
         const char* msg = g_lyrState == 1 ? "Loading lyrics..."
@@ -3051,7 +3071,7 @@ static void lyricsView() {
     double pos = posMs() + off;
     int curLine = -1;
     if (g_lyrSynced) for (int i = 0; i < (int)g_lyr.size(); i++) if (g_lyr[i].t <= pos + 120) curLine = i;
-    if (g_lyrSynced) {  // petite barre : décalage
+    if (g_lyrSynced && header) {  // petite barre : décalage
         ImGui::SetCursorPos({ImGui::GetWindowContentRegionMax().x - 330 * S, ImGui::GetCursorPosY() - 64 * S});
         ImGui::TextDisabled("Offset %+.1f s", off / 1000.0);
         ImGui::SameLine();
@@ -4245,6 +4265,9 @@ static void playerBar() {
 
     // droite : paroles, file, plus, volume
     float vw = 100 * S, rx = o.x + w - vw - 30 * S - 34 * S * 3;
+    ImGui::SetCursorScreenPos({rx - 34 * S, cy - 17 * S});
+    if (iconBtn("full", I_EXPAND, 34 * S)) toggleFull();
+    ImGui::SetItemTooltip("Full screen player (F11)");
     ImGui::SetCursorScreenPos({rx, cy - 17 * S});
     if (iconBtn("lyrics", I_LYRICS, 34 * S, g_lyricsOpen)) g_lyricsOpen = !g_lyricsOpen;
     ImGui::SetItemTooltip("Lyrics (Ctrl+L)");
@@ -4374,6 +4397,87 @@ static void miniPlayer(ImGuiViewport* vp) {  // fenêtre compacte, toujours au p
         if (g_set.neon > 0 && cur >= 0) glow(dl, {cx, ly + 50 * S}, mw * 0.35f, a4, 0.18f * g_set.neon);
         centeredLine(dl, cx, ly + 36 * S, mw, cur >= 0 ? line(cur) : std::string(u8"• • •"), g_bold, 19, col(1, 1, 1, 0.45f), col(1, 1, 1), g_lyrSynced ? fill : 1);
         centeredLine(dl, cx, ly + 74 * S, mw, line(cur + 1), ImGui::GetFont(), 14, col(1, 1, 1, 0.35f), 0, 0);
+    }
+}
+
+static void toggleMini();
+static void toggleFull() {  // lecteur plein écran ; Échap ou F11 pour sortir
+    if (g_mini) toggleMini();
+    g_full = !g_full;
+    plat::setFullscreen(g_full);
+}
+
+// Lecteur plein écran façon Apple Music : grande pochette et commandes à gauche, paroles synchronisées à droite.
+static void fullPlayer(ImGuiViewport* vp) {
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    ImVec2 o = vp->Pos, sz = vp->Size;
+    Track* t = current();
+    bool lyr = sz.x > 1000 * S;  // assez large : les paroles à droite
+    float cs = std::min(lyr ? sz.x * 0.3f : sz.x * 0.5f, sz.y * 0.5f), cx = o.x + (lyr ? sz.x * 0.28f : sz.x * 0.5f), x0 = cx - cs / 2;
+    float y0 = o.y + std::max(70 * S, (sz.y - cs - 250 * S) * 0.5f);
+
+    // en haut à gauche : quitter le plein écran
+    ImGui::SetCursorScreenPos(o + ImVec2{20 * S, 18 * S});
+    if (iconBtn("fexit", I_MINI, 36 * S)) toggleFull();
+    ImGui::SetItemTooltip("Exit full screen (Esc)");
+
+    // pochette avec une ombre douce, qui respire un peu en pause (comme Apple Music)
+    float k = animTo(ImGui::GetID("##fcov"), isPlaying() || !t ? 1.f : 0.86f, 6), c2 = cs * k;
+    ImVec2 cp{cx - c2 / 2, y0 + (cs - c2) / 2};
+    glow(dl, cp + ImVec2{c2, c2} * 0.5f + ImVec2{0, 18 * S}, c2 * 0.85f, ImVec4{0, 0, 0, 1}, 0.55f);
+    coverAt(dl, t ? t->image : "icon:", "", cp, c2, 16 * S);
+
+    // titre, artiste, favori
+    float ty = y0 + cs + 26 * S;
+    textAt(dl, {x0, ty}, cs - 44 * S, col(1, 1, 1), t ? t->title : "Glass", g_bold, 24);
+    textAt(dl, {x0, ty + 32 * S}, cs - 44 * S, col(1, 1, 1, 0.65f), t ? t->artist : "Nothing playing", nullptr, 18);
+    ImGui::SetCursorScreenPos({x0 + cs - 38 * S, ty + 6 * S});
+    bool fav = t && isFav(t->uri);
+    if (iconBtn("ffav", fav ? I_HEART : I_HEART_O, 38 * S, fav) && t) toggleFav(*t);
+
+    // progression
+    static float sv = 0;
+    static bool drag = false;
+    double dur = durMs();
+    if (!drag) sv = (float)posMs();
+    float py = ty + 70 * S;
+    ImGui::SetCursorScreenPos({x0, py});
+    bool rel = scrub("##fseek", &sv, (float)std::max(dur, 1.0), cs);
+    drag = ImGui::IsItemActive();
+    if (rel && t) seekMs(sv);
+    std::string a1 = g_loading && t ? "..." : fmtTime(sv), a2 = "-" + fmtTime(std::max(0.0, dur - sv));
+    float fs = 13 * S * g_set.textScale;
+    dl->AddText(ImGui::GetFont(), fs, {x0, py + 20 * S}, col(1, 1, 1, 0.55f), a1.c_str());
+    dl->AddText(ImGui::GetFont(), fs, {x0 + cs - ImGui::GetFont()->CalcTextSizeA(fs, FLT_MAX, 0, a2.c_str()).x, py + 20 * S}, col(1, 1, 1, 0.55f), a2.c_str());
+
+    // commandes
+    float ps = 66 * S, bs = 44 * S, gap = 18 * S, row = bs * 4 + ps + gap * 4, bx = cx - row / 2, by = py + 46 * S;
+    ImGui::SetCursorScreenPos({bx, by + (ps - bs) / 2});
+    if (iconBtn("fshuf", I_SHUFFLE, bs, g_shuffle)) toggleShuffle();
+    ImGui::SetCursorScreenPos({bx + bs + gap, by + (ps - bs) / 2});
+    if (iconBtn("fprev", I_PREV, bs)) { if (posMs() > 3000) seekMs(0); else step(-1); }
+    ImGui::SetCursorScreenPos({bx + (bs + gap) * 2, by});
+    if (playBtn("fplay", ps, isPlaying() || g_loading, col(1, 1, 1), col(0, 0, 0))) togglePlay();
+    ImGui::SetCursorScreenPos({bx + (bs + gap) * 2 + ps + gap, by + (ps - bs) / 2});
+    if (iconBtn("fnext", I_NEXT, bs)) step(1);
+    ImGui::SetCursorScreenPos({bx + (bs + gap) * 3 + ps + gap, by + (ps - bs) / 2});
+    if (iconBtn("frep", I_REPEAT1, bs, g_repeat)) g_repeat = !g_repeat;
+
+    // volume
+    float vy = by + ps + 26 * S, vw = cs * 0.7f;
+    iconAt(dl, {cx - vw / 2 - 18 * S, vy + 8 * S}, I_VOL, 15 * S, col(1, 1, 1, 0.7f));
+    ImGui::SetCursorScreenPos({cx - vw / 2, vy});
+    float old = g_set.vol;
+    if (scrub("##fvol", &g_set.vol, 1, vw, 0.05f)) saveSettings();
+    if (g_set.vol != old) setVolume();
+
+    // paroles à droite, synchronisées (la vue paroles de Glass, sans son en-tête)
+    if (lyr) {
+        float lx = o.x + sz.x * 0.52f;
+        ImGui::SetCursorScreenPos({lx, o.y + 60 * S});
+        ImGui::BeginChild("fulllyr", {o.x + sz.x - 60 * S - lx, sz.y - 120 * S}, 0, ImGuiWindowFlags_NoBackground | ImGuiWindowFlags_NoScrollbar);
+        lyricsView(false);
+        ImGui::EndChild();
     }
 }
 
@@ -4606,6 +4710,9 @@ static void drawUI() {
     if (g_mini) {
         if (g_set.neon > 0) neonRect(ImGui::GetBackgroundDrawList(), vp->Pos + ImVec2{3 * S, 3 * S}, vp->Pos + vp->Size - ImVec2{3 * S, 3 * S}, 10 * S, g_set.neon);
         miniPlayer(vp);
+    } else if (g_full) {
+        fullPlayer(vp);
+        dialogs();
     } else {
         float tb = 42 * S, gap = 10 * S, barH = 100 * S, sideW = 290 * S;
         titleBar(vp, tb);
@@ -4661,6 +4768,7 @@ static void drawUI() {
         if (ImGui::IsKeyChordPressed(ImGuiMod_Ctrl | ImGuiKey_L)) g_lyricsOpen = !g_lyricsOpen;
         if (ImGui::IsKeyChordPressed(ImGuiMod_Ctrl | ImGuiKey_Q)) { g_view = "queue"; g_lyricsOpen = false; }
         if (ImGui::IsKeyChordPressed(ImGuiMod_Ctrl | ImGuiKey_M)) toggleMini();
+        if (ImGui::IsKeyPressed(ImGuiKey_F11, false) || (g_full && ImGui::IsKeyPressed(ImGuiKey_Escape, false))) toggleFull();
         float dv = ImGui::IsKeyChordPressed(ImGuiMod_Ctrl | ImGuiKey_UpArrow) ? 0.05f : ImGui::IsKeyChordPressed(ImGuiMod_Ctrl | ImGuiKey_DownArrow) ? -0.05f : 0;
         if (dv) { g_set.vol = std::clamp(g_set.vol + dv, 0.f, 1.f); setVolume(); saveSettings(); }
     }
@@ -4823,7 +4931,8 @@ void app::media(int cmd) {
 }
 
 bool app::caption(float x, float y, float w, float) {
-    if (g_mini) return x < 140 * S || y < 8 * S || y > 146 * S;  // pochette, bord haut, paroles = poignée
+    if (g_full) return false;  // plein écran : rien à déplacer
+    if (g_mini) return x < 140 * S || y < 8 * S || y > 156 * S;  // pochette, bord haut, paroles = poignée  // pochette, bord haut, paroles = poignée
     if (x >= g_updRect.x && x < g_updRect.x + g_updRect.z && y >= g_updRect.y && y < g_updRect.y + g_updRect.w) return false;
 #ifdef __APPLE__
     return y < 42 * S && x > 70 * S && x < w - 46 * S;  // boutons ronds du Mac à gauche, mini-lecteur à droite
