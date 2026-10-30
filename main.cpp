@@ -236,6 +236,17 @@ static void saveLocal() {
     if (List* l = findList("local"))
         for (auto& t : l->tracks) f << t.uri << '\t' << t.title << '\t' << t.artist << '\t' << t.album << '\t' << t.ms << '\n';
 }
+static std::map<std::string, std::vector<Track>> g_extras;  // playlist Spotify -> sons ajoutés dans Glass seulement (extras.json)
+static void saveExtras() {
+    json j = json::object();
+    for (auto& [uri, ts] : g_extras) if (!ts.empty()) { json a = json::array(); for (auto& t : ts) a.push_back(trackJson(t)); j[uri] = a; }
+    std::ofstream(g_dir / "extras.json") << j.dump();
+}
+static bool isExtra(const std::string& list, const std::string& uri) {
+    auto it = g_extras.find(list);
+    return it != g_extras.end() && std::any_of(it->second.begin(), it->second.end(), [&](const Track& x) { return x.uri == uri; });
+}
+
 static void saveMine() {  // playlists créées dans Glass (dont Favoris et Récents)
     json a = json::array();
     for (auto& l : g_lists) if (l.own) {
@@ -258,6 +269,18 @@ static void applyOverride(List& l) {
 }
 static Track g_coverTrack;                // titre dont on change la pochette
 static bool g_openCover = false;
+static void applyExtras() {  // g_mx tenu
+    static size_t sig = SIZE_MAX;
+    size_t s = g_extras.size();
+    for (auto& [uri, ts] : g_extras) if (List* l = findList(uri)) s = s * 31 + l->tracks.size() + l->loaded + ts.size();
+    if (s == sig) return;
+    sig = s;
+    for (auto& [uri, ts] : g_extras)
+        if (List* l = findList(uri); l && l->loaded)
+            for (auto& t : ts)
+                if (std::none_of(l->tracks.begin(), l->tracks.end(), [&](const Track& x) { return x.uri == t.uri; })) l->tracks.push_back(t);
+}
+
 static void applyTrackCovers(bool force = false) {  // g_mx tenu ; repasse seulement quand une liste change
     static size_t sig = SIZE_MAX;
     size_t s = g_over.size();
@@ -296,6 +319,10 @@ static void loadSaved() {
     std::ifstream o((g_dir / "overrides.json"));
     json ov = json::parse(o, nullptr, false);
     if (ov.is_object()) for (auto& [k, v] : ov.items()) g_over[k] = {jstr(v, "name"), jstr(v, "image")};
+
+    std::ifstream x((g_dir / "extras.json"));
+    json ex = json::parse(x, nullptr, false);
+    if (ex.is_object()) for (auto& [uri, a] : ex.items()) if (a.is_array()) for (auto& t : a) if (Track tr = trackFrom(t); !tr.uri.empty() && !isExtra(uri, tr.uri)) g_extras[uri].push_back(tr);
 
     std::ifstream m((g_dir / "myplaylists.json"));
     json mine = json::parse(m, nullptr, false);
@@ -359,11 +386,20 @@ static void addRecent(const Track& t) {
     saveMine();
 }
 // Tes playlists Glass, ou tes playlists Spotify (titres Spotify seulement, via le lecteur officiel connecté).
+static bool onSpotify(const List& l, const Track& t) { return l.editable && g_webOk && isSpotifyTrack(t); }  // ajout visible dans l'app Spotify
 static bool canAdd(const List& l, const Track& t) {
-    return (l.own && l.uri != "glass:recent") || (l.editable && g_webOk && isSpotifyTrack(t));
+    return (l.own && l.uri != "glass:recent") || onSpotify(l, t) || l.uri.rfind("spotify:playlist:", 0) == 0;  // sinon : dans Glass seulement
 }
 static void addToList(List& l, const Track& t) {
     bool has = std::any_of(l.tracks.begin(), l.tracks.end(), [&](const Track& x) { return x.uri == t.uri; });
+    if (!l.own && !onSpotify(l, t)) {  // Spotify ne peut pas garder ce son : Glass le garde pour cette playlist
+        if (has || isExtra(l.uri, t.uri)) { g_status = "Already in \"" + l.name + "\""; return; }  // aussi avant d'être remis dans la liste rechargée
+        g_extras[l.uri].push_back(t);
+        if (l.loaded) l.tracks.push_back(t);
+        saveExtras();
+        g_status = "Added to \"" + l.name + "\" (in Glass only)";
+        return;
+    }
     if (l.editable) {  // sur ton compte Spotify : visible aussi dans l'app Spotify
         if (has) { g_status = "Already in \"" + l.name + "\""; return; }
         spWrite("POST", "/v1/playlists/" + l.uri.substr(17) + "/items", {{"uris", {t.uri}}}, "Added to \"" + l.name + "\" (Spotify)", l.uri);
@@ -3685,9 +3721,9 @@ static void trackMenu(List& l, int i, int& removeAt) {
     if (ImGui::BeginMenu("Add to playlist")) {
         for (auto& p : g_lists) if (p.own && canAdd(p, t) && ImGui::MenuItem(p.name.c_str())) addToList(p, t);
         bool sp = false;
-        for (auto& p : g_lists) if (p.editable && canAdd(p, t)) {
+        for (auto& p : g_lists) if (!p.own && !p.hidden && canAdd(p, t)) {
             if (!sp) { sp = true; ImGui::SeparatorText("Spotify"); }
-            if (ImGui::MenuItem(p.name.c_str())) addToList(p, t);
+            if (ImGui::MenuItem(onSpotify(p, t) ? p.name.c_str() : (p.name + "  (in Glass only)").c_str())) addToList(p, t);
         }
         ImGui::Separator();
         if (ImGui::MenuItem("New playlist...")) { g_pendingAdd = {t}; g_openNew = true; }
@@ -3696,7 +3732,12 @@ static void trackMenu(List& l, int i, int& removeAt) {
     if (!t.local && t.uri.rfind("spotify:track:", 0) == 0 && ImGui::MenuItem("Copy Spotify link"))
         ImGui::SetClipboardText(("https://open.spotify.com/track/" + t.uri.substr(14)).c_str());
     if (l.own && ImGui::MenuItem("Remove from this playlist")) removeAt = i;
-    if (l.editable && g_webOk && ImGui::MenuItem("Remove from this playlist")) {  // aussi sur ton compte Spotify
+    if (isExtra(l.uri, t.uri) && ImGui::MenuItem("Remove from this playlist (in Glass only)")) {
+        auto& ex = g_extras[l.uri];
+        ex.erase(std::remove_if(ex.begin(), ex.end(), [&](const Track& x) { return x.uri == t.uri; }), ex.end());
+        saveExtras();
+        removeAt = i;
+    } else if (l.editable && g_webOk && isSpotifyTrack(t) && ImGui::MenuItem("Remove from this playlist")) {  // aussi sur ton compte Spotify
         json item = {{"uri", t.uri}};
         spWrite("DELETE", "/v1/playlists/" + l.uri.substr(17) + "/items", {{"items", json::array({item})}}, "Removed from \"" + l.name + "\" (Spotify)", l.uri);
         removeAt = i;
@@ -4742,6 +4783,7 @@ static void glassPanel(ImDrawList* dl, ImVec2 a, ImVec2 b, float r) {
 
 static void drawUI() {
     ImGuiViewport* vp = ImGui::GetMainViewport();
+    applyExtras();
     applyTrackCovers();
     updateAccent();
     drawBackground(vp);
@@ -4925,8 +4967,8 @@ bool app::tick() {
         for (auto& [id, m] : g_wvOut) plat::webPost(id, m);
         g_wvOut.clear();
         if (g_has) plat::nowPlaying(g_cur.title, g_cur.artist, isPlaying());
-        if (g_logoDirty) { g_logoDirty = false; applyLogo(); saveSettings(); }
-        if (g_fontDirty) { g_fontDirty = false; applyFont(); }  // avant NewFrame : ImGui peut changer de police ici  // logo téléchargé : appliqué depuis le fil de la fenêtre (Dock du Mac)
+        if (g_logoDirty) { g_logoDirty = false; applyLogo(); saveSettings(); }  // logo téléchargé : appliqué depuis le fil de la fenêtre (Dock du Mac)
+        if (g_fontDirty) { g_fontDirty = false; applyFont(); }  // avant NewFrame : ImGui peut changer de police ici
         updateDiscord();
         if (now() - g_updT > 6 * 3600) { g_updT = now(); checkUpdate(); }
         pick = g_pick; g_pick = 0;
