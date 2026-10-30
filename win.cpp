@@ -61,7 +61,7 @@ std::string plat::httpGet(const std::string& url, const std::string& headers) {
     std::wstring wh = widen(headers);
     HINTERNET net = InternetOpenW(L"Glass", INTERNET_OPEN_TYPE_PRECONFIG, nullptr, nullptr, 0);
     HINTERNET h = net ? InternetOpenUrlW(net, widen(url).c_str(), wh.empty() ? nullptr : wh.c_str(), wh.empty() ? 0 : (DWORD)-1L,
-                                         INTERNET_FLAG_SECURE | (wh.empty() ? 0 : INTERNET_FLAG_RELOAD | INTERNET_FLAG_NO_CACHE_WRITE), 0) : nullptr;  // avec une session : jamais de cache
+                                         INTERNET_FLAG_SECURE | INTERNET_FLAG_NO_COOKIES | (wh.empty() ? 0 : INTERNET_FLAG_RELOAD | INTERNET_FLAG_NO_CACHE_WRITE), 0) : nullptr;  // avec une session : jamais de cache ; sans cookies : certaines API (NetEase) renvoient de faux résultats aux clients qui en gardent
     char buf[16384]; DWORD n;
     while (h && InternetReadFile(h, buf, sizeof buf, &n) && n) out.append(buf, n);
     if (h) InternetCloseHandle(h);

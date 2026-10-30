@@ -818,6 +818,7 @@ static void requestTracks(List& l) {
 }
 
 static void ytPlay(const Track& t);
+static void moreLyrics(const Track& t, bool haveText);
 static void wvPost(const json& j);
 
 static void onEngine(const std::string& line) try {
@@ -860,6 +861,10 @@ static void onEngine(const std::string& line) try {
         g_lyrSrc = jstr(j, "src");
         g_lyrState = g_lyr.empty() ? 3 : 2;
         g_lyrAlign = !g_lyr.empty() && g_lyrSrc.rfind("LRCLIB", 0) == 0;  // les paroles de Spotify sont déjà calées
+        if (!g_lyrSynced && g_has && g_cur.uri == g_lyrKey) {  // rien de synchronisé : d'autres sites (NetEase, lyrics.ovh)
+            if (g_lyr.empty()) g_lyrState = 1;  // « chargement » plutôt que « pas de paroles » pendant la recherche
+            moreLyrics(g_cur, !g_lyr.empty());
+        }
     } else if (ev == "get") {
         std::string id = jstr(j, "id");
         json d = j.contains("data") ? j["data"] : json();  // copie : les champs absents deviennent null au lieu de planter
@@ -1152,6 +1157,74 @@ static bool lrclib(const Track& t, std::vector<LyricLine>& lines, bool& synced, 
     return !lines.empty();
 }
 
+// NetEase Cloud Music : beaucoup de paroles synchronisées, même pour des titres peu connus (API du site, sans compte).
+// On ne garde qu'un résultat du même artiste, d'une durée proche (versions accélérées / ralenties : temps étirés).
+static bool netease(const Track& t, std::vector<LyricLine>& lines, bool& synced, std::string& src) {
+    lines.clear(); synced = false; src = "NetEase";
+    std::string artist = firstArtist(t.artist), base = baseTitle(t.title), la = artist;
+    std::transform(la.begin(), la.end(), la.begin(), [](unsigned char c) { return (char)tolower(c); });
+    json r = json::parse(plat::httpGet("https://music.163.com/api/search/get?s=" + urlEnc(artist + " " + base) + "&type=1&limit=10"), nullptr, false);
+    const json* best = nullptr;
+    double bestGap = 1e9;
+    for (auto& s : jget(jget(r, "result"), "songs")) {
+        bool same = false;
+        for (auto& a : jget(s, "artists")) {
+            std::string n = jstr(a, "name");
+            std::transform(n.begin(), n.end(), n.begin(), [](unsigned char c) { return (char)tolower(c); });
+            same = same || (!n.empty() && (n.find(la) != std::string::npos || la.find(n) != std::string::npos));
+        }
+        double d = jnum(s, "duration"), gap = t.ms > 0 && d > 0 ? std::fabs(t.ms / d - 1) : 0.5;
+        if (same && gap < 0.45 && gap < bestGap) { best = &s; bestGap = gap; }  // < 0.45 : même titre, au plus accéléré / ralenti
+    }
+    if (!best) return false;
+    json l = json::parse(plat::httpGet("https://music.163.com/api/song/lyric?id=" + std::to_string((long long)jnum(*best, "id")) + "&lv=1&tv=-1"), nullptr, false);
+    std::string lrc = jstr(jget(l, "lrc"), "lyric"), clean;
+    std::istringstream in(lrc);
+    for (std::string line; std::getline(in, line);) {  // sans les crédits en chinois (« 作词 : ... », « 作曲 : ... »)
+        size_t c = line.find("] "), colon = std::min(line.find(':', c == std::string::npos ? 0 : c), line.find("\xEF\xBC\x9A"));
+        bool credit = c != std::string::npos && colon != std::string::npos &&
+                      std::any_of(line.begin() + c, line.begin() + colon, [](char ch) { return (unsigned char)ch >= 0xE3 && (unsigned char)ch <= 0xE9; });
+        if (!credit) clean += line + "\n";
+    }
+    double d = jnum(*best, "duration"), scale = d > 0 && t.ms > 0 && std::fabs(t.ms / d - 1) > 0.04 ? t.ms / d : 1;
+    lines = parseLrc(clean, scale, false);
+    if (lines.size() >= 2) { synced = true; if (scale != 1) { char b[64]; snprintf(b, sizeof b, "NetEase (original version, tempo adjusted x%.2f)", scale); src = b; } return true; }
+    lines.clear();
+    return false;
+}
+
+// lyrics.ovh : paroles sans minutage (l'IA de Glass peut ensuite les caler sur le son).
+static bool lyricsOvh(const Track& t, std::vector<LyricLine>& lines) {
+    lines.clear();
+    json r = json::parse(plat::httpGet("https://api.lyrics.ovh/v1/" + urlEnc(firstArtist(t.artist)) + "/" + urlEnc(baseTitle(t.title))), nullptr, false);
+    std::istringstream ps(jstr(r, "lyrics"));
+    for (std::string l; std::getline(ps, l);) { if (!l.empty() && l.back() == '\r') l.pop_back(); if (!l.empty()) lines.push_back({0, l}); }
+    return lines.size() >= 2;
+}
+
+// Autres sites quand les premières sources n'ont rien de synchronisé : NetEase, puis lyrics.ovh si on n'a encore rien.
+static bool moreLyricsNow(const Track& t, bool haveText, std::vector<LyricLine>& lines, bool& synced, std::string& src) {
+    if (netease(t, lines, synced, src)) return true;
+    if (!haveText && lyricsOvh(t, lines)) { synced = false; src = "lyrics.ovh"; return true; }
+    return false;
+}
+static void moreLyrics(const Track& t, bool haveText) {  // g_mx tenu : cherche en arrière-plan, remplace si mieux
+    std::thread([t, haveText] {
+        std::vector<LyricLine> lines;
+        bool synced = false;
+        std::string src;
+        bool found = moreLyricsNow(t, haveText, lines, synced, src);
+        std::lock_guard lk(g_mx);
+        if (g_lyrKey != t.uri) return;  // on écoute autre chose
+        if (!found) { if (g_lyr.empty()) g_lyrState = 3; wake(); return; }
+        if (g_lyrSynced && !g_lyr.empty()) return;  // des paroles synchronisées sont arrivées entre-temps
+        g_lyr = std::move(lines); g_lyrSynced = synced; g_lyrSrc = src;
+        g_lyrState = 2;
+        g_lyrAlign = true;  // l'IA cale le minutage sur le vrai son (réglable dans Settings)
+        wake();
+    }).detach();
+}
+
 // ---------- base de paroles partagée (GitHub) : les paroles de l'IA (écrites ou calées sur le son) servent à tout le monde ----------
 // Lecture publique ; envoi seulement depuis un ordinateur où l'outil « gh » est connecté au compte du dépôt.
 static const char* kLyricsRepo = "lanaryy-hash/glass-lyrics";
@@ -1250,6 +1323,12 @@ static void findLyrics(const Track& t) {
         bool synced;
         std::string src;
         lrclib(t, lines, synced, src);
+        if (!synced) {  // pas de minutage : d'autres sites (NetEase, lyrics.ovh)
+            std::vector<LyricLine> more;
+            bool s2 = false;
+            std::string src2;
+            if (moreLyricsNow(t, !lines.empty(), more, s2, src2)) { lines = std::move(more); synced = s2; src = src2; }
+        }
         std::lock_guard lk(g_mx);
         if (g_lyrKey != t.uri) return;
         g_lyr = std::move(lines); g_lyrSynced = synced; g_lyrSrc = src;
