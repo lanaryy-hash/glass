@@ -19,7 +19,8 @@ extern fs::path g_bin;    // programmes (glass-engine, outils fournis)
 namespace plat {
 void wake();  // réveille la boucle principale, depuis n'importe quel thread
 std::string wallpaper();
-std::string httpGet(const std::string& url);
+std::string httpGet(const std::string& url, const std::string& headers = "");  // headers : "Nom: valeur\r\n..." (ex. une session de compte)
+int httpSend(const std::string& method, const std::string& url, const std::string& headers);  // PUT / DELETE sans corps ; code HTTP (0 = pas de réseau)
 bool download(const std::string& url, const fs::path& to, const std::function<void(int)>& progress);  // progress : %
 fs::path findTool(const char* name);  // yt-dlp, ffmpeg, whisper-cli... ; vide si introuvable
 bool run(const std::vector<std::string>& args, int timeoutMs);  // caché, priorité basse ; true si code 0

@@ -56,15 +56,34 @@ std::string plat::wallpaper() {
 }
 
 // ---------- réseau ----------
-std::string plat::httpGet(const std::string& url) {
+std::string plat::httpGet(const std::string& url, const std::string& headers) {
     std::string out;
+    std::wstring wh = widen(headers);
     HINTERNET net = InternetOpenW(L"Glass", INTERNET_OPEN_TYPE_PRECONFIG, nullptr, nullptr, 0);
-    HINTERNET h = net ? InternetOpenUrlW(net, widen(url).c_str(), nullptr, 0, INTERNET_FLAG_SECURE, 0) : nullptr;
+    HINTERNET h = net ? InternetOpenUrlW(net, widen(url).c_str(), wh.empty() ? nullptr : wh.c_str(), wh.empty() ? 0 : (DWORD)-1L,
+                                         INTERNET_FLAG_SECURE | (wh.empty() ? 0 : INTERNET_FLAG_RELOAD | INTERNET_FLAG_NO_CACHE_WRITE), 0) : nullptr;  // avec une session : jamais de cache
     char buf[16384]; DWORD n;
     while (h && InternetReadFile(h, buf, sizeof buf, &n) && n) out.append(buf, n);
     if (h) InternetCloseHandle(h);
     if (net) InternetCloseHandle(net);
     return out;
+}
+
+int plat::httpSend(const std::string& method, const std::string& url, const std::string& headers) {
+    wchar_t host[256], path[2048], extra[2048];
+    URL_COMPONENTSW u{sizeof u};
+    u.lpszHostName = host; u.dwHostNameLength = 256; u.lpszUrlPath = path; u.dwUrlPathLength = 2048; u.lpszExtraInfo = extra; u.dwExtraInfoLength = 2048;
+    std::wstring wurl = widen(url);
+    if (!InternetCrackUrlW(wurl.c_str(), 0, 0, &u)) return 0;
+    std::wstring target = std::wstring(path) + extra, wh = widen(headers + "Content-Length: 0\r\n");
+    DWORD code = 0, len = sizeof code;
+    HINTERNET net = InternetOpenW(L"Glass", INTERNET_OPEN_TYPE_PRECONFIG, nullptr, nullptr, 0);
+    HINTERNET con = net ? InternetConnectW(net, host, u.nPort, nullptr, nullptr, INTERNET_SERVICE_HTTP, 0, 0) : nullptr;
+    HINTERNET req = con ? HttpOpenRequestW(con, widen(method).c_str(), target.c_str(), nullptr, nullptr, nullptr,
+                                           (u.nScheme == INTERNET_SCHEME_HTTPS ? INTERNET_FLAG_SECURE : 0) | INTERNET_FLAG_RELOAD | INTERNET_FLAG_NO_CACHE_WRITE, 0) : nullptr;
+    if (req && HttpSendRequestW(req, wh.c_str(), (DWORD)-1L, nullptr, 0)) HttpQueryInfoW(req, HTTP_QUERY_STATUS_CODE | HTTP_QUERY_FLAG_NUMBER, &code, &len, nullptr);
+    for (HINTERNET x : {req, con, net}) if (x) InternetCloseHandle(x);
+    return (int)code;
 }
 
 bool plat::download(const std::string& url, const fs::path& path, const std::function<void(int)>& progress) {
@@ -254,7 +273,7 @@ struct Notify : IMFMediaEngineNotify {  // fin de piste / erreur : on réveille 
 // On l'affiche donc dans une petite fenêtre hors de l'écran, absente de la barre des tâches et d'Alt+Tab ;
 // pour se connecter à un compte, la même fenêtre vient au centre de l'écran.
 struct Web { ICoreWebView2Controller* c = nullptr; ICoreWebView2* wv = nullptr; HWND host = nullptr; bool on = false; };
-static Web g_webs[2];
+static Web g_webs[3];  // 0 Spotify, 1 Apple Music, 2 connexion SoundCloud
 
 static void fitWeb(int id) {
     RECT r; GetClientRect(g_webs[id].host, &r);
@@ -313,7 +332,7 @@ void plat::webStart(int id, const std::string& html, const std::string& url, con
         std::ofstream(web + L"\\player.html") << html;
         nav = L"https://glass.player/player.html?v=" + std::to_wstring(vol);  // volume dès le départ
     }
-    w.host = CreateWindowExW(WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE, L"GlassWeb", id == 1 ? L"Apple Music - Glass" : L"Spotify - Glass", WS_POPUP,
+    w.host = CreateWindowExW(WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE, L"GlassWeb", id == 2 ? L"SoundCloud - Glass" : id == 1 ? L"Apple Music - Glass" : L"Spotify - Glass", WS_POPUP,
                              -4000, -4000, 320, 240, nullptr, nullptr, GetModuleHandleW(nullptr), nullptr);
     SetWindowLongPtrW(w.host, GWLP_USERDATA, id);
     ShowWindow(w.host, SW_SHOWNOACTIVATE);

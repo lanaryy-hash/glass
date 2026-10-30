@@ -65,16 +65,45 @@ static CURL* curlFor(const std::string& url) {
     return c;
 }
 
-std::string plat::httpGet(const std::string& url) {
+static curl_slist* curlHeaders(const std::string& headers) {  // "Nom: valeur\r\n..." -> liste curl
+    curl_slist* l = nullptr;
+    size_t a = 0;
+    for (size_t b; (b = headers.find("\r\n", a)) != std::string::npos; a = b + 2)
+        if (b > a) l = curl_slist_append(l, headers.substr(a, b - a).c_str());
+    return l;
+}
+
+std::string plat::httpGet(const std::string& url, const std::string& headers) {
     std::string out;
     CURL* c = curlFor(url);
     if (!c) return out;
+    curl_slist* hl = curlHeaders(headers);
+    if (hl) curl_easy_setopt(c, CURLOPT_HTTPHEADER, hl);
     curl_easy_setopt(c, CURLOPT_TIMEOUT, 60L);
     curl_easy_setopt(c, CURLOPT_WRITEFUNCTION, curlAppend);
     curl_easy_setopt(c, CURLOPT_WRITEDATA, &out);
     if (curl_easy_perform(c) != CURLE_OK) out.clear();
     curl_easy_cleanup(c);
+    curl_slist_free_all(hl);
     return out;
+}
+
+int plat::httpSend(const std::string& method, const std::string& url, const std::string& headers) {
+    CURL* c = curlFor(url);
+    if (!c) return 0;
+    curl_slist* hl = curlHeaders(headers + "Content-Length: 0\r\n");
+    std::string sink;
+    curl_easy_setopt(c, CURLOPT_HTTPHEADER, hl);
+    curl_easy_setopt(c, CURLOPT_CUSTOMREQUEST, method.c_str());
+    curl_easy_setopt(c, CURLOPT_FAILONERROR, 0L);  // on veut le code, même 4xx
+    curl_easy_setopt(c, CURLOPT_TIMEOUT, 30L);
+    curl_easy_setopt(c, CURLOPT_WRITEFUNCTION, curlAppend);
+    curl_easy_setopt(c, CURLOPT_WRITEDATA, &sink);
+    long code = 0;
+    if (curl_easy_perform(c) == CURLE_OK) curl_easy_getinfo(c, CURLINFO_RESPONSE_CODE, &code);
+    curl_easy_cleanup(c);
+    curl_slist_free_all(hl);
+    return (int)code;
 }
 
 struct Progress { const std::function<void(int)>* cb; int last = -1; };
@@ -326,7 +355,7 @@ static void hideWeb(NSWindow* w);
 @end
 
 struct Web { WKWebView* view; NSWindow* win; GlassWeb* handler; };
-static Web g_webs[2];
+static Web g_webs[3];  // 0 Spotify, 1 Apple Music, 2 connexion SoundCloud
 
 static void hideWeb(NSWindow* w) {  // minuscule et quasi transparente : la page se croit affichée, on ne la voit pas
     w.styleMask = NSWindowStyleMaskBorderless;
@@ -341,7 +370,7 @@ void plat::webShow(int id, bool show) {
     if (!w) return;
     if (!show) { hideWeb(w); return; }
     w.styleMask = NSWindowStyleMaskTitled | NSWindowStyleMaskClosable | NSWindowStyleMaskResizable | NSWindowStyleMaskMiniaturizable;
-    w.title = id == 1 ? @"Apple Music - Glass" : @"Spotify - Glass";
+    w.title = id == 2 ? @"SoundCloud - Glass" : id == 1 ? @"Apple Music - Glass" : @"Spotify - Glass";
     w.ignoresMouseEvents = NO;
     w.alphaValue = 1;
     [w setFrame:NSMakeRect(0, 0, 1000, 760) display:YES];

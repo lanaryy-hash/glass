@@ -115,6 +115,10 @@ static bool g_sleepEnd = false;         // minuterie « à la fin du titre »
 static bool g_webOk = false, g_sp = false, g_wvStarted = false, g_sdkReady = false, g_spPaused = true, g_spEnded = false;
 static bool g_spApple = false;                                                      // le lecteur officiel en cours est celui d'Apple
 static bool g_amStarted = false, g_amReady = false, g_amAuth = false, g_amLogin = false;  // Apple Music : page lancée, prête, connectée, fenêtre de connexion
+static std::string g_scToken, g_scUser;  // session de ton compte SoundCloud (vide = pas connecté), nom affiché
+static long long g_scId = 0;              // ton identifiant SoundCloud (0 tant que la session n'est pas vérifiée)
+static bool g_scLogin = false, g_scStarted = false, g_scStop = false;  // fenêtre de connexion : à ouvrir, ouverte, à fermer
+static std::set<std::string> g_scLists;   // listes ajoutées par ton compte (retirées à la déconnexion)
 static bool g_amPreview = false;  // Apple n'a donné qu'un extrait de 30 s (pas d'abonnement actif) : titres suivants via YouTube
 static std::string g_amDiag;  // ce que le lecteur d'Apple peut faire ici (titres entiers ou extraits)
 static std::string g_sdkDevice;
@@ -182,7 +186,7 @@ static std::string toUri(const std::string& s) {
     return "";
 }
 // SoundCloud : lien public (titre, playlist, profil, likes) ; titres "soundcloud:track:<id>"
-static bool isSoundcloud(const std::string& uri) { return uri.rfind("https://soundcloud.com/", 0) == 0 || uri.rfind("https://on.soundcloud.com/", 0) == 0; }
+static bool isSoundcloud(const std::string& uri) { return uri.rfind("https://soundcloud.com/", 0) == 0 || uri.rfind("https://on.soundcloud.com/", 0) == 0 || uri == "soundcloud:likes"; }
 // Apple Music : lien public (https://music.apple.com/...) ou playlist de ton compte ("am:<id>")
 // YouTube : lien de playlist ou de vidéo ; titres "youtube:video:<id>"
 static bool isYoutube(const std::string& uri) { return uri.rfind("https://www.youtube.com/", 0) == 0 || uri.rfind("https://music.youtube.com/", 0) == 0; }
@@ -321,17 +325,22 @@ static bool inList(const char* list, const std::string& uri) {
     return l && std::any_of(l->tracks.begin(), l->tracks.end(), [&](const Track& t) { return t.uri == uri; });
 }
 
-static bool isFav(const std::string& uri) { return inList("glass:favoris", uri) || inList("spotify:collection", uri); }  // ou liké sur Spotify
+static bool isFav(const std::string& uri) { return inList("glass:favoris", uri) || inList("spotify:collection", uri) || inList("soundcloud:likes", uri); }  // ou liké sur Spotify / SoundCloud
+static void scLike(const Track& t, bool on);
 static void toggleFav(const Track& t) {
     bool on = !isFav(t.uri);
-    List *f = findList("glass:favoris"), *liked = findList("spotify:collection");
-    for (List* l : {f, liked})
+    List *f = findList("glass:favoris"), *liked = findList("spotify:collection"), *sc = findList("soundcloud:likes");
+    for (List* l : {f, liked, sc})
         if (l) l->tracks.erase(std::remove_if(l->tracks.begin(), l->tracks.end(), [&](const Track& x) { return x.uri == t.uri; }), l->tracks.end());
     if (on) f->tracks.insert(f->tracks.begin(), t);
     if (isSpotifyTrack(t) && g_webOk) {  // aussi dans tes titres likés Spotify
         spWrite(on ? "PUT" : "DELETE", "/v1/me/library?uris=" + urlEnc(t.uri), {{"uris", {t.uri}}},
                 on ? "Added to your Liked Songs (Spotify)" : "Removed from your Liked Songs (Spotify)", "spotify:collection");
         if (on && liked && liked->loaded) liked->tracks.insert(liked->tracks.begin(), t);
+    }
+    if (t.uri.rfind("soundcloud:track:", 0) == 0 && g_scId) {  // aussi dans tes likes SoundCloud
+        scLike(t, on);
+        if (on && sc && sc->loaded) sc->tracks.insert(sc->tracks.begin(), t);
     }
     saveMine();
 }
@@ -492,13 +501,15 @@ static Track scTrack(const json& t, const std::string& album) {
     return Track{"soundcloud:track:" + std::to_string((long long)jnum(t, "id")), title, artist, album, scArt(t), (int)jnum(t, "duration")};
 }
 
-static void loadSoundcloud(const std::string& url) {
-    std::thread([url] {
+static std::string scAuth() { return g_scToken.empty() ? "" : "Authorization: OAuth " + g_scToken + "\r\n"; }  // g_mx tenu
+
+static void loadSoundcloud(const std::string& url) {  // g_mx tenu
+    std::thread([url, auth = scAuth()] {
         std::string cid = scClientId(), page = url, name, image;
         std::vector<Track> tracks;
         auto api = [&](std::string path) {
             if (path.rfind("https://", 0) != 0) path = "https://api-v2.soundcloud.com/" + path;
-            return json::parse(plat::httpGet(path + (path.find('?') == std::string::npos ? "?" : "&") + "client_id=" + cid), nullptr, false);
+            return json::parse(plat::httpGet(path + (path.find('?') == std::string::npos ? "?" : "&") + "client_id=" + cid, auth), nullptr, false);
         };
         if (page.rfind("https://on.soundcloud.com/", 0) == 0) {  // lien court de l'appli : la page d'arrivée donne le vrai lien
             std::string html = plat::httpGet(page);
@@ -535,6 +546,97 @@ static void loadSoundcloud(const std::string& url) {
         if (image.empty() && !tracks.empty()) image = tracks[0].image;
         fillList(url, name, image, tracks, "SoundCloud: couldn't read this link (private?)");
     }).detach();
+}
+
+// ---------- ton compte SoundCloud ----------
+// Comme Apple Music : la vraie page soundcloud.com s'ouvre dans une fenêtre de Glass, tu t'y connectes,
+// ce script lit la session du site (cookie oauth_token) et la donne à Glass ; la fenêtre se ferme ensuite.
+static const char* kScJs = R"JS((() => {
+  if (window.top !== window || window.__glass) return;
+  window.__glass = true;
+  const post = m => window.chrome && chrome.webview ? chrome.webview.postMessage(m) : webkit.messageHandlers.glass.postMessage(JSON.stringify(m));
+  const look = () => {
+    const m = document.cookie.match(/(?:^|;\s*)oauth_token=([^;]+)/);
+    if (m) post({t: 'token', v: decodeURIComponent(m[1])}); else setTimeout(look, 1000);
+  };
+  look();
+})();)JS";
+static fs::path scTokenFile() { return g_dir / "soundcloud-session.txt"; }
+static void requestTracks(List& l);
+
+static void loadScLikes() {  // g_mx tenu : tes titres likés, même privés (2000 max)
+    std::thread([auth = scAuth(), id = g_scId] {
+        std::string cid = scClientId();
+        std::vector<Track> tracks;
+        for (std::string path = "https://api-v2.soundcloud.com/users/" + std::to_string(id) + "/track_likes?limit=200&linked_partitioning=1"; !path.empty() && tracks.size() < 2000;) {
+            json c = json::parse(plat::httpGet(path + "&client_id=" + cid, auth), nullptr, false);
+            for (auto& it : jget(c, "collection")) if (const json& t = jget(it, "track"); t.is_object()) tracks.push_back(scTrack(t, ""));
+            path = jstr(c, "next_href");
+        }
+        fillList("soundcloud:likes", "", "", tracks, "SoundCloud: couldn't load your likes (connect again in Settings)");
+    }).detach();
+}
+
+static void scConnect(bool announce) {  // g_mx tenu : vérifie la session, puis tes likes et tes playlists dans la bibliothèque
+    std::thread([auth = scAuth(), announce] {
+        std::string cid = scClientId(), body = plat::httpGet("https://api-v2.soundcloud.com/me?client_id=" + cid, auth);
+        json me = json::parse(body, nullptr, false);
+        long long id = (long long)jnum(me, "id");
+        json pl = id ? json::parse(plat::httpGet("https://api-v2.soundcloud.com/users/" + std::to_string(id) + "/playlists?limit=200&client_id=" + cid, auth), nullptr, false) : json();
+        std::lock_guard lk(g_mx);
+        if (!id) {
+            if (me.is_object()) {  // réponse de SoundCloud sans compte : session refusée ou expirée
+                g_scToken.clear();
+                std::error_code ec;
+                fs::remove(scTokenFile(), ec);
+                g_status = "SoundCloud: session expired, connect again in Settings";
+            } else if (announce) g_status = "SoundCloud: no answer, check your internet";  // pas de réseau : on garde la session
+            wake();
+            return;
+        }
+        g_scId = id; g_scUser = jstr(me, "username");
+        if (!findList("soundcloud:likes")) { List l{"soundcloud:likes", "SoundCloud Likes", scArt(me)}; g_lists.push_back(l); }
+        g_scLists.insert("soundcloud:likes");
+        for (auto& p : jget(pl, "collection")) {
+            std::string uri = jstr(p, "permalink_url");
+            if (uri.rfind("https://soundcloud.com/", 0) != 0) continue;
+            if (!findList(uri)) { List l{uri, jstr(p, "title"), scArt(p)}; g_lists.push_back(l); }
+            g_scLists.insert(uri);
+        }
+        if (List* l = findList("soundcloud:likes")) requestTracks(*l);
+        if (announce) g_status = "SoundCloud: connected as " + g_scUser;
+        wake();
+    }).detach();
+}
+
+static void scDisconnect() {  // g_mx tenu
+    g_scToken.clear(); g_scUser.clear(); g_scId = 0;
+    std::error_code ec;
+    fs::remove(scTokenFile(), ec);
+    g_lists.erase(std::remove_if(g_lists.begin(), g_lists.end(), [](const List& l) { return g_scLists.count(l.uri) && !l.custom; }), g_lists.end());
+    g_scLists.clear();
+    if (!findList(g_view) && g_view != "settings") g_view = "home";
+    g_status = "SoundCloud: disconnected";
+}
+
+static void scLike(const Track& t, bool on) {  // g_mx tenu : le cœur de Glass like aussi sur SoundCloud
+    std::thread([auth = scAuth(), id = g_scId, tid = t.uri.substr(17), on] {
+        int code = plat::httpSend(on ? "PUT" : "DELETE", "https://api-v2.soundcloud.com/users/" + std::to_string(id) + "/track_likes/" + tid + "?client_id=" + scClientId(), auth);
+        std::lock_guard lk(g_mx);
+        g_status = code >= 200 && code < 300 ? (on ? "Liked on SoundCloud" : "Removed from your SoundCloud likes")
+                                             : "SoundCloud: couldn't change the like (" + std::to_string(code) + ")";
+        wake();
+    }).detach();
+}
+
+static void onSoundcloud(const json& j) {  // messages de la fenêtre de connexion (g_mx tenu)
+    std::string t = jstr(j, "t");
+    if (t == "token" && !jstr(j, "v").empty() && g_scToken != jstr(j, "v")) {
+        g_scToken = jstr(j, "v");
+        std::ofstream(scTokenFile(), std::ios::binary) << g_scToken;
+        g_scStop = true;  // fermée à la prochaine image, pas depuis son propre message
+        scConnect(true);
+    } else if (t == "hidden") g_scStop = true;
 }
 
 // ---------- catalogue : artistes, leurs titres et albums ----------
@@ -646,6 +748,7 @@ static void requestTracks(List& l) {
     if (l.uri.rfind("artist:", 0) == 0 || l.uri.rfind("itunes:album:", 0) == 0) { l.requested = true; loadCatalogList(l); return; }
     if (l.uri.rfind("am:", 0) == 0) { if (g_amAuth) { l.requested = true; amPost({{"cmd", "list"}, {"id", l.uri.substr(3)}}); } return; }
     if (isApple(l.uri)) { l.requested = true; loadApple(l.uri); return; }
+    if (l.uri == "soundcloud:likes") { if (g_scId) { l.requested = true; loadScLikes(); } return; }  // une fois la session vérifiée
     if (isSoundcloud(l.uri)) { l.requested = true; loadSoundcloud(l.uri); return; }
     if (isYoutube(l.uri)) { l.requested = true; loadYoutube(l.uri); return; }
     if (!g_spReady) return;
@@ -3507,6 +3610,15 @@ static void settingsView() {
     ImGui::TextDisabled("Your playlists show up on the left. No account? Paste an Apple Music link with \"+\".");
     if (!g_amDiag.empty()) { label("Diagnostic"); ImGui::TextDisabled("%s", g_amDiag.c_str()); }
 
+    section("SoundCloud");
+    label(g_scId ? ("Connected as " + g_scUser).c_str() : !g_scToken.empty() ? "Connecting..." : "Not connected");
+    if (g_scToken.empty()) { if (ImGui::Button("Connect SoundCloud")) g_scLogin = true; }
+    else if (ImGui::Button("Disconnect##sc")) scDisconnect();
+    label("");
+    ImGui::TextDisabled("Sign in on the real soundcloud.com page: your likes (even private) and your playlists show up on the left,");
+    label("");
+    ImGui::TextDisabled("and the heart in Glass likes or unlikes songs on SoundCloud too.");
+
     section("Spotify account");
     label(g_spReady ? "Connected" : "Not connected");
     if (ImGui::Button(g_spReady ? "Log out" : "Log in")) logout();
@@ -4582,6 +4694,9 @@ void app::init() {
     g_wall = plat::wallpaper();
     loadSettings();
     loadMyThemes();
+    g_scToken = readFile(scTokenFile());
+    while (!g_scToken.empty() && isspace((unsigned char)g_scToken.back())) g_scToken.pop_back();
+    if (!g_scToken.empty()) scConnect(false);
     g_accLive = {g_set.accent[0], g_set.accent[1], g_set.accent[2], 1};
     plat::audioVolume(g_set.vol * g_set.vol);
     loadSaved();
@@ -4644,6 +4759,8 @@ bool app::tick() {
         if (g_webOk && g_set.source != 2 && !g_wvStarted) startWebView();  // lecteur officiel seulement s'il sert
         if (g_wvStarted && g_set.source == 2) stopWebView();
         if (g_set.apple && !g_amStarted) startApple();
+        if (g_scLogin && !g_scStarted) { g_scStarted = true; plat::webStart(2, "", "https://soundcloud.com/signin", kScJs, 0); plat::webShow(2, true); }
+        if (g_scStop) { g_scStop = g_scLogin = false; if (g_scStarted) { plat::webStop(2); g_scStarted = false; } }
         if (g_amStarted && !g_set.apple) stopApple();
         for (auto& [id, m] : g_wvOut) plat::webPost(id, m);
         g_wvOut.clear();
@@ -4697,7 +4814,7 @@ void app::onWeb(int id, const std::string& msg) {
     json j = json::parse(msg, nullptr, false);
     if (!j.is_object()) return;
     std::lock_guard lk(g_mx);
-    if (id == 1) onApple(j); else onPlayer(j);
+    if (id == 1) onApple(j); else if (id == 2) onSoundcloud(j); else onPlayer(j);
 }
 
 void app::media(int cmd) {
