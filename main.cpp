@@ -583,7 +583,14 @@ static void scConnect(bool announce) {  // g_mx tenu : vérifie la session, puis
         std::string cid = scClientId(), body = plat::httpGet("https://api-v2.soundcloud.com/me?client_id=" + cid, auth);
         json me = json::parse(body, nullptr, false);
         long long id = (long long)jnum(me, "id");
-        json pl = id ? json::parse(plat::httpGet("https://api-v2.soundcloud.com/users/" + std::to_string(id) + "/playlists?limit=200&client_id=" + cid, auth), nullptr, false) : json();
+        std::vector<json> pl;  // tes playlists : créées, likées, puis ta bibliothèque (privées comprises) ; toutes les pages, 500 max
+        std::string api = "https://api-v2.soundcloud.com/", user = api + "users/" + std::to_string(id) + "/";
+        for (const std::string& first : {user + "playlists?limit=200", user + "playlist_likes?limit=200", api + "me/library/all?limit=50"})
+            for (std::string path = id ? first + "&linked_partitioning=1" : ""; !path.empty() && pl.size() < 500;) {
+                json c = json::parse(plat::httpGet(path + "&client_id=" + cid, auth), nullptr, false);
+                for (auto& it : jget(c, "collection")) if (const json& p = it.contains("playlist") ? jget(it, "playlist") : it; p.is_object()) pl.push_back(p);
+                path = jstr(c, "next_href");
+            }
         std::lock_guard lk(g_mx);
         if (!id) {
             if (me.is_object()) {  // réponse de SoundCloud sans compte : session refusée ou expirée
@@ -598,7 +605,7 @@ static void scConnect(bool announce) {  // g_mx tenu : vérifie la session, puis
         g_scId = id; g_scUser = jstr(me, "username");
         if (!findList("soundcloud:likes")) { List l{"soundcloud:likes", "SoundCloud Likes", scArt(me)}; g_lists.push_back(l); }
         g_scLists.insert("soundcloud:likes");
-        for (auto& p : jget(pl, "collection")) {
+        for (auto& p : pl) {
             std::string uri = jstr(p, "permalink_url");
             if (uri.rfind("https://soundcloud.com/", 0) != 0) continue;
             if (!findList(uri)) { List l{uri, jstr(p, "title"), scArt(p)}; g_lists.push_back(l); }
