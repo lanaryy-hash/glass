@@ -118,6 +118,11 @@ static bool g_amStarted = false, g_amReady = false, g_amAuth = false, g_amLogin 
 static std::string g_scToken, g_scUser;  // session de ton compte SoundCloud (vide = pas connecté), nom affiché
 static long long g_scId = 0;              // ton identifiant SoundCloud (0 tant que la session n'est pas vérifiée)
 static bool g_scLogin = false, g_scStarted = false, g_scStop = false;  // fenêtre de connexion : à ouvrir, ouverte, à fermer
+// La session du site SoundCloud ne dure qu'environ une heure : soundcloud.com, ouvert en invisible, la renouvelle tout seul,
+// au démarrage puis toutes les 45 min ; Glass reprend la nouvelle et referme la page.
+static bool g_scRefresh = false;           // renouvellement demandé
+static double g_scStartT = 0, g_scNextRefresh = 0;
+static int g_scFails = 0;                  // sessions refusées de suite (3 : vraiment déconnecté)
 static std::set<std::string> g_scLists;   // listes ajoutées par ton compte (retirées à la déconnexion)
 static bool g_amPreview = false;  // Apple n'a donné qu'un extrait de 30 s (pas d'abonnement actif) : titres suivants via YouTube
 static std::string g_amDiag;  // ce que le lecteur d'Apple peut faire ici (titres entiers ou extraits)
@@ -556,9 +561,13 @@ static const char* kScJs = R"JS((() => {
   if (window.top !== window || window.__glass) return;
   window.__glass = true;
   const post = m => window.chrome && chrome.webview ? chrome.webview.postMessage(m) : webkit.messageHandlers.glass.postMessage(JSON.stringify(m));
+  // la page remplace sa session expirée quelques secondes après son chargement : on attend qu'elle ne bouge plus
+  const start = Date.now();
+  let last = '', since = 0;
   const look = () => {
-    const m = document.cookie.match(/(?:^|;\s*)oauth_token=([^;]+)/);
-    if (m) post({t: 'token', v: decodeURIComponent(m[1])}); else setTimeout(look, 1000);
+    const m = document.cookie.match(/(?:^|;\s*)oauth_token=([^;]+)/), v = m ? decodeURIComponent(m[1]) : '';
+    if (v !== last) { last = v; since = Date.now(); }
+    if (v && Date.now() - start > 6000 && Date.now() - since > 3000) post({t: 'token', v}); else setTimeout(look, 1000);
   };
   look();
 })();)JS";
@@ -593,16 +602,17 @@ static void scConnect(bool announce) {  // g_mx tenu : vérifie la session, puis
             }
         std::lock_guard lk(g_mx);
         if (!id) {
-            if (me.is_object()) {  // réponse de SoundCloud sans compte : session refusée ou expirée
-                g_scToken.clear();
+            if (me.is_object() && ++g_scFails >= 3) {  // session refusée plusieurs fois de suite : vraiment déconnecté du site
+                g_scToken.clear(); g_scFails = 0;
                 std::error_code ec;
                 fs::remove(scTokenFile(), ec);
                 g_status = "SoundCloud: session expired, connect again in Settings";
-            } else if (announce) g_status = "SoundCloud: no answer, check your internet";  // pas de réseau : on garde la session
+            } else if (me.is_object()) g_scNextRefresh = now() + 60;  // refusée : la page la renouvelle, on réessaie dans une minute
+            else if (announce) g_status = "SoundCloud: no answer, check your internet";  // pas de réseau : on garde la session
             wake();
             return;
         }
-        g_scId = id; g_scUser = jstr(me, "username");
+        g_scId = id; g_scUser = jstr(me, "username"); g_scFails = 0;
         if (!findList("soundcloud:likes")) { List l{"soundcloud:likes", "SoundCloud Likes", scArt(me)}; g_lists.push_back(l); }
         g_scLists.insert("soundcloud:likes");
         for (auto& p : pl) {
@@ -611,6 +621,8 @@ static void scConnect(bool announce) {  // g_mx tenu : vérifie la session, puis
             if (!findList(uri)) { List l{uri, jstr(p, "title"), scArt(p)}; g_lists.push_back(l); }
             g_scLists.insert(uri);
         }
+        for (auto& l : g_lists)  // listes vides (chargées avec une session expirée) : rechargées avec la nouvelle
+            if (g_scLists.count(l.uri) && l.tracks.empty()) { l.requested = l.loaded = false; if (l.name == "Not found") l.name = "SoundCloud"; }
         if (List* l = findList("soundcloud:likes")) requestTracks(*l);
         if (announce) g_status = "SoundCloud: connected as " + g_scUser;
         wake();
@@ -619,6 +631,7 @@ static void scConnect(bool announce) {  // g_mx tenu : vérifie la session, puis
 
 static void scDisconnect() {  // g_mx tenu
     g_scToken.clear(); g_scUser.clear(); g_scId = 0;
+    g_scRefresh = false; g_scNextRefresh = 0; g_scFails = 0;
     std::error_code ec;
     fs::remove(scTokenFile(), ec);
     g_lists.erase(std::remove_if(g_lists.begin(), g_lists.end(), [](const List& l) { return g_scLists.count(l.uri) && !l.custom; }), g_lists.end());
@@ -632,18 +645,22 @@ static void scLike(const Track& t, bool on) {  // g_mx tenu : le cœur de Glass 
         int code = plat::httpSend(on ? "PUT" : "DELETE", "https://api-v2.soundcloud.com/users/" + std::to_string(id) + "/track_likes/" + tid + "?client_id=" + scClientId(), auth);
         std::lock_guard lk(g_mx);
         g_status = code >= 200 && code < 300 ? (on ? "Liked on SoundCloud" : "Removed from your SoundCloud likes")
-                                             : "SoundCloud: couldn't change the like (" + std::to_string(code) + ")";
+                 : code == 401 ? "SoundCloud: session renewed, try the heart again"
+                               : "SoundCloud: couldn't change the like (" + std::to_string(code) + ")";
+        if (code == 401) g_scRefresh = true;
         wake();
     }).detach();
 }
 
 static void onSoundcloud(const json& j) {  // messages de la fenêtre de connexion (g_mx tenu)
     std::string t = jstr(j, "t");
-    if (t == "token" && !jstr(j, "v").empty() && g_scToken != jstr(j, "v")) {
+    if (t == "token" && !jstr(j, "v").empty()) {
+        bool changed = g_scToken != jstr(j, "v");
         g_scToken = jstr(j, "v");
-        std::ofstream(scTokenFile(), std::ios::binary) << g_scToken;
+        if (changed) std::ofstream(scTokenFile(), std::ios::binary) << g_scToken;
         g_scStop = true;  // fermée à la prochaine image, pas depuis son propre message
-        scConnect(true);
+        g_scNextRefresh = now() + 45 * 60;
+        if (changed || !g_scId) scConnect(g_scLogin);  // message « connecté » seulement après une vraie connexion
     } else if (t == "hidden") g_scStop = true;
 }
 
@@ -4829,7 +4846,7 @@ void app::init() {
     loadMyThemes();
     g_scToken = readFile(scTokenFile());
     while (!g_scToken.empty() && isspace((unsigned char)g_scToken.back())) g_scToken.pop_back();
-    if (!g_scToken.empty()) scConnect(false);
+    g_scRefresh = !g_scToken.empty();
     g_accLive = {g_set.accent[0], g_set.accent[1], g_set.accent[2], 1};
     plat::audioVolume(g_set.vol * g_set.vol);
     loadSaved();
@@ -4892,8 +4909,18 @@ bool app::tick() {
         if (g_webOk && g_set.source != 2 && !g_wvStarted) startWebView();  // lecteur officiel seulement s'il sert
         if (g_wvStarted && g_set.source == 2) stopWebView();
         if (g_set.apple && !g_amStarted) startApple();
-        if (g_scLogin && !g_scStarted) { g_scStarted = true; plat::webStart(2, "", "https://soundcloud.com/signin", kScJs, 0); plat::webShow(2, true); }
-        if (g_scStop) { g_scStop = g_scLogin = false; if (g_scStarted) { plat::webStop(2); g_scStarted = false; } }
+        if (!g_scToken.empty() && !g_scStarted && g_scNextRefresh > 0 && now() > g_scNextRefresh) g_scRefresh = true;
+        if ((g_scLogin || g_scRefresh) && !g_scStarted) {
+            g_scStarted = true; g_scStartT = now();
+            plat::webStart(2, "", g_scLogin ? "https://soundcloud.com/signin" : "https://soundcloud.com/discover", kScJs, 0);
+            if (g_scLogin) plat::webShow(2, true);
+        }
+        if (g_scRefresh && !g_scLogin && g_scStarted && now() - g_scStartT > 25) {  // pas de réponse de la page (hors ligne, déconnecté du site)
+            g_scStop = true;
+            g_scNextRefresh = now() + 10 * 60;
+            if (!g_scId && !g_scToken.empty()) scConnect(false);
+        }
+        if (g_scStop) { g_scStop = g_scLogin = g_scRefresh = false; if (g_scStarted) { plat::webStop(2); g_scStarted = false; } }
         if (g_amStarted && !g_set.apple) stopApple();
         for (auto& [id, m] : g_wvOut) plat::webPost(id, m);
         g_wvOut.clear();
