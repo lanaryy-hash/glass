@@ -4414,51 +4414,70 @@ static void toggleFull() {  // lecteur plein écran ; Échap ou F11 pour sortir
     plat::setFullscreen(g_full);
 }
 
-// Lecteur plein écran façon Apple Music : grande pochette et commandes à gauche, paroles synchronisées à droite.
+// Image qui s'efface vers la droite : pleine jusqu'à `from` (fraction de la largeur), puis transparente au bord (courbe douce).
+static void imageFadeRight(ImDrawList* dl, ImTextureID tx, ImVec2 a, ImVec2 b, float from, float alpha = 1) {
+    const int N = 16;  // bandes verticales : la transparence passe d'un sommet à l'autre
+    auto al = [&](float u) { float t = u <= from ? 0 : (u - from) / (1 - from); return (ImU32)(255 * alpha * (1 - t * t * (3 - 2 * t))) << IM_COL32_A_SHIFT | 0x00FFFFFF; };
+    dl->PushTexture(tx);
+    dl->PrimReserve(6 * N, 4 * N);
+    for (int k = 0; k < N; k++) {
+        float u0 = k == 0 ? 0 : from + (1 - from) * (k - 1) / (N - 1), u1 = from + (1 - from) * k / (N - 1);
+        float x0 = a.x + (b.x - a.x) * u0, x1 = a.x + (b.x - a.x) * u1;
+        ImDrawIdx i = (ImDrawIdx)dl->_VtxCurrentIdx;
+        dl->PrimWriteIdx(i); dl->PrimWriteIdx(i + 1); dl->PrimWriteIdx(i + 2); dl->PrimWriteIdx(i); dl->PrimWriteIdx(i + 2); dl->PrimWriteIdx(i + 3);
+        dl->PrimWriteVtx({x0, a.y}, {u0, 0}, al(u0)); dl->PrimWriteVtx({x1, a.y}, {u1, 0}, al(u1));
+        dl->PrimWriteVtx({x1, b.y}, {u1, 1}, al(u1)); dl->PrimWriteVtx({x0, b.y}, {u0, 1}, al(u0));
+    }
+    dl->PopTexture();
+}
+
+// Lecteur plein écran façon Apple Music : la pochette en grand, collée à gauche, qui fond vers la droite ;
+// titre et commandes par-dessus son bas ; paroles synchronisées à droite.
 static void fullPlayer(ImGuiViewport* vp) {
     ImDrawList* dl = ImGui::GetWindowDrawList();
     ImVec2 o = vp->Pos, sz = vp->Size;
     Track* t = current();
     bool lyr = sz.x > 1000 * S;  // assez large : les paroles à droite
-    float cs = std::min(lyr ? sz.x * 0.3f : sz.x * 0.5f, sz.y * 0.5f), cx = o.x + (lyr ? sz.x * 0.28f : sz.x * 0.5f), x0 = cx - cs / 2;
-    float y0 = o.y + std::max(70 * S, (sz.y - cs - 250 * S) * 0.5f);
+    float cs = lyr ? sz.y : std::min(sz.y, sz.x);  // toute la hauteur
+    ImVec2 ca{o.x, o.y + (sz.y - cs) * 0.5f};
 
-    // en haut à gauche : quitter le plein écran
+    // la pochette, puis un voile sombre en bas pour lire le titre et les commandes
+    float k = animTo(ImGui::GetID("##fcov"), isPlaying() || !t ? 1.f : 0.6f, 4);  // s'assombrit un peu en pause
+    if (ImTextureID tx = t ? tex(t->image, 800) : 0) imageFadeRight(dl, tx, ca, ca + ImVec2{cs, cs}, 0.4f, 0.4f + 0.6f * k);
+    else coverAt(dl, "icon:", "", ca + ImVec2{cs * 0.25f, cs * 0.25f}, cs * 0.4f, 24 * S);
+    float sh = sz.y * 0.55f;  // plus sombre en bas à gauche, là où sont le titre et les commandes
+    dl->AddRectFilledMultiColor({o.x, o.y + sz.y - sh}, {o.x + cs, o.y + sz.y}, col(0, 0, 0, 0), col(0, 0, 0, 0), col(0, 0, 0, 0.3f), col(0, 0, 0, 0.88f));
+
+    // en haut à gauche : quitter le plein écran (sur un rond sombre, lisible sur n'importe quelle pochette)
+    dl->AddCircleFilled(o + ImVec2{38 * S, 36 * S}, 20 * S, col(0, 0, 0, 0.35f), 32);
     ImGui::SetCursorScreenPos(o + ImVec2{20 * S, 18 * S});
     if (iconBtn("fexit", I_MINI, 36 * S)) toggleFull();
     ImGui::SetItemTooltip("Exit full screen (Esc)");
 
-    // pochette avec une ombre douce, qui respire un peu en pause (comme Apple Music)
-    float k = animTo(ImGui::GetID("##fcov"), isPlaying() || !t ? 1.f : 0.86f, 6), c2 = cs * k;
-    ImVec2 cp{cx - c2 / 2, y0 + (cs - c2) / 2};
-    glow(dl, cp + ImVec2{c2, c2} * 0.5f + ImVec2{0, 18 * S}, c2 * 0.85f, ImVec4{0, 0, 0, 1}, 0.55f);
-    coverAt(dl, t ? t->image : "icon:", "", cp, c2, 16 * S);
-
-    // titre, artiste, favori
-    float ty = y0 + cs + 26 * S;
-    textAt(dl, {x0, ty}, cs - 44 * S, col(1, 1, 1), t ? t->title : "Glass", g_bold, 24);
-    textAt(dl, {x0, ty + 32 * S}, cs - 44 * S, col(1, 1, 1, 0.65f), t ? t->artist : "Nothing playing", nullptr, 18);
-    ImGui::SetCursorScreenPos({x0 + cs - 38 * S, ty + 6 * S});
+    // titre, artiste, favori, progression, commandes, volume : en bas à gauche, sur la pochette
+    float x0 = o.x + 48 * S, cw = std::min(cs * 0.72f, 560 * S), cx = x0 + cw / 2;
+    float ty = o.y + sz.y - 290 * S;
+    textAt(dl, {x0, ty}, cw - 48 * S, col(1, 1, 1), t ? t->title : "Glass", g_bold, 30);
+    textAt(dl, {x0, ty + 40 * S}, cw - 48 * S, col(1, 1, 1, 0.7f), t ? t->artist : "Nothing playing", nullptr, 19);
+    ImGui::SetCursorScreenPos({x0 + cw - 40 * S, ty + 8 * S});
     bool fav = t && isFav(t->uri);
-    if (iconBtn("ffav", fav ? I_HEART : I_HEART_O, 38 * S, fav) && t) toggleFav(*t);
+    if (iconBtn("ffav", fav ? I_HEART : I_HEART_O, 40 * S, fav) && t) toggleFav(*t);
 
-    // progression
     static float sv = 0;
     static bool drag = false;
     double dur = durMs();
     if (!drag) sv = (float)posMs();
-    float py = ty + 70 * S;
+    float py = ty + 84 * S;
     ImGui::SetCursorScreenPos({x0, py});
-    bool rel = scrub("##fseek", &sv, (float)std::max(dur, 1.0), cs);
+    bool rel = scrub("##fseek", &sv, (float)std::max(dur, 1.0), cw);
     drag = ImGui::IsItemActive();
     if (rel && t) seekMs(sv);
     std::string a1 = g_loading && t ? "..." : fmtTime(sv), a2 = "-" + fmtTime(std::max(0.0, dur - sv));
     float fs = 13 * S * g_set.textScale;
-    dl->AddText(ImGui::GetFont(), fs, {x0, py + 20 * S}, col(1, 1, 1, 0.55f), a1.c_str());
-    dl->AddText(ImGui::GetFont(), fs, {x0 + cs - ImGui::GetFont()->CalcTextSizeA(fs, FLT_MAX, 0, a2.c_str()).x, py + 20 * S}, col(1, 1, 1, 0.55f), a2.c_str());
+    dl->AddText(ImGui::GetFont(), fs, {x0, py + 20 * S}, col(1, 1, 1, 0.6f), a1.c_str());
+    dl->AddText(ImGui::GetFont(), fs, {x0 + cw - ImGui::GetFont()->CalcTextSizeA(fs, FLT_MAX, 0, a2.c_str()).x, py + 20 * S}, col(1, 1, 1, 0.6f), a2.c_str());
 
-    // commandes
-    float ps = 66 * S, bs = 44 * S, gap = 18 * S, row = bs * 4 + ps + gap * 4, bx = cx - row / 2, by = py + 46 * S;
+    float ps = 66 * S, bs = 44 * S, gap = 18 * S, row = bs * 4 + ps + gap * 4, bx = cx - row / 2, by = py + 44 * S;
     ImGui::SetCursorScreenPos({bx, by + (ps - bs) / 2});
     if (iconBtn("fshuf", I_SHUFFLE, bs, g_shuffle)) toggleShuffle();
     ImGui::SetCursorScreenPos({bx + bs + gap, by + (ps - bs) / 2});
@@ -4470,8 +4489,7 @@ static void fullPlayer(ImGuiViewport* vp) {
     ImGui::SetCursorScreenPos({bx + (bs + gap) * 3 + ps + gap, by + (ps - bs) / 2});
     if (iconBtn("frep", I_REPEAT1, bs, g_repeat)) g_repeat = !g_repeat;
 
-    // volume
-    float vy = by + ps + 26 * S, vw = cs * 0.7f;
+    float vy = by + ps + 24 * S, vw = cw * 0.6f;
     iconAt(dl, {cx - vw / 2 - 18 * S, vy + 8 * S}, I_VOL, 15 * S, col(1, 1, 1, 0.7f));
     ImGui::SetCursorScreenPos({cx - vw / 2, vy});
     float old = g_set.vol;
@@ -4480,7 +4498,7 @@ static void fullPlayer(ImGuiViewport* vp) {
 
     // paroles à droite, synchronisées (la vue paroles de Glass, sans son en-tête)
     if (lyr) {
-        float lx = o.x + sz.x * 0.52f;
+        float lx = o.x + std::max(cs * 0.88f, sz.x * 0.52f);  // là où la pochette s'est presque effacée
         ImGui::SetCursorScreenPos({lx, o.y + 60 * S});
         ImGui::BeginChild("fulllyr", {o.x + sz.x - 60 * S - lx, sz.y - 120 * S}, 0, ImGuiWindowFlags_NoBackground | ImGuiWindowFlags_NoScrollbar);
         lyricsView(false);
