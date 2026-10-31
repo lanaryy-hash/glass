@@ -4552,20 +4552,36 @@ static void toggleFull() {  // lecteur plein écran ; Échap ou F11 pour sortir
 }
 
 // Image qui s'efface vers la droite : pleine jusqu'à `from` (fraction de la largeur), puis transparente au bord (courbe douce).
-static void imageFadeRight(ImDrawList* dl, ImTextureID tx, ImVec2 a, ImVec2 b, float from, float alpha = 1) {
-    const int N = 16;  // bandes verticales : la transparence passe d'un sommet à l'autre
+static void imageFade(ImDrawList* dl, ImTextureID tx, ImVec2 a, ImVec2 b, float from, float alpha = 1, bool down = false) {  // down : vers le bas (écran vertical)
+    const int N = 16;  // bandes : la transparence passe d'un sommet à l'autre
     auto al = [&](float u) { float t = u <= from ? 0 : (u - from) / (1 - from); return (ImU32)(255 * alpha * (1 - t * t * (3 - 2 * t))) << IM_COL32_A_SHIFT | 0x00FFFFFF; };
     dl->PushTexture(tx);
     dl->PrimReserve(6 * N, 4 * N);
     for (int k = 0; k < N; k++) {
         float u0 = k == 0 ? 0 : from + (1 - from) * (k - 1) / (N - 1), u1 = from + (1 - from) * k / (N - 1);
-        float x0 = a.x + (b.x - a.x) * u0, x1 = a.x + (b.x - a.x) * u1;
         ImDrawIdx i = (ImDrawIdx)dl->_VtxCurrentIdx;
         dl->PrimWriteIdx(i); dl->PrimWriteIdx(i + 1); dl->PrimWriteIdx(i + 2); dl->PrimWriteIdx(i); dl->PrimWriteIdx(i + 2); dl->PrimWriteIdx(i + 3);
-        dl->PrimWriteVtx({x0, a.y}, {u0, 0}, al(u0)); dl->PrimWriteVtx({x1, a.y}, {u1, 0}, al(u1));
-        dl->PrimWriteVtx({x1, b.y}, {u1, 1}, al(u1)); dl->PrimWriteVtx({x0, b.y}, {u0, 1}, al(u0));
+        if (down) {
+            float y0 = a.y + (b.y - a.y) * u0, y1 = a.y + (b.y - a.y) * u1;
+            dl->PrimWriteVtx({a.x, y0}, {0, u0}, al(u0)); dl->PrimWriteVtx({b.x, y0}, {1, u0}, al(u0));
+            dl->PrimWriteVtx({b.x, y1}, {1, u1}, al(u1)); dl->PrimWriteVtx({a.x, y1}, {0, u1}, al(u1));
+        } else {
+            float x0 = a.x + (b.x - a.x) * u0, x1 = a.x + (b.x - a.x) * u1;
+            dl->PrimWriteVtx({x0, a.y}, {u0, 0}, al(u0)); dl->PrimWriteVtx({x1, a.y}, {u1, 0}, al(u1));
+            dl->PrimWriteVtx({x1, b.y}, {u1, 1}, al(u1)); dl->PrimWriteVtx({x0, b.y}, {u0, 1}, al(u0));
+        }
     }
     dl->PopTexture();
+}
+
+// Pochette en grand : la plus haute définition que donne le service (les listes n'utilisent que la petite).
+static std::string hiRes(std::string u) {
+    auto swap = [&](const char* a, const char* b) { if (size_t p = u.find(a); p != std::string::npos) { u.replace(p, strlen(a), b); return true; } return false; };
+    if (u.find("i.scdn.co/image/") != std::string::npos) swap("00001e02", "0000b273") || swap("00004851", "0000b273");  // Spotify : 300 / 64 -> 640 px
+    else if (u.find("sndcdn.com") != std::string::npos) swap("-t300x300.", "-t500x500.") || swap("-large.", "-t500x500.");  // SoundCloud
+    else if (u.find("mzstatic.com") != std::string::npos) swap("300x300", "1000x1000") || swap("100x100", "1000x1000");  // Apple / iTunes
+    else if (u.find("dzcdn.net") != std::string::npos) swap("250x250", "1000x1000");  // Deezer
+    return u;
 }
 
 // Lecteur plein écran façon Apple Music : la pochette en grand, collée à gauche, qui fond vers la droite ;
@@ -4574,16 +4590,19 @@ static void fullPlayer(ImGuiViewport* vp) {
     ImDrawList* dl = ImGui::GetWindowDrawList();
     ImVec2 o = vp->Pos, sz = vp->Size;
     Track* t = current();
-    bool lyr = sz.x > 1000 * S;  // assez large : les paroles à droite
-    float cs = lyr ? sz.y : std::min(sz.y, sz.x);  // toute la hauteur
-    ImVec2 ca{o.x, o.y + (sz.y - cs) * 0.5f};
+    bool portrait = sz.y > sz.x * 1.1f;  // écran vertical : pochette en haut, paroles au milieu, commandes en bas
+    bool lyr = portrait || sz.x > 1000 * S;
+    float cs = portrait ? sz.x : lyr ? sz.y : std::min(sz.y, sz.x);  // toute la largeur / toute la hauteur
+    ImVec2 ca{o.x, portrait ? o.y : o.y + (sz.y - cs) * 0.5f};
 
-    // la pochette, puis un voile sombre en bas pour lire le titre et les commandes
+    // la pochette en haute définition (la petite en attendant), puis un voile sombre en bas pour lire le titre et les commandes
     float k = animTo(ImGui::GetID("##fcov"), isPlaying() || !t ? 1.f : 0.6f, 4);  // s'assombrit un peu en pause
-    if (ImTextureID tx = t ? tex(t->image, 800) : 0) imageFadeRight(dl, tx, ca, ca + ImVec2{cs, cs}, 0.4f, 0.4f + 0.6f * k);
+    ImTextureID tx = t ? tex(hiRes(t->image), 1280) : 0;
+    if (!tx && t) tx = tex(t->image, 300);  // en cours de chargement, ou pas de grande version (lien refusé)
+    if (tx) imageFade(dl, tx, ca, ca + ImVec2{cs, cs}, portrait ? 0.55f : 0.4f, 0.4f + 0.6f * k, portrait);
     else coverAt(dl, "icon:", "", ca + ImVec2{cs * 0.25f, cs * 0.25f}, cs * 0.4f, 24 * S);
-    float sh = sz.y * 0.55f;  // plus sombre en bas à gauche, là où sont le titre et les commandes
-    dl->AddRectFilledMultiColor({o.x, o.y + sz.y - sh}, {o.x + cs, o.y + sz.y}, col(0, 0, 0, 0), col(0, 0, 0, 0), col(0, 0, 0, 0.3f), col(0, 0, 0, 0.88f));
+    float sh = sz.y * (portrait ? 0.4f : 0.55f);  // plus sombre en bas, là où sont le titre et les commandes
+    dl->AddRectFilledMultiColor({o.x, o.y + sz.y - sh}, {o.x + sz.x, o.y + sz.y}, col(0, 0, 0, 0), col(0, 0, 0, 0), col(0, 0, 0, 0.3f), col(0, 0, 0, 0.88f));
 
     // en haut à gauche : quitter le plein écran (sur un rond sombre, lisible sur n'importe quelle pochette)
     dl->AddCircleFilled(o + ImVec2{38 * S, 36 * S}, 20 * S, col(0, 0, 0, 0.35f), 32);
@@ -4592,7 +4611,7 @@ static void fullPlayer(ImGuiViewport* vp) {
     ImGui::SetItemTooltip("Exit full screen (Esc)");
 
     // titre, artiste, favori, progression, commandes, volume : en bas à gauche, sur la pochette
-    float x0 = o.x + 48 * S, cw = std::min(cs * 0.72f, 560 * S), cx = x0 + cw / 2;
+    float cw = portrait ? std::min(sz.x - 96 * S, 620 * S) : std::min(cs * 0.72f, 560 * S), x0 = portrait ? o.x + (sz.x - cw) / 2 : o.x + 48 * S, cx = x0 + cw / 2;
     float ty = o.y + sz.y - 290 * S;
     textAt(dl, {x0, ty}, cw - 48 * S, col(1, 1, 1), t ? t->title : "Glass", g_bold, 30);
     textAt(dl, {x0, ty + 40 * S}, cw - 48 * S, col(1, 1, 1, 0.7f), t ? t->artist : "Nothing playing", nullptr, 19);
@@ -4634,10 +4653,14 @@ static void fullPlayer(ImGuiViewport* vp) {
     if (g_set.vol != old) setVolume();
 
     // paroles à droite, synchronisées (la vue paroles de Glass, sans son en-tête)
+    if (lyr) {  // à droite, ou (écran vertical) entre la pochette et les commandes
+        float lx = portrait ? x0 : o.x + std::max(cs * 0.88f, sz.x * 0.52f);  // là où la pochette s'est presque effacée
+        float ly = portrait ? o.y + cs * 0.72f : o.y + 60 * S, lw = portrait ? cw : o.x + sz.x - 60 * S - lx, lh = portrait ? ty - 40 * S - ly : sz.y - 120 * S;
+        ImGui::SetCursorScreenPos({lx, ly});
+        if (lh > 120 * S) ImGui::BeginChild("fulllyr", {lw, lh}, 0, ImGuiWindowFlags_NoBackground | ImGuiWindowFlags_NoScrollbar);
+        else { lyr = false; }
+    }
     if (lyr) {
-        float lx = o.x + std::max(cs * 0.88f, sz.x * 0.52f);  // là où la pochette s'est presque effacée
-        ImGui::SetCursorScreenPos({lx, o.y + 60 * S});
-        ImGui::BeginChild("fulllyr", {o.x + sz.x - 60 * S - lx, sz.y - 120 * S}, 0, ImGuiWindowFlags_NoBackground | ImGuiWindowFlags_NoScrollbar);
         lyricsView(false);
         ImGui::EndChild();
     }
