@@ -377,6 +377,25 @@ static void toggleFav(const Track& t) {
     }
     saveMine();
 }
+// ---------- historique d'écoute (page Stats) : chaque titre écouté au moins 30 s, dans history.jsonl ----------
+struct Play { long long t; std::string uri, title, artist, image; int ms; };  // quand (secondes), quoi, combien de temps écouté
+static std::vector<Play> g_history;
+static double g_listenMs = 0;  // temps réellement écouté du titre en cours
+static void logListen() {  // g_mx tenu : au changement de titre
+    if (g_has && g_listenMs >= 30000) {
+        Play p{nowId() / 1000, g_cur.uri, g_cur.title, g_cur.artist, g_cur.image, (int)g_listenMs};
+        g_history.push_back(p);
+        std::ofstream(g_dir / "history.jsonl", std::ios::app) << json{{"t", p.t}, {"uri", p.uri}, {"title", p.title}, {"artist", p.artist}, {"image", p.image}, {"ms", p.ms}}.dump() << "\n";
+    }
+    g_listenMs = 0;
+}
+static void loadHistory() {
+    std::ifstream f(g_dir / "history.jsonl");
+    for (std::string line; std::getline(f, line);)
+        if (json j = json::parse(line, nullptr, false); j.is_object() && !jstr(j, "uri").empty())
+            g_history.push_back({(long long)jnum(j, "t"), jstr(j, "uri"), jstr(j, "title"), jstr(j, "artist"), jstr(j, "image"), (int)jnum(j, "ms")});
+}
+
 static void addRecent(const Track& t) {
     List* r = findList("glass:recent");
     if (!r || g_plUri == r->uri) return;  // on ne réordonne pas la liste qu'on est en train d'écouter
@@ -743,7 +762,27 @@ static void openCard(const Card& c) {  // g_mx tenu : page d'artiste ou album
 }
 
 
+static void loadYoutube(const std::string& url, const std::string& list = "", const std::string& query = "");
+static std::vector<Track> deezerRadio(const std::string& artist);
+// SoundCloud et YouTube Music : résultats dans les onglets de la recherche (listes cachées "search:sc", "search:yt")
+static void searchMore(const std::string& q) {  // g_mx tenu
+    for (const char* u : {"search:sc", "search:yt"}) {
+        if (!findList(u)) { List l{u, ""}; l.hidden = true; g_lists.push_back(l); }
+        if (List* l = findList(u)) { l->tracks.clear(); l->loaded = false; l->requested = true; }
+    }
+    std::thread([q, auth = scAuth()] {
+        json r = json::parse(plat::httpGet("https://api-v2.soundcloud.com/search/tracks?q=" + urlEnc(q) + "&limit=30&client_id=" + scClientId(), auth), nullptr, false);
+        std::vector<Track> tracks;
+        for (auto& t : jget(r, "collection")) if (t.is_object()) tracks.push_back(scTrack(t, ""));
+        std::lock_guard lk(g_mx);
+        if (q == g_searchSent) if (List* l = findList("search:sc")) { l->tracks = std::move(tracks); l->loaded = true; }
+        wake();
+    }).detach();
+    loadYoutube("ytsearch25:" + q, "search:yt", q);  // YouTube classique : chaîne et durée connues (YouTube Music ne donne que le titre)
+}
+
 static void searchCatalog(const std::string& q) {  // g_mx tenu
+    searchMore(q);
     g_artists.clear();
     if (g_webOk) {
         send({{"cmd", "search"}, {"q", q}});
@@ -803,12 +842,16 @@ static void loadCatalogList(List& l) {  // g_mx tenu : titres d'une page d'artis
 static void send(const json& j) { plat::engineSend(j.dump() + "\n"); }
 static void amPost(const json& j);
 
-static void loadYoutube(const std::string& url);
 static void requestTracks(List& l) {
     if (l.requested || l.own || l.uri == "local" || l.uri == "search") return;
     if (l.uri.rfind("artist:", 0) == 0 || l.uri.rfind("itunes:album:", 0) == 0) { l.requested = true; loadCatalogList(l); return; }
     if (l.uri.rfind("am:", 0) == 0) { if (g_amAuth) { l.requested = true; amPost({{"cmd", "list"}, {"id", l.uri.substr(3)}}); } return; }
     if (isApple(l.uri)) { l.requested = true; loadApple(l.uri); return; }
+    if (l.uri.rfind("mix:", 0) == 0) {  // mix d'un artiste : sa radio Deezer
+        l.requested = true;
+        std::thread([uri = l.uri] { std::vector<Track> t = deezerRadio(uri.substr(4)); fillList(uri, "", "", t, "Mix: nothing found for this artist"); }).detach();
+        return;
+    }
     if (l.uri == "soundcloud:likes") { if (g_scId) { l.requested = true; loadScLikes(); } return; }  // une fois la session vérifiée
     if (isSoundcloud(l.uri)) { l.requested = true; loadSoundcloud(l.uri); return; }
     if (isYoutube(l.uri)) { l.requested = true; loadYoutube(l.uri); return; }
@@ -819,6 +862,15 @@ static void requestTracks(List& l) {
 
 static void ytPlay(const Track& t);
 static void moreLyrics(const Track& t, bool haveText);
+// « Paroles fausses » : sources refusées pour un titre (pendant la session) : spotify, lrclib, netease, ovh, ai
+static std::map<std::string, std::set<std::string>> g_badLyr;
+static std::string lyrFamily(const std::string& src) {
+    if (src.rfind("LRCLIB", 0) == 0) return "lrclib";
+    if (src.rfind("NetEase", 0) == 0) return "netease";
+    if (src.rfind("lyrics.ovh", 0) == 0) return "ovh";
+    if (src.find("AI") != std::string::npos) return "ai";  // écrites ou calées par l'IA (ce PC ou la base Glass)
+    return "spotify";
+}
 static void wvPost(const json& j);
 
 static void onEngine(const std::string& line) try {
@@ -859,6 +911,7 @@ static void onEngine(const std::string& line) try {
         for (auto& l : j["lines"]) g_lyr.push_back({(int)jnum(l, "t"), jstr(l, "w")});
         g_lyrSynced = j.value("synced", false);
         g_lyrSrc = jstr(j, "src");
+        if (g_badLyr[g_lyrKey].count(lyrFamily(g_lyrSrc))) { g_lyr.clear(); g_lyrSynced = false; }  // source refusée (« Wrong lyrics »)
         g_lyrState = g_lyr.empty() ? 3 : 2;
         g_lyrAlign = !g_lyr.empty() && g_lyrSrc.rfind("LRCLIB", 0) == 0;  // les paroles de Spotify sont déjà calées
         if (!g_lyrSynced && g_has && g_cur.uri == g_lyrKey) {  // rien de synchronisé : d'autres sites (NetEase, lyrics.ovh)
@@ -1069,8 +1122,9 @@ static std::vector<LyricLine> parseLrc(const std::string& text, double scale, bo
 static std::string readFile(const fs::path& p) { std::ifstream f(p, std::ios::binary); return {std::istreambuf_iterator<char>(f), {}}; }
 
 // ---------- YouTube / YouTube Music : liens publics lus par yt-dlp (titres seulement, sans rien télécharger) ----------
-static void loadYoutube(const std::string& url) {
-    std::thread([url] {
+// list : liste à remplir (par défaut celle du lien) ; query : recherche (résultats ignorés si on cherche déjà autre chose)
+static void loadYoutube(const std::string& url, const std::string& list, const std::string& query) {
+    std::thread([url, list = list.empty() ? url : list, query] {
         std::string tag = std::to_string(nowId()), name;
         fs::path items = g_dir / "cache" / upath("yt" + tag + ".jsonl"), title = g_dir / "cache" / upath("yt" + tag + ".txt"), y = ytdlpPath();
         std::vector<Track> tracks;
@@ -1079,7 +1133,7 @@ static void loadYoutube(const std::string& url) {
             fs::create_directories(items.parent_path(), ec);
             for (int attempt = 0; attempt < 2 && !fileExists(items); attempt++)  // YouTube refuse parfois la 1re demande : on réessaie une fois
                 plat::run({ustr(y), "-q", "--no-warnings", "--flat-playlist", "--skip-download", "--print-to-file", "%()j", ustr(items),
-                           "--print-to-file", "playlist:%(title)s", ustr(title), url}, 120000);
+                           "--print-to-file", "playlist:%(title)s", ustr(title), "--playlist-items", query.empty() ? "1:5000" : "1:25", url}, 120000);  // recherche : les 25 premiers
             std::istringstream in(readFile(items));
             for (std::string line; std::getline(in, line);) {
                 json v = json::parse(line, nullptr, false);
@@ -1087,6 +1141,13 @@ static void loadYoutube(const std::string& url) {
                 if (id.empty() || (name1.rfind("[", 0) == 0 && !jnum(v, "duration"))) continue;  // [Private video], [Deleted video]
                 if (artist.empty()) artist = jstr(v, "uploader");
                 if (artist.size() > 8 && artist.compare(artist.size() - 8, 8, " - Topic") == 0) artist.resize(artist.size() - 8);  // chaînes auto de YouTube Music
+                if (!query.empty()) {  // recherche : « Artiste - Titre (official audio) » -> « Titre »
+                    std::string low = name1, la = artist;
+                    for (std::string* x : {&low, &la}) std::transform(x->begin(), x->end(), x->begin(), [](unsigned char c) { return (char)tolower(c); });
+                    if (!la.empty() && low.rfind(la + " - ", 0) == 0) { name1.erase(0, la.size() + 3); low.erase(0, la.size() + 3); }
+                    for (const char* junk : {" (official audio)", " (official video)", " (official music video)", " (official lyric video)", " (lyric video)", " (lyrics)", " (audio)", " (visualizer)", " [official audio]", " [official video]", " [official music video]"})
+                        if (size_t p = low.find(junk); p != std::string::npos) { name1.erase(p, strlen(junk)); low.erase(p, strlen(junk)); }
+                }
                 tracks.push_back(Track{"youtube:video:" + id, name1, artist, "", "https://i.ytimg.com/vi/" + id + "/hqdefault.jpg", (int)jnum(v, "duration") * 1000});
             }
             name = readFile(title);
@@ -1094,7 +1155,13 @@ static void loadYoutube(const std::string& url) {
             fs::remove(items, ec); fs::remove(title, ec);
         }
         if (name.empty() && tracks.size() == 1) name = tracks[0].title;
-        fillList(url, name, tracks.empty() ? "" : tracks[0].image, tracks, y.empty() ? kNoYtdlp : url.size() > 7 && url.compare(url.size() - 7, 7, "/videos") == 0 ? "YouTube: this channel has no videos, paste an album or playlist link"
+        if (!query.empty()) {  // recherche : pas de message « introuvable », juste la liste
+            std::lock_guard lk(g_mx);
+            if (query == g_searchSent) if (List* l = findList(list)) { l->tracks = std::move(tracks); l->loaded = true; }
+            wake();
+            return;
+        }
+        fillList(list, name, tracks.empty() ? "" : tracks[0].image, tracks, y.empty() ? kNoYtdlp : url.size() > 7 && url.compare(url.size() - 7, 7, "/videos") == 0 ? "YouTube: this channel has no videos, paste an album or playlist link"
                                                                                            : "YouTube: couldn't read this link (private?)");
     }).detach();
 }
@@ -1203,17 +1270,17 @@ static bool lyricsOvh(const Track& t, std::vector<LyricLine>& lines) {
 }
 
 // Autres sites quand les premières sources n'ont rien de synchronisé : NetEase, puis lyrics.ovh si on n'a encore rien.
-static bool moreLyricsNow(const Track& t, bool haveText, std::vector<LyricLine>& lines, bool& synced, std::string& src) {
-    if (netease(t, lines, synced, src)) return true;
-    if (!haveText && lyricsOvh(t, lines)) { synced = false; src = "lyrics.ovh"; return true; }
+static bool moreLyricsNow(const Track& t, bool haveText, std::vector<LyricLine>& lines, bool& synced, std::string& src, const std::set<std::string>& bad) {
+    if (!bad.count("netease") && netease(t, lines, synced, src)) return true;
+    if (!haveText && !bad.count("ovh") && lyricsOvh(t, lines)) { synced = false; src = "lyrics.ovh"; return true; }
     return false;
 }
 static void moreLyrics(const Track& t, bool haveText) {  // g_mx tenu : cherche en arrière-plan, remplace si mieux
-    std::thread([t, haveText] {
+    std::thread([t, haveText, bad = g_badLyr[t.uri]] {
         std::vector<LyricLine> lines;
         bool synced = false;
         std::string src;
-        bool found = moreLyricsNow(t, haveText, lines, synced, src);
+        bool found = moreLyricsNow(t, haveText, lines, synced, src, bad);
         std::lock_guard lk(g_mx);
         if (g_lyrKey != t.uri) return;  // on écoute autre chose
         if (!found) { if (g_lyr.empty()) g_lyrState = 3; wake(); return; }
@@ -1316,18 +1383,18 @@ static bool useShared(const Track& t) {  // base partagée : true si trouvées (
 }
 
 // Paroles sur Internet sans le moteur Spotify (Apple Music, fichiers, Spotify non connecté) : base Glass, puis LRCLIB.
-static void findLyrics(const Track& t) {
-    std::thread([t] {
-        if (useShared(t)) return;
+static void findLyrics(const Track& t) {  // g_mx tenu
+    std::thread([t, bad = g_badLyr[t.uri]] {
+        if (!bad.count("ai") && useShared(t)) return;
         std::vector<LyricLine> lines;
-        bool synced;
+        bool synced = false;
         std::string src;
-        lrclib(t, lines, synced, src);
+        if (!bad.count("lrclib")) lrclib(t, lines, synced, src);
         if (!synced) {  // pas de minutage : d'autres sites (NetEase, lyrics.ovh)
             std::vector<LyricLine> more;
             bool s2 = false;
             std::string src2;
-            if (moreLyricsNow(t, !lines.empty(), more, s2, src2)) { lines = std::move(more); synced = s2; src = src2; }
+            if (moreLyricsNow(t, !lines.empty(), more, s2, src2, bad)) { lines = std::move(more); synced = s2; src = src2; }
         }
         std::lock_guard lk(g_mx);
         if (g_lyrKey != t.uri) return;
@@ -1668,6 +1735,7 @@ static void downloadAll(const List& l) {
 }
 
 static void startTrack(const Track& t) {
+    logListen();  // le titre d'avant compte dans les stats s'il a été écouté au moins 30 s
     g_cur = t; g_has = true;
     g_failed = g_spEnded = false; ++g_gen;
     g_status.clear();
@@ -1739,32 +1807,39 @@ static void toggleShuffle() {
 static std::set<std::string> g_radioSeen;  // titres déjà proposés pendant la session
 static bool g_radioBusy = false;
 
+// Radio d'un artiste chez Deezer (publique, sans compte) : titres proches, joués via YouTube. g_mx NON tenu.
+static std::vector<Track> deezerRadio(const std::string& artist) {
+    json a = json::parse(plat::httpGet("https://api.deezer.com/search/artist?limit=1&q=" + urlEnc(artist)), nullptr, false);
+    const json& found = jget(a, "data");
+    json r = found.is_array() && !found.empty() && found[0].is_object() && found[0]["id"].is_number()
+                 ? json::parse(plat::httpGet("https://api.deezer.com/artist/" + std::to_string(found[0]["id"].get<long long>()) + "/radio?limit=50"), nullptr, false)
+                 : json();
+    std::vector<Track> out;
+    for (auto& x : jget(r, "data")) {
+        if (!x.is_object()) continue;
+        Track t;
+        t.uri = "deezer:track:" + std::to_string(x.value("id", 0LL));
+        t.title = jstr(x, "title"); t.artist = jstr(jget(x, "artist"), "name");
+        t.album = jstr(jget(x, "album"), "title"); t.image = jstr(jget(x, "album"), "cover_medium");
+        t.ms = (int)jnum(x, "duration") * 1000;
+        std::string low = t.title;
+        std::transform(low.begin(), low.end(), low.begin(), [](unsigned char c) { return (char)tolower(c); });
+        if (!t.title.empty() && low.find("karaoke") == std::string::npos) out.push_back(t);  // sans les reprises karaoké
+    }
+    return out;
+}
+
 static void startRadio(const Track& seed) {  // g_mx tenu
     if (g_radioBusy) return;
     g_radioBusy = true;
     std::string artist = firstArtist(seed.artist);
     g_status = "Radio: songs similar to " + artist + "...";
     std::thread([artist, gen = g_gen.load()] {
-        json a = json::parse(plat::httpGet("https://api.deezer.com/search/artist?limit=1&q=" + urlEnc(artist)), nullptr, false);
-        const json& found = jget(a, "data");
-        json r = found.is_array() && !found.empty() && found[0].is_object() && found[0]["id"].is_number()
-                     ? json::parse(plat::httpGet("https://api.deezer.com/artist/" + std::to_string(found[0]["id"].get<long long>()) + "/radio?limit=50"), nullptr, false)
-                     : json();
+        std::vector<Track> found = deezerRadio(artist);
         std::lock_guard lk(g_mx);
         g_radioBusy = false;
         List radio{"glass:radio", "Radio · " + artist};
-        for (auto& x : jget(r, "data")) {
-            if (!x.is_object()) continue;
-            Track t;
-            t.uri = "deezer:track:" + std::to_string(x.value("id", 0LL));
-            t.title = jstr(x, "title"); t.artist = jstr(jget(x, "artist"), "name");
-            t.album = jstr(jget(x, "album"), "title"); t.image = jstr(jget(x, "album"), "cover_medium");
-            t.ms = (int)jnum(x, "duration") * 1000;
-            std::string low = t.title;
-            std::transform(low.begin(), low.end(), low.begin(), [](unsigned char c) { return (char)tolower(c); });
-            if (t.title.empty() || low.find("karaoke") != std::string::npos) continue;  // reprises karaoké
-            if (radio.tracks.size() < 25 && g_radioSeen.insert(t.uri).second) radio.tracks.push_back(t);
-        }
+        for (auto& t : found) if (radio.tracks.size() < 25 && g_radioSeen.insert(t.uri).second) radio.tracks.push_back(t);
         if (gen != g_gen) return;  // tu as lancé autre chose entre-temps
         if (radio.tracks.empty()) { g_status = "Radio: nothing found, starting the list over"; playPos(0); wake(); return; }
         radio.loaded = radio.requested = radio.hidden = true;
@@ -2176,14 +2251,14 @@ static const char *I_PLAY = u8"\uE768", *I_PAUSE = u8"\uE769", *I_PREV = u8"\uE8
                   *I_NOTE = u8"\uEC4F", *I_HEART = u8"\uEB52", *I_HEART_O = u8"\uEB51", *I_FOLDER = u8"\uE8D6", *I_MIN = u8"\uE921",
                   *I_MAX = u8"\uE922", *I_RESTORE = u8"\uE923", *I_CLOSE = u8"\uE8BB", *I_GEAR = u8"\uE713",
                   *I_LYRICS = u8"\uE720", *I_QUEUE = u8"\uE8FD", *I_MORE = u8"\uE712", *I_EDIT = u8"\uE70F",
-                  *I_MINI = u8"\uE73F", *I_EXPAND = u8"\uE740", *I_SEARCH = u8"\uE721", *I_HISTORY = u8"\uE81C", *I_LIST = u8"\uE8A4", *I_DOWNLOAD = u8"\uE896", *I_HOME = u8"\uE80F";
+                  *I_MINI = u8"\uE73F", *I_EXPAND = u8"\uE740", *I_SEARCH = u8"\uE721", *I_HISTORY = u8"\uE81C", *I_LIST = u8"\uE8A4", *I_DOWNLOAD = u8"\uE896", *I_HOME = u8"\uE80F", *I_STATS = u8"\uE9D2";
 #else  // icônes Material Icons (fournies avec Glass.app)
 static const char *I_PLAY = u8"\uE037", *I_PAUSE = u8"\uE034", *I_PREV = u8"\uE045", *I_NEXT = u8"\uE044",
                   *I_SHUFFLE = u8"\uE043", *I_REPEAT1 = u8"\uE041", *I_VOL = u8"\uE050", *I_ADD = u8"\uE145",
                   *I_NOTE = u8"\uE405", *I_HEART = u8"\uE87D", *I_HEART_O = u8"\uE87E", *I_FOLDER = u8"\uE2C7", *I_MIN = u8"\uE931",
                   *I_MAX = u8"\uE3C6", *I_RESTORE = u8"\uE3E0", *I_CLOSE = u8"\uE5CD", *I_GEAR = u8"\uE8B8",
                   *I_LYRICS = u8"\uE029", *I_QUEUE = u8"\uE03D", *I_MORE = u8"\uE5D3", *I_EDIT = u8"\uE3C9",
-                  *I_MINI = u8"\uE911", *I_EXPAND = u8"\uF1CE", *I_SEARCH = u8"\uE8B6", *I_HISTORY = u8"\uE889", *I_LIST = u8"\uE896", *I_DOWNLOAD = u8"\uF090", *I_HOME = u8"\uE88A";
+                  *I_MINI = u8"\uE911", *I_EXPAND = u8"\uF1CE", *I_SEARCH = u8"\uE8B6", *I_HISTORY = u8"\uE889", *I_LIST = u8"\uE896", *I_DOWNLOAD = u8"\uF090", *I_HOME = u8"\uE88A", *I_STATS = u8"\uE24B";
 #endif
 
 static ImU32 col(float r, float g, float b, float a = 1) { return ImGui::GetColorU32(ImVec4{r, g, b, a}); }
@@ -3070,6 +3145,7 @@ static void sidebar() {
     static char url[512];
     float w = ImGui::GetContentRegionAvail().x;
     navItem("##home", I_HOME, "Home", "home");
+    navItem("##stats", I_STATS, "Stats", "stats");
     ImGui::Dummy({0, 4 * S});
     ImGui::PushFont(g_bold, 20); ImGui::TextUnformatted("Library"); ImGui::PopFont();
     ImGui::SameLine(w - 58 * S);
@@ -3163,15 +3239,25 @@ static void ensureLyrics(const Track& t) {
             if (text.find("[ar:") == std::string::npos) text = lrcHeader(t) + text;  // anciennes paroles sans en-tête
             if (g_lyrState == 2) shareLyrics(t, text);
         }
-        else if (t.uri.rfind("spotify:", 0) == 0 && g_spReady)  // Spotify d'abord, puis LRCLIB
+        else if (t.uri.rfind("spotify:", 0) == 0 && g_spReady && !g_badLyr[t.uri].count("spotify"))  // Spotify d'abord, puis LRCLIB
             send({{"cmd", "lyrics"}, {"key", t.uri}, {"uri", t.uri}, {"title", t.title}, {"artist", t.artist}, {"ms", t.ms}});
         else findLyrics(t);  // Apple Music, fichiers, Spotify non connecté : base Glass puis LRCLIB
     }
     if (g_genRunning || g_listened.count(t.uri)) return;
     // trouvées sur Internet : l'IA écoute le titre une fois pour les caler sur le vrai son (base Glass d'abord)
-    if (g_lyrState == 2 && g_lyrAlign && g_set.alignLyrics) listenLyrics(t, g_lyr, true);
+    bool noAi = g_badLyr[t.uri].count("ai") > 0;  // l'IA s'est trompée sur ce titre : on ne lui redemande pas
+    if (g_lyrState == 2 && g_lyrAlign && g_set.alignLyrics && !noAi) listenLyrics(t, g_lyr, true);
     // rien trouvé : base Glass, puis l'IA les écrit (si activé)
-    else if (g_lyrState == 3 && !fileExists(lyricsFile(t, ".none"))) listenLyrics(t, {}, g_set.autoLyrics);
+    else if (g_lyrState == 3 && !fileExists(lyricsFile(t, ".none")) && !noAi) listenLyrics(t, {}, g_set.autoLyrics);
+}
+
+static void wrongLyrics(const Track& t) {  // g_mx tenu : on oublie ces paroles et on cherche ailleurs
+    g_badLyr[t.uri].insert(lyrFamily(g_lyrSrc));
+    std::error_code ec;
+    fs::remove(lyricsFile(t, ".lrc"), ec);  // version gardée sur ce PC (écrite ou calée par l'IA)
+    g_listened.erase(t.uri);
+    g_lyrKey.clear();  // nouvelle recherche au prochain affichage
+    g_status = "Looking for other lyrics...";
 }
 
 static void lyricsView(bool header = true) {  // header = false : colonne des paroles du lecteur plein écran
@@ -3211,7 +3297,7 @@ static void lyricsView(bool header = true) {  // header = false : colonne des pa
     int curLine = -1;
     if (g_lyrSynced) for (int i = 0; i < (int)g_lyr.size(); i++) if (g_lyr[i].t <= pos + 120) curLine = i;
     if (g_lyrSynced && header) {  // petite barre : décalage
-        ImGui::SetCursorPos({ImGui::GetWindowContentRegionMax().x - 330 * S, ImGui::GetCursorPosY() - 64 * S});
+        ImGui::SetCursorPos({ImGui::GetWindowContentRegionMax().x - 440 * S, ImGui::GetCursorPosY() - 64 * S});
         ImGui::TextDisabled("Offset %+.1f s", off / 1000.0);
         ImGui::SameLine();
         if (ImGui::SmallButton(" - ")) off -= 250;
@@ -3225,6 +3311,14 @@ static void lyricsView(bool header = true) {  // header = false : colonne des pa
         if (g_genRunning) ImGui::TextDisabled("AI is listening...");
         else if (ImGui::SmallButton("Resync (AI)")) { g_listened.erase(t->uri); listenLyrics(*t, g_lyr, true, true); }
         ImGui::SetItemTooltip("AI listens to the whole song and syncs each line to when it's sung");
+        ImGui::SameLine();
+        if (ImGui::SmallButton("Wrong lyrics")) wrongLyrics(*t);
+        ImGui::SetItemTooltip("Not the right lyrics? Glass forgets them and looks elsewhere (now from: %s)", g_lyrSrc.c_str());
+        ImGui::Dummy({0, 34 * S});
+    } else if (header && g_lyrState == 2) {  // paroles sans minutage : le bouton seul
+        ImGui::SetCursorPos({ImGui::GetWindowContentRegionMax().x - 130 * S, ImGui::GetCursorPosY() - 64 * S});
+        if (ImGui::SmallButton("Wrong lyrics")) wrongLyrics(*t);
+        ImGui::SetItemTooltip("Not the right lyrics? Glass forgets them and looks elsewhere (now from: %s)", g_lyrSrc.c_str());
         ImGui::Dummy({0, 34 * S});
     }
     ImGui::BeginChild("lyr", {0, 0}, 0, ImGuiWindowFlags_NoBackground | ImGuiWindowFlags_NoScrollbar);
@@ -4121,6 +4215,68 @@ static int shelfCard(const char* id, const std::string& img, const std::string& 
     return click ? (onPlay ? 2 : 1) : 0;
 }
 
+// Boutons en pastille (onglets) : true quand on change ; sel = index choisi.
+static bool pills(const char* id, std::initializer_list<const char*> names, int& sel) {
+    ImGui::PushID(id);
+    bool changed = false;
+    int i = 0;
+    for (const char* n : names) {
+        if (i) ImGui::SameLine(0, 8 * S);
+        bool on = sel == i;
+        ImVec4 a = acc();
+        ImGui::PushStyleColor(ImGuiCol_Button, on ? ImVec4{a.x, a.y, a.z, 0.9f} : ImVec4{1, 1, 1, 0.08f});
+        ImGui::PushStyleColor(ImGuiCol_ButtonHovered, on ? ImVec4{a.x, a.y, a.z, 1} : ImVec4{1, 1, 1, 0.14f});
+        ImGui::PushStyleColor(ImGuiCol_Text, on ? ImVec4{0, 0, 0, 0.9f} : ImVec4{1, 1, 1, 0.9f});
+        ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 999);
+        if (ImGui::Button(n) && !on) { sel = i; changed = true; }
+        ImGui::PopStyleVar();
+        ImGui::PopStyleColor(3);
+        i++;
+    }
+    ImGui::PopID();
+    return changed;
+}
+
+// Mix d'un artiste (sa radio Deezer) : ouvrir la liste, ou la lancer dès qu'elle est chargée.
+static std::string g_pendingPlay;  // liste à lancer dès qu'elle est chargée
+static void openMix(const std::string& artist, bool playNow) {  // g_mx tenu
+    std::string uri = "mix:" + artist;
+    if (!findList(uri)) { List l{uri, artist + " Mix", artistPic(artist)}; l.hidden = true; g_lists.push_back(l); }
+    List* l = findList(uri);
+    requestTracks(*l);
+    if (!playNow) { g_view = uri; g_lyricsOpen = false; return; }
+    if (l->loaded && !l->tracks.empty()) play(uri, 0); else g_pendingPlay = uri;
+}
+
+// Découvrir : des artistes proches de tes 3 préférés (Deezer), que tu n'as pas encore dans ta bibliothèque.
+struct Disc { std::string name, image; };
+static std::vector<Disc> g_discover;
+static void discoverArtists(const std::vector<LibArtist>& as) {  // g_mx tenu : une fois par lancement
+    static bool started = false;
+    if (started || as.empty()) return;
+    started = true;
+    auto low = [](std::string x) { std::transform(x.begin(), x.end(), x.begin(), [](unsigned char c) { return (char)tolower(c); }); return x; };
+    std::set<std::string> mine;
+    std::vector<std::string> top;
+    for (auto& a : as) mine.insert(low(a.name));
+    for (int i = 0; i < std::min(3, (int)as.size()); i++) top.push_back(as[i].name);
+    std::thread([top, mine, low] {
+        std::vector<Disc> out;
+        std::set<std::string> seen = mine;
+        for (auto& n : top) {
+            json a = json::parse(plat::httpGet("https://api.deezer.com/search/artist?limit=1&q=" + urlEnc(n)), nullptr, false);
+            const json& f = jget(a, "data");
+            if (!f.is_array() || f.empty() || !f[0].is_object()) continue;
+            json r = json::parse(plat::httpGet("https://api.deezer.com/artist/" + std::to_string((long long)jnum(f[0], "id")) + "/related?limit=12"), nullptr, false);
+            for (auto& x : jget(r, "data"))
+                if (std::string nm = jstr(x, "name"); !nm.empty() && seen.insert(low(nm)).second) out.push_back({nm, jstr(x, "picture_medium")});
+        }
+        std::lock_guard lk(g_mx);
+        g_discover = std::move(out);
+        wake();
+    }).detach();
+}
+
 static void homeView() {
     std::time_t tt = std::time(nullptr);
     std::tm d = *std::localtime(&tt);
@@ -4223,6 +4379,36 @@ static void homeView() {
         if (!open.empty()) openLibArtist(open);
     }
 
+    if (!as.empty()) {  // mix pour toi : la radio de tes artistes les plus écoutés
+        shelfTitle("Mixes for you");
+        std::string open, playMix;
+        for (int i = 0; i < std::min(per, (int)as.size()); i++) {
+            if (i) ImGui::SameLine(0, g2);
+            ImGui::PushID(4000 + i);
+            int r = shelfCard("m", artistPic(as[i].name), "", as[i].name + " Mix", "With similar artists", cs, false);
+            if (r == 1) open = as[i].name;
+            if (r == 2) playMix = as[i].name;
+            ImGui::PopID();
+        }
+        if (!open.empty()) openMix(open, false);
+        else if (!playMix.empty()) openMix(playMix, true);
+    }
+    discoverArtists(as);
+    if (!g_discover.empty()) {  // découvrir : des artistes proches, que tu n'écoutes pas encore
+        shelfTitle("Discover");
+        std::string open, playMix;
+        for (int i = 0; i < std::min(per, (int)g_discover.size()); i++) {
+            if (i) ImGui::SameLine(0, g2);
+            ImGui::PushID(5000 + i);
+            int r = shelfCard("d", g_discover[i].image, "", g_discover[i].name, "Similar to your artists", cs, true);
+            if (r == 1) open = g_discover[i].name;
+            if (r == 2) playMix = g_discover[i].name;
+            ImGui::PopID();
+        }
+        if (!open.empty()) openMix(open, false);
+        else if (!playMix.empty()) openMix(playMix, true);
+    }
+
     std::vector<int> lists;
     for (int i = 0; i < (int)g_lists.size(); i++) if (!g_lists[i].hidden && g_lists[i].uri != "local" && !g_lists[i].own) lists.push_back(i);
     if (!lists.empty()) {
@@ -4245,11 +4431,157 @@ static void homeView() {
     ImGui::Dummy({0, 20 * S});
 }
 
+// Stats façon « Wrapped » : temps d'écoute, artistes et titres les plus écoutés, heures d'écoute (depuis history.jsonl).
+static void statsView() {
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    ImGui::PushFont(g_bold, 36); ImGui::TextUnformatted("Your stats"); ImGui::PopFont();
+    static int period = 1;  // 0 7 jours, 1 30 jours, 2 cette année, 3 depuis le début
+    pills("per", {"7 days", "30 days", "This year", "All time"}, period);
+    long long nowS = nowId() / 1000, since = 0;
+    if (period == 0) since = nowS - 7 * 86400;
+    else if (period == 1) since = nowS - 30 * 86400;
+    else if (period == 2) { std::time_t tt = (std::time_t)nowS; std::tm y = *std::localtime(&tt); y.tm_mon = 0; y.tm_mday = 1; y.tm_hour = y.tm_min = y.tm_sec = 0; since = (long long)std::mktime(&y); }
+    struct Agg { long long ms = 0; int plays = 0; const Play* last = nullptr; };
+    std::map<std::string, Agg> byArtist, bySong;
+    long long total = 0;
+    int plays = 0;
+    double hours[24] = {};
+    for (auto& p : g_history) {
+        if (p.t < since) continue;
+        total += p.ms; plays++;
+        Agg& a = byArtist[firstArtist(p.artist)]; a.ms += p.ms; a.plays++; a.last = &p;
+        Agg& t = bySong[p.uri]; t.ms += p.ms; t.plays++; t.last = &p;
+        std::time_t pt = (std::time_t)p.t;
+        hours[std::localtime(&pt)->tm_hour] += p.ms / 60000.0;
+    }
+    ImGui::Dummy({0, 10 * S});
+    if (!plays) {
+        ImGui::TextDisabled(g_history.empty() ? "Glass counts every song you listen to for at least 30 seconds, starting now. Play some music and come back!"
+                                              : "Nothing listened to in this period.");
+        return;
+    }
+    float avail = ImGui::GetContentRegionAvail().x, gap = 14 * S;
+    ImVec4 a4 = acc();
+
+    // trois grands chiffres
+    {
+        std::string nums[3] = {std::to_string(total / 60000), std::to_string(plays), std::to_string(byArtist.size())};
+        const char* labels[3] = {"minutes listened", "songs played", "artists"};
+        float cw = (avail - gap * 2) / 3, ch = 118 * S;
+        ImVec2 p = ImGui::GetCursorScreenPos();
+        for (int i = 0; i < 3; i++) {
+            ImVec2 q = p + ImVec2{(cw + gap) * i, 0};
+            dl->AddRectFilled(q, q + ImVec2{cw, ch}, ImGui::GetColorU32(ImVec4{a4.x, a4.y, a4.z, 0.16f + 0.06f * (2 - i)}), 18 * S);
+            dl->AddRect(q, q + ImVec2{cw, ch}, col(1, 1, 1, 0.08f), 18 * S);
+            dl->AddText(g_bold, 44 * S, q + ImVec2{20 * S, 16 * S}, col(1, 1, 1), nums[i].c_str());
+            dl->AddText(ImGui::GetFont(), 15 * S, q + ImVec2{22 * S, ch - 32 * S}, col(1, 1, 1, 0.7f), labels[i]);
+        }
+        ImGui::Dummy({avail, ch});
+    }
+
+    std::vector<std::pair<std::string, Agg>> arts(byArtist.begin(), byArtist.end()), songs(bySong.begin(), bySong.end());
+    std::sort(arts.begin(), arts.end(), [](auto& x, auto& y) { return x.second.ms > y.second.ms; });
+    std::sort(songs.begin(), songs.end(), [](auto& x, auto& y) { return x.second.plays != y.second.plays ? x.second.plays > y.second.plays : x.second.ms > y.second.ms; });
+
+    // ton artiste n°1, en grand
+    {
+        shelfTitle("Top artists");
+        auto& [name, ag] = arts[0];
+        float hh = 150 * S, r = 56 * S;
+        ImVec2 p = ImGui::GetCursorScreenPos();
+        glow(dl, p + ImVec2{90 * S, hh / 2}, hh * 1.1f, a4, 0.35f);
+        dl->AddRectFilled(p, p + ImVec2{avail, hh}, col(1, 1, 1, 0.05f), 18 * S);
+        ImVec2 c = p + ImVec2{24 * S + r, hh / 2};
+        if (ImTextureID t = tex(artistPic(name), 300)) dl->AddImageRounded(t, c - ImVec2{r, r}, c + ImVec2{r, r}, {0, 0}, {1, 1}, IM_COL32_WHITE, r);
+        else dl->AddCircleFilled(c, r, col(1, 1, 1, 0.1f), 48);
+        float tx = 24 * S + r * 2 + 24 * S;
+        dl->AddText(g_bold, 14 * S, p + ImVec2{tx, 34 * S}, accU(), "#1  YOUR TOP ARTIST");
+        textAt(dl, p + ImVec2{tx, 54 * S}, avail - tx - 20 * S, col(1, 1, 1), name, g_bold, 30);
+        std::string sub = std::to_string(ag.ms / 60000) + " minutes · " + std::to_string(ag.plays) + (ag.plays > 1 ? " plays" : " play");
+        dl->AddText(p + ImVec2{tx, 100 * S}, col(1, 1, 1, 0.65f), sub.c_str());
+        ImGui::Dummy({avail, hh + 8 * S});
+        // n°2 à 6 : rang, photo, nom, barre de proportion, minutes
+        for (int i = 1; i < std::min(6, (int)arts.size()); i++) {
+            ImVec2 q = ImGui::GetCursorScreenPos();
+            float rh = 50 * S, pr = 20 * S;
+            char rk[8]; snprintf(rk, sizeof rk, "%d", i + 1);
+            dl->AddText(g_bold, 18 * S, q + ImVec2{8 * S, rh / 2 - 11 * S}, col(1, 1, 1, 0.45f), rk);
+            ImVec2 pc = q + ImVec2{40 * S + pr, rh / 2};
+            if (ImTextureID t = tex(artistPic(arts[i].first), 96)) dl->AddImageRounded(t, pc - ImVec2{pr, pr}, pc + ImVec2{pr, pr}, {0, 0}, {1, 1}, IM_COL32_WHITE, pr);
+            else dl->AddCircleFilled(pc, pr, col(1, 1, 1, 0.1f), 24);
+            float nx = 40 * S + pr * 2 + 14 * S, bw = avail - nx - 110 * S;
+            textAt(dl, q + ImVec2{nx, 8 * S}, bw, col(1, 1, 1, 0.95f), arts[i].first, g_bold, 15);
+            float f = (float)arts[i].second.ms / std::max(1LL, arts[0].second.ms);
+            dl->AddRectFilled(q + ImVec2{nx, 32 * S}, q + ImVec2{nx + bw, 36 * S}, col(1, 1, 1, 0.08f), 2 * S);
+            dl->AddRectFilled(q + ImVec2{nx, 32 * S}, q + ImVec2{nx + bw * f, 36 * S}, accU(), 2 * S);
+            std::string m = std::to_string(arts[i].second.ms / 60000) + " min";
+            dl->AddText(q + ImVec2{avail - ImGui::CalcTextSize(m.c_str()).x - 8 * S, rh / 2 - 9 * S}, col(1, 1, 1, 0.6f), m.c_str());
+            ImGui::Dummy({avail, rh});
+        }
+    }
+
+    // titres les plus écoutés : un clic les lance (dans une liste « Top songs »)
+    {
+        shelfTitle("Top songs");
+        int playAt = -1, n = std::min(10, (int)songs.size());
+        for (int i = 0; i < n; i++) {
+            const Play& p = *songs[i].second.last;
+            ImGui::PushID(6000 + i);
+            ImVec2 q = ImGui::GetCursorScreenPos();
+            float rh = 56 * S, cs = 44 * S;
+            if (ImGui::InvisibleButton("##s", {avail, rh})) playAt = i;
+            rowHighlight(dl, q, {avail, rh}, g_has && g_cur.uri == p.uri);
+            char rk[8]; snprintf(rk, sizeof rk, "%d", i + 1);
+            dl->AddText(g_bold, 18 * S, q + ImVec2{8 * S, rh / 2 - 11 * S}, col(1, 1, 1, 0.45f), rk);
+            coverAt(dl, p.image, "", q + ImVec2{40 * S, (rh - cs) / 2}, cs, 8 * S);
+            float nx = 40 * S + cs + 14 * S, tw = avail - nx - 110 * S;
+            textAt(dl, q + ImVec2{nx, 9 * S}, tw, col(1, 1, 1), p.title, g_bold, 15);
+            textAt(dl, q + ImVec2{nx, 30 * S}, tw, col(1, 1, 1, 0.55f), p.artist);
+            std::string c = std::to_string(songs[i].second.plays) + (songs[i].second.plays > 1 ? " plays" : " play");
+            dl->AddText(q + ImVec2{avail - ImGui::CalcTextSize(c.c_str()).x - 10 * S, rh / 2 - 9 * S}, col(1, 1, 1, 0.6f), c.c_str());
+            ImGui::PopID();
+        }
+        if (playAt >= 0) {
+            List l{"stats:top", "Top songs"};
+            for (int i = 0; i < n; i++) { const Play& p = *songs[i].second.last; l.tracks.push_back(Track{p.uri, p.title, p.artist, "", p.image, 0}); }
+            l.hidden = l.loaded = l.requested = true;
+            if (List* old = findList(l.uri)) *old = std::move(l); else g_lists.push_back(std::move(l));
+            play("stats:top", playAt);
+        }
+    }
+
+    // à quelle heure tu écoutes
+    {
+        shelfTitle("When you listen");
+        float ch = 120 * S, bw = avail / 24, mx = *std::max_element(hours, hours + 24);
+        ImVec2 p = ImGui::GetCursorScreenPos();
+        for (int h = 0; h < 24; h++) {
+            float f = mx > 0 ? (float)(hours[h] / mx) : 0, bh = std::max(3 * S, (ch - 22 * S) * f);
+            ImVec2 b0{p.x + bw * h + 3 * S, p.y + ch - 22 * S - bh}, b1{p.x + bw * (h + 1) - 3 * S, p.y + ch - 22 * S};
+            dl->AddRectFilled(b0, b1, f > 0.999f ? accU() : ImGui::GetColorU32(ImVec4{a4.x, a4.y, a4.z, 0.25f + 0.5f * f}), 4 * S, ImDrawFlags_RoundCornersTop);
+            if (h % 6 == 0) { char lb[8]; snprintf(lb, sizeof lb, "%dh", h); dl->AddText(ImGui::GetFont(), 12 * S, {b0.x, p.y + ch - 16 * S}, col(1, 1, 1, 0.45f), lb); }
+        }
+        ImGui::Dummy({avail, ch});
+    }
+    ImGui::Dummy({0, 20 * S});
+}
+
 static void searchView() {
     ImGui::PushFont(g_bold, 34); ImGui::TextUnformatted("Search"); ImGui::PopFont();
     if (!g_searchBuf[0]) { ImGui::TextDisabled("Type a song, artist or album in the bar on the left."); return; }
+    static int tab = 0;  // 0 tout (bibliothèque + catalogue), 1 SoundCloud, 2 YouTube Music
+    ImGui::Spacing();
+    if (pills("srch", {"All", "SoundCloud", "YouTube"}, tab)) {}
+    ImGui::Spacing();
+    if (tab != 0) {
+        List* l = findList(tab == 1 ? "search:sc" : "search:yt");
+        if (!l || !l->loaded) ImGui::TextDisabled(tab == 1 ? "Searching SoundCloud..." : "Searching YouTube...");
+        else if (l->tracks.empty()) ImGui::TextDisabled("Nothing found.");
+        else { ImGui::TextDisabled("%s (%d)", tab == 1 ? "SOUNDCLOUD" : "YOUTUBE", (int)l->tracks.size()); trackTable(*l, nullptr); }
+        return;
+    }
     if (!g_artists.empty()) {  // artistes : photo ronde + nom, un clic ouvre sa page
-        ImGui::Spacing(); ImGui::TextDisabled("ARTISTES");
+        ImGui::Spacing(); ImGui::TextDisabled("ARTISTS");
         cardRow(g_artists, true);
     }
     ImGui::Spacing();
@@ -4264,6 +4596,7 @@ static void mainView() {
     if (g_view == "queue") { queueView(); return; }
     if (g_view == "search") { searchView(); return; }
     if (g_view == "home") { homeView(); return; }
+    if (g_view == "stats") { statsView(); return; }
     List* l = findList(g_view);
     if (!l) { if (g_lists.empty()) return; l = &g_lists[0]; g_view = l->uri; }
     if (l->uri.rfind("spotify:", 0) == 0 && !g_spReady) { loginPanel(); return; }
@@ -4286,7 +4619,7 @@ static void mainView() {
     long long total = 0;
     for (auto& t : l->tracks) total += t.ms;
     ImVec2 q = ImGui::GetCursorScreenPos();
-    const char* kind = local ? "MY MUSIC" : l->own ? "GLASS PLAYLIST" : libArtist ? "ARTIST · IN YOUR LIBRARY" : artist ? "ARTIST · TOP SONGS" : l->uri.rfind("itunes:album:", 0) == 0 ? "ALBUM"
+    const char* kind = local ? "MY MUSIC" : l->own ? "GLASS PLAYLIST" : l->uri.rfind("mix:", 0) == 0 ? "MIX · ARTIST RADIO" : libArtist ? "ARTIST · IN YOUR LIBRARY" : artist ? "ARTIST · TOP SONGS" : l->uri.rfind("itunes:album:", 0) == 0 ? "ALBUM"
                      : isAlbum(l->uri) ? (isApple(l->uri) ? "APPLE MUSIC ALBUM" : "ALBUM") : isApple(l->uri) ? "APPLE MUSIC PLAYLIST" : "PLAYLIST";
     dl->AddText(g_bold, 12 * S, q + ImVec2{0, 26 * S}, col(1, 1, 1, 0.7f), kind);
     textAt(dl, q + ImVec2{0, 40 * S}, tx, col(1, 1, 1), l->name, g_bold, 46);
@@ -4887,6 +5220,7 @@ static void drawUI() {
     ImGuiViewport* vp = ImGui::GetMainViewport();
     applyExtras();
     applyTrackCovers();
+    if (!g_pendingPlay.empty()) if (List* l = findList(g_pendingPlay); !l || l->loaded) { if (l && !l->tracks.empty()) play(g_pendingPlay, 0); g_pendingPlay.clear(); }
     updateAccent();
     drawBackground(vp);
     ImGui::SetNextWindowPos(vp->Pos); ImGui::SetNextWindowSize(vp->Size);
@@ -4991,6 +5325,7 @@ void app::init() {
     g_scToken = readFile(scTokenFile());
     while (!g_scToken.empty() && isspace((unsigned char)g_scToken.back())) g_scToken.pop_back();
     g_scRefresh = !g_scToken.empty();
+    loadHistory();
     g_accLive = {g_set.accent[0], g_set.accent[1], g_set.accent[2], 1};
     plat::audioVolume(g_set.vol * g_set.vol);
     loadSaved();
@@ -5046,6 +5381,7 @@ bool app::tick() {
         uploadTextures();
         if (!g_ready.empty()) { audioPlay(ustr(g_ready)); g_ready.clear(); g_status.clear(); }
         if (!g_sp && g_has && !g_loading && !g_failed && plat::audioFailed()) { g_failed = true; g_status = "Can't play this song"; }
+        { static double last = now(); double n = now(); if (isPlaying()) g_listenMs += (n - last) * 1000; last = n; }  // temps écouté (Stats)
         crossfade();
         if (!g_sp && g_has && !g_loading && !g_failed && plat::audioEnded()) onTrackEnd();
         if (g_spEnded) { g_spEnded = false; onTrackEnd(); }
