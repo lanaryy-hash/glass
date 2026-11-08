@@ -1889,6 +1889,12 @@ static void seekMs(double ms) {
     else if (g_has) plat::audioSeek(ms / 1000);
 }
 
+static void webEq() {  // égaliseur des lecteurs officiels (Windows : kEqJs dans leurs pages)
+    json m = {{"cmd", "eq"}, {"on", g_set.eqOn}, {"g", std::vector<float>(g_set.eq, g_set.eq + 10)}};
+    if (g_wvStarted) wvPost(m);
+    if (g_amStarted) amPost(m);
+}
+
 static void setVolume() {
     plat::audioVolume(g_set.vol * g_set.vol);
     json v = {{"cmd", "volume"}, {"v", std::max(g_set.vol * g_set.vol, 0.0001f)}};  // le SDK Spotify ignore 0
@@ -1997,6 +2003,56 @@ window.onSpotifyWebPlaybackSDKReady = () => {
 </script>
 <script src="https://sdk.scdn.co/spotify-player.js"></script>)HTML";
 
+// Égaliseur des lecteurs officiels (WebView2, chaque cadre de la page) : Web Audio entre le <audio> et la sortie.
+// Le son protégé (Widevine) passe bien par Web Audio dans WebView2 (vérifié). Mêmes filtres et baisse globale qu'eq.h.
+// Le cadre principal reçoit {cmd:'eq'} de Glass et le relaie aux iframes (le lecteur du SDK Spotify est dans une iframe).
+static const char* kEqJs = R"JS((() => {
+  if (window.__glassEq) return;
+  window.__glassEq = true;
+  const F = [31, 62, 125, 250, 500, 1000, 2000, 4000, 8000, 16000], els = [];
+  let cfg = null, ctx = null;
+  const apply = n => {
+    const g = cfg && cfg.on ? cfg.g : F.map(() => 0);
+    n.pre.gain.value = Math.pow(10, -Math.max(0, ...g) / 20);
+    n.bq.forEach((b, i) => { b.gain.value = g[i]; });
+  };
+  const hook = el => {  // une fois branché, un <audio> passe toujours par Web Audio : on attend que l'égaliseur soit allumé
+    if (el.__glassEq || !cfg || !cfg.on) return;
+    try {
+      ctx = ctx || new AudioContext();
+      const n = {src: ctx.createMediaElementSource(el), pre: ctx.createGain(), bq: F.map(f => {
+        const b = ctx.createBiquadFilter(); b.type = 'peaking'; b.frequency.value = f; b.Q.value = 1.41; return b; })};
+      n.src.connect(n.pre);
+      n.bq.reduce((a, b) => (a.connect(b), b), n.pre).connect(ctx.destination);
+      el.__glassEq = n; apply(n);
+      if (ctx.state !== 'running') ctx.resume();
+    } catch (e) {}
+  };
+  const set = c => { cfg = c; els.forEach(el => el.__glassEq ? apply(el.__glassEq) : hook(el)); };
+  const play = HTMLMediaElement.prototype.play;
+  HTMLMediaElement.prototype.play = function () {
+    if (!els.includes(this)) els.push(this);
+    hook(this);
+    return play.apply(this, arguments);
+  };
+  const got = c => { set(c); for (let i = 0; i < frames.length; i++) frames[i].postMessage({glassEq: c}, '*'); };  // relayé aux iframes
+  addEventListener('message', e => {
+    const d = e.data;
+    if (d && d.glassEq && e.source === parent && parent !== window) got(d.glassEq);
+    else if (d && d.glassEqAsk && cfg && e.source) e.source.postMessage({glassEq: cfg}, '*');
+  });
+  if (window.top === window) {
+    if (window.chrome && chrome.webview) chrome.webview.addEventListener('message', e => {
+      if (e.data && e.data.cmd === 'eq') got({on: e.data.on, g: e.data.g});
+    });
+  } else parent.postMessage({glassEqAsk: 1}, '*');
+})();)JS";
+#ifdef _WIN32
+static const char* kWebEq = kEqJs;
+#else
+static const char* kWebEq = "";  // WKWebView : son protégé muet dans Web Audio
+#endif
+
 // ---------- Apple Music officiel : le vrai site music.apple.com, invisible, piloté par ce script (MusicKit du site) ----------
 // Même idée que Spotify : ton compte, ton abonnement, le lecteur d'Apple ; Glass ne fait qu'appuyer sur les boutons.
 static const char* kAppleJs = R"JS((() => {
@@ -2092,7 +2148,7 @@ static void onPlayer(const json& j) {  // messages de la page Spotify (g_mx tenu
     std::string t = jstr(j, "t");
     bool mine = g_sp && !g_spApple;
     if (t == "token") send({{"cmd", "token"}});
-    else if (t == "ready") { g_sdkDevice = jstr(j, "id"); g_sdkReady = true; setVolume(); }
+    else if (t == "ready") { g_sdkDevice = jstr(j, "id"); g_sdkReady = true; setVolume(); webEq(); }
     else if (t == "notready") g_sdkReady = false;
     else if (t == "error") g_status = "Spotify player: " + jstr(j, "msg");
     else if (t == "ended" && mine) g_spEnded = true;
@@ -2106,7 +2162,7 @@ static void onApple(const json& j) {  // messages de la page Apple Music (g_mx t
         g_amReady = true;
         bool was = g_amAuth;
         g_amAuth = j.value("ok", false);
-        if (t == "ready") setVolume();
+        if (t == "ready") { setVolume(); webEq(); }
         if (g_amAuth && !was) {  // connecté : on cache la fenêtre et on charge ses playlists
             g_amPreview = false;
             if (g_amLogin) { plat::webShow(1, false); g_amLogin = false; g_status = "Apple Music connected"; }
@@ -2148,7 +2204,7 @@ static void onApple(const json& j) {  // messages de la page Apple Music (g_mx t
 }
 
 static void stopWebView() { plat::webStop(0); g_wvStarted = g_sdkReady = false; if (!g_spApple) g_sp = false; }
-static void startWebView() { g_wvStarted = true; plat::webStart(0, kPlayerHtml, "", "", g_set.vol * g_set.vol); }  // thread de la fenêtre
+static void startWebView() { g_wvStarted = true; plat::webStart(0, kPlayerHtml, "", kWebEq, g_set.vol * g_set.vol); }  // thread de la fenêtre
 static void stopApple() {
     plat::webStop(1);
     g_amStarted = g_amReady = g_amAuth = g_amLogin = false;
@@ -2157,7 +2213,7 @@ static void stopApple() {
 }
 static void startApple() {
     g_amStarted = true;
-    plat::webStart(1, "", "https://music.apple.com/", kAppleJs, g_set.vol * g_set.vol);
+    plat::webStart(1, "", "https://music.apple.com/", std::string(kAppleJs) + kWebEq, g_set.vol * g_set.vol);
     if (g_amLogin) plat::webShow(1, true);
 }
 
@@ -3846,7 +3902,7 @@ static void settingsView() {
         bool eqChanged = false;
         label("Equalizer");
         eqChanged |= ImGui::Checkbox("##eqon", &g_set.eqOn);
-        ImGui::SameLine(); ImGui::TextDisabled("(YouTube, SoundCloud, your files; not the official Spotify / Apple players)");
+        ImGui::SameLine(); ImGui::TextDisabled(kWebEq[0] ? "(every source, official Spotify and Apple Music included)" : "(YouTube, SoundCloud, your files; not the official Spotify / Apple players)");
         label("Preset");
         int pi = g_set.eqPreset;
         if (ImGui::BeginCombo("##eqpre", pi >= 0 && pi < (int)std::size(kEqPresets) ? kEqPresets[pi].name : "Custom")) {
@@ -3880,7 +3936,7 @@ static void settingsView() {
         ImGui::EndGroup();
         label("");
         ImGui::TextDisabled("Double-click a slider: back to 0. Boosting lowers the overall volume a bit, so it never distorts.");
-        if (eqChanged) { plat::setEq(g_set.eq, g_set.eqOn); changed = true; }
+        if (eqChanged) { plat::setEq(g_set.eq, g_set.eqOn); webEq(); changed = true; }
     }
 
     section("Window and system");
