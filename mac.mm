@@ -267,7 +267,12 @@ static void tapProcess(MTAudioProcessingTapRef tap, CMItemCount frames, MTAudioP
 static void attachEq(AVPlayerItem* it) {
     AVAssetTrack* tr = [[it.asset tracksWithMediaType:AVMediaTypeAudio] firstObject];  // fichier local : pistes connues tout de suite
     if (!tr) return;
-    MTAudioProcessingTapCallbacks cb = {kMTAudioProcessingTapCallbacksVersion_0, nullptr, tapInit, tapFinalize, tapPrepare, tapUnprepare, tapProcess};
+    // rempli champ par champ : la structure est « packée » à 4 octets, initialisée d'un coup elle devient une constante
+    // aux pointeurs mal alignés que l'éditeur de liens refuse (« pointer not aligned »)
+    MTAudioProcessingTapCallbacks cb;
+    cb.version = kMTAudioProcessingTapCallbacksVersion_0;
+    cb.clientInfo = nullptr;
+    cb.init = tapInit; cb.finalize = tapFinalize; cb.prepare = tapPrepare; cb.unprepare = tapUnprepare; cb.process = tapProcess;
     MTAudioProcessingTapRef tap = nullptr;
     if (MTAudioProcessingTapCreate(kCFAllocatorDefault, &cb, kMTAudioProcessingTapCreationFlag_PostEffects, &tap) != noErr || !tap) return;
     AVMutableAudioMixInputParameters* p = [AVMutableAudioMixInputParameters audioMixInputParametersWithTrack:tr];
