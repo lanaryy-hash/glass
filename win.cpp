@@ -13,6 +13,8 @@
 #include <wincodec.h>
 #include <mfapi.h>
 #include <mfmediaengine.h>
+#include <mftransform.h>
+#include <mferror.h>
 #include <atomic>
 #include <cmath>
 #include <fstream>
@@ -20,6 +22,7 @@
 #include <initguid.h>  // définit les PKEY_* de propkey.h
 #include <propkey.h>
 #include "platform.h"
+#include "eq.h"
 #include "imgui_impl_win32.h"
 #include "imgui_impl_dx11.h"
 #include <wrl.h>
@@ -239,6 +242,102 @@ void plat::audioFade(double secs) {
         }
     }).detach();
 }
+
+// ---------- égaliseur : un effet audio (MFT) inséré dans chaque moteur Media Foundation ----------
+// Media Foundation convertit le son en flottants 32 bits pour nous ; on le modifie sur place et on rend le même échantillon.
+struct EqMFT : IMFTransform {
+    LONG ref = 1;
+    IMFMediaType *in = nullptr, *out = nullptr;
+    IMFSample* held = nullptr;  // échantillon reçu, rendu au prochain ProcessOutput
+    UINT32 rate = 0, ch = 0;
+    eq::Filter f;
+    ~EqMFT() { for (IUnknown* u : {(IUnknown*)in, (IUnknown*)out, (IUnknown*)held}) if (u) u->Release(); }
+    static bool isFloat(IMFMediaType* t) {
+        GUID m{}, s{};
+        return t && SUCCEEDED(t->GetGUID(MF_MT_MAJOR_TYPE, &m)) && m == MFMediaType_Audio && SUCCEEDED(t->GetGUID(MF_MT_SUBTYPE, &s)) && s == MFAudioFormat_Float;
+    }
+    static HRESULT floatType(IMFMediaType** t) {  // type partiel proposé : « du son en flottants », le reste au choix
+        HRESULT hr = MFCreateMediaType(t);
+        if (SUCCEEDED(hr)) { (*t)->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Audio); (*t)->SetGUID(MF_MT_SUBTYPE, MFAudioFormat_Float); }
+        return hr;
+    }
+    STDMETHODIMP QueryInterface(REFIID r, void** p) override {
+        if (r == __uuidof(IUnknown) || r == __uuidof(IMFTransform)) { *p = this; AddRef(); return S_OK; }
+        *p = nullptr; return E_NOINTERFACE;
+    }
+    STDMETHODIMP_(ULONG) AddRef() override { return InterlockedIncrement(&ref); }
+    STDMETHODIMP_(ULONG) Release() override { ULONG r = InterlockedDecrement(&ref); if (!r) delete this; return r; }
+    STDMETHODIMP GetStreamLimits(DWORD* a, DWORD* b, DWORD* c, DWORD* d) override { *a = *b = *c = *d = 1; return S_OK; }
+    STDMETHODIMP GetStreamCount(DWORD* a, DWORD* b) override { *a = *b = 1; return S_OK; }
+    STDMETHODIMP GetStreamIDs(DWORD, DWORD*, DWORD, DWORD*) override { return E_NOTIMPL; }
+    STDMETHODIMP GetInputStreamInfo(DWORD, MFT_INPUT_STREAM_INFO* i) override { *i = {}; i->dwFlags = MFT_INPUT_STREAM_PROCESSES_IN_PLACE; return S_OK; }
+    STDMETHODIMP GetOutputStreamInfo(DWORD, MFT_OUTPUT_STREAM_INFO* o) override { *o = {}; o->dwFlags = MFT_OUTPUT_STREAM_PROVIDES_SAMPLES; return S_OK; }
+    STDMETHODIMP GetAttributes(IMFAttributes**) override { return E_NOTIMPL; }
+    STDMETHODIMP GetInputStreamAttributes(DWORD, IMFAttributes**) override { return E_NOTIMPL; }
+    STDMETHODIMP GetOutputStreamAttributes(DWORD, IMFAttributes**) override { return E_NOTIMPL; }
+    STDMETHODIMP DeleteInputStream(DWORD) override { return E_NOTIMPL; }
+    STDMETHODIMP AddInputStreams(DWORD, DWORD*) override { return E_NOTIMPL; }
+    STDMETHODIMP GetInputAvailableType(DWORD, DWORD i, IMFMediaType** t) override {
+        if (i > 0) return MF_E_NO_MORE_TYPES;
+        if (out) { *t = out; out->AddRef(); return S_OK; }  // la sortie est déjà fixée : même format en entrée
+        return floatType(t);
+    }
+    STDMETHODIMP GetOutputAvailableType(DWORD, DWORD i, IMFMediaType** t) override {
+        if (i > 0) return MF_E_NO_MORE_TYPES;
+        if (in) { *t = in; in->AddRef(); return S_OK; }
+        return floatType(t);
+    }
+    STDMETHODIMP SetInputType(DWORD, IMFMediaType* t, DWORD fl) override {
+        if (t && !isFloat(t)) return MF_E_INVALIDMEDIATYPE;
+        if (held) return MF_E_TRANSFORM_CANNOT_CHANGE_MEDIATYPE_WHILE_PROCESSING;
+        if (fl & MFT_SET_TYPE_TEST_ONLY) return S_OK;
+        if (in) in->Release();
+        in = t; rate = ch = 0;
+        if (in) { in->AddRef(); in->GetUINT32(MF_MT_AUDIO_SAMPLES_PER_SECOND, &rate); in->GetUINT32(MF_MT_AUDIO_NUM_CHANNELS, &ch); }
+        return S_OK;
+    }
+    STDMETHODIMP SetOutputType(DWORD, IMFMediaType* t, DWORD fl) override {
+        if (t && !isFloat(t)) return MF_E_INVALIDMEDIATYPE;
+        DWORD same = 0;
+        if (t && in && in->IsEqual(t, &same) != S_OK) return MF_E_INVALIDMEDIATYPE;  // sortie = entrée
+        if (fl & MFT_SET_TYPE_TEST_ONLY) return S_OK;
+        if (out) out->Release();
+        out = t;
+        if (out) out->AddRef();
+        return S_OK;
+    }
+    STDMETHODIMP GetInputCurrentType(DWORD, IMFMediaType** t) override { if (!in) return MF_E_TRANSFORM_TYPE_NOT_SET; *t = in; in->AddRef(); return S_OK; }
+    STDMETHODIMP GetOutputCurrentType(DWORD, IMFMediaType** t) override { if (!out) return MF_E_TRANSFORM_TYPE_NOT_SET; *t = out; out->AddRef(); return S_OK; }
+    STDMETHODIMP GetInputStatus(DWORD, DWORD* f) override { *f = held ? 0 : MFT_INPUT_STATUS_ACCEPT_DATA; return S_OK; }
+    STDMETHODIMP GetOutputStatus(DWORD* f) override { *f = held ? MFT_OUTPUT_STATUS_SAMPLE_READY : 0; return S_OK; }
+    STDMETHODIMP SetOutputBounds(LONGLONG, LONGLONG) override { return E_NOTIMPL; }
+    STDMETHODIMP ProcessEvent(DWORD, IMFMediaEvent*) override { return E_NOTIMPL; }
+    STDMETHODIMP ProcessMessage(MFT_MESSAGE_TYPE m, ULONG_PTR) override {
+        if (m == MFT_MESSAGE_COMMAND_FLUSH) { if (held) { held->Release(); held = nullptr; } f.reset(); }  // saut dans le titre
+        return S_OK;
+    }
+    STDMETHODIMP ProcessInput(DWORD, IMFSample* s, DWORD) override {
+        if (!in || !out) return MF_E_TRANSFORM_TYPE_NOT_SET;
+        if (held) return MF_E_NOTACCEPTING;
+        held = s; held->AddRef();
+        return S_OK;
+    }
+    STDMETHODIMP ProcessOutput(DWORD, DWORD, MFT_OUTPUT_DATA_BUFFER* o, DWORD* st) override {
+        *st = 0;
+        if (!held) return MF_E_TRANSFORM_NEED_MORE_INPUT;
+        IMFMediaBuffer* b = nullptr;
+        if (SUCCEEDED(held->ConvertToContiguousBuffer(&b))) {
+            BYTE* p; DWORD len;
+            if (SUCCEEDED(b->Lock(&p, nullptr, &len))) { if (ch) f.process((float*)p, len / sizeof(float) / ch, (int)rate, (int)ch); b->Unlock(); }
+            b->Release();
+        }
+        o[0].pSample = held; o[0].dwStatus = 0; o[0].pEvents = nullptr;  // la référence passe à l'appelant
+        held = nullptr;
+        return S_OK;
+    }
+};
+
+void plat::setEq(const float* gains, bool on) { eq::set(gains, on); }
 
 // ---------- Discord : canal nommé local ----------
 static HANDLE g_ipc = INVALID_HANDLE_VALUE;
@@ -855,6 +954,10 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
     attr->SetUnknown(MF_MEDIA_ENGINE_CALLBACK, &g_notify);
     if (FAILED(factory->CreateInstance(MF_MEDIA_ENGINE_AUDIOONLY, attr, &g_mf)) || FAILED(factory->CreateInstance(MF_MEDIA_ENGINE_AUDIOONLY, attr, &g_tail))) { MessageBoxW(nullptr, L"Media Foundation unavailable.", L"Glass", MB_ICONERROR); return 1; }
     attr->Release(); factory->Release();
+    for (IMFMediaEngine* e : {g_mf, g_tail}) {  // égaliseur dans chaque moteur (s'applique aux titres chargés ensuite)
+        IMFMediaEngineEx* x = nullptr;
+        if (SUCCEEDED(e->QueryInterface(IID_PPV_ARGS(&x)))) { EqMFT* m = new EqMFT; x->InsertAudioEffect(m, TRUE); m->Release(); x->Release(); }  // TRUE : facultatif, la lecture marche sans
+    }
 
     app::init();
 

@@ -61,6 +61,9 @@ struct Settings {
     bool apple = false;                          // compte Apple Music connecté (page music.apple.com lancée au démarrage)
     std::string logo;                            // image choisie comme logo de Glass ("" = logo d'origine)
     std::string font;                            // police de l'interface ("" = celle du système), voir kUIFonts
+    float eq[10] = {};                           // égaliseur : gain de chaque bande (dB, -12..+12), voir kEqPresets
+    bool eqOn = false;
+    int eqPreset = 0;                            // préréglage choisi (-1 = réglé à la main)
     std::string wall;                            // fond Evangelion : "wh:<chemin Wallhaven>" de la galerie, ou ton image ("" = la 1re de la galerie)
     std::vector<std::string> pinned = {"glass:favoris", "spotify:collection", "local", "glass:recent"};  // en haut de la bibliothèque
 };
@@ -131,6 +134,7 @@ static double g_spPos = 0, g_spT = 0, g_spDur = 0;
 static std::vector<std::pair<int, std::string>> g_wvOut;  // messages JSON pour les pages (postés depuis le thread de la fenêtre)
 
 // interface
+static bool g_scrollEq = false;         // Settings ouvert sur l'égaliseur (menu « ... » du lecteur)
 static int g_pick = 0;                  // boîtes de dialogue (hors du verrou) : 1 fichiers, 2 dossier, 3 image de pochette, 4 logo, 5 fond Evangelion, 6 importer un thème, 7 exporter un thème, 8 pochette d'un titre
 static std::string g_pickUri;           // liste dont on choisit la pochette
 static bool g_full = false;             // lecteur plein écran (façon Apple Music)
@@ -208,7 +212,8 @@ static void saveSettings() {
               {"mediaKeys", s.mediaKeys}, {"startup", s.startup}, {"animations", s.animations}, {"showAlbum", s.showAlbum}, {"tray", s.tray},
               {"topmost", s.topmost}, {"lyricsCenter", s.lyricsCenter}, {"stopAtEnd", s.stopAtEnd},
               {"neon", s.neon}, {"accentAuto", s.accentAuto}, {"autoLyrics", s.autoLyrics}, {"particles", s.particles}, {"pinned", s.pinned}, {"apple", s.apple}, {"logo", s.logo}, {"alignLyrics", s.alignLyrics}, {"seenVersion", s.seenVersion}, {"halloween", s.halloween},
-              {"fade", s.fade}, {"discord", s.discord}, {"radio", s.radio}, {"wall", s.wall}, {"font", s.font}};
+              {"fade", s.fade}, {"discord", s.discord}, {"radio", s.radio}, {"wall", s.wall}, {"font", s.font},
+              {"eq", std::vector<float>(s.eq, s.eq + 10)}, {"eqOn", s.eqOn}, {"eqPreset", s.eqPreset}};
     std::ofstream((g_dir / "settings.json")) << j.dump(1);
 }
 static void loadSettings() {
@@ -221,7 +226,9 @@ static void loadSettings() {
     get("glass", s.glass); get("dim", s.dim); get("tintAmt", s.tintAmt); get("rounding", s.rounding); get("textScale", s.textScale); get("speed", s.speed); get("vol", s.vol);
     get("mediaKeys", s.mediaKeys); get("startup", s.startup); get("animations", s.animations); get("showAlbum", s.showAlbum); get("tray", s.tray);
     get("topmost", s.topmost); get("lyricsCenter", s.lyricsCenter); get("stopAtEnd", s.stopAtEnd);
-    get("neon", s.neon); get("accentAuto", s.accentAuto); get("autoLyrics", s.autoLyrics); get("particles", s.particles); get("pinned", s.pinned); get("apple", s.apple); get("logo", s.logo); get("alignLyrics", s.alignLyrics); get("seenVersion", s.seenVersion); get("halloween", s.halloween); get("fade", s.fade); get("discord", s.discord); get("radio", s.radio); get("wall", s.wall); get("font", s.font);
+    get("neon", s.neon); get("accentAuto", s.accentAuto); get("autoLyrics", s.autoLyrics); get("particles", s.particles); get("pinned", s.pinned); get("apple", s.apple); get("logo", s.logo); get("alignLyrics", s.alignLyrics); get("seenVersion", s.seenVersion); get("halloween", s.halloween); get("fade", s.fade); get("discord", s.discord); get("radio", s.radio); get("wall", s.wall); get("font", s.font); get("eqOn", s.eqOn); get("eqPreset", s.eqPreset);
+    if (j.contains("eq") && j["eq"].is_array() && j["eq"].size() == 10)
+        for (int i = 0; i < 10; i++) if (j["eq"][i].is_number()) s.eq[i] = std::clamp(j["eq"][i].get<float>(), -12.f, 12.f);
     for (int i = 0; i < 3; i++) {
         if (j.contains("accentRGB") && j["accentRGB"].size() == 3) s.accent[i] = j["accentRGB"][i].get<float>();
         if (j.contains("tint") && j["tint"].size() == 3) s.tint[i] = j["tint"][i].get<float>();
@@ -3825,6 +3832,57 @@ static void settingsView() {
         cacheT = 0;
     }
 
+    section("Equalizer");
+    {
+        static const struct { const char* name; float g[10]; } kEqPresets[] = {
+            {"Flat", {0, 0, 0, 0, 0, 0, 0, 0, 0, 0}},           {"Bass boost", {6, 5, 4, 2, 0, 0, 0, 0, 0, 0}},
+            {"Bass reducer", {-6, -5, -4, -2, 0, 0, 0, 0, 0, 0}}, {"Treble boost", {0, 0, 0, 0, 0, 1, 2, 4, 5, 6}},
+            {"Vocal", {-2, -2, -1, 1, 3, 4, 3, 1, 0, -1}},       {"Electronic", {4, 3, 1, 0, -1, 1, 0, 1, 3, 4}},
+            {"Hip-hop", {5, 4, 1, 2, -1, -1, 1, -1, 2, 3}},      {"Rock", {4, 3, 2, 0, -1, -1, 1, 2, 3, 4}},
+            {"Acoustic", {3, 3, 2, 1, 1, 1, 2, 2, 2, 1}},        {"Loudness", {5, 3, 0, 0, -1, 0, -1, 0, 3, 5}},
+        };
+        static const char* kBand[10] = {"31", "62", "125", "250", "500", "1k", "2k", "4k", "8k", "16k"};
+        if (g_scrollEq) { ImGui::SetScrollHereY(0.1f); g_scrollEq = false; }  // ouvert depuis le menu « ... » du lecteur
+        bool eqChanged = false;
+        label("Equalizer");
+        eqChanged |= ImGui::Checkbox("##eqon", &g_set.eqOn);
+        ImGui::SameLine(); ImGui::TextDisabled("(YouTube, SoundCloud, your files; not the official Spotify / Apple players)");
+        label("Preset");
+        int pi = g_set.eqPreset;
+        if (ImGui::BeginCombo("##eqpre", pi >= 0 && pi < (int)std::size(kEqPresets) ? kEqPresets[pi].name : "Custom")) {
+            for (int i = 0; i < (int)std::size(kEqPresets); i++)
+                if (ImGui::Selectable(kEqPresets[i].name, pi == i)) { g_set.eqPreset = i; std::copy(kEqPresets[i].g, kEqPresets[i].g + 10, g_set.eq); g_set.eqOn = true; eqChanged = true; }
+            ImGui::EndCombo();
+        }
+        // 10 curseurs verticaux, fréquence dessous
+        ImGui::SetCursorPosX(lw);
+        float sw = 34 * S, sh = 150 * S;
+        ImGui::BeginDisabled(!g_set.eqOn);
+        for (int i = 0; i < 10; i++) {
+            if (i) ImGui::SameLine(0, 10 * S);
+            ImGui::BeginGroup();
+            ImGui::PushID(i);
+            if (ImGui::VSliderFloat("##b", {sw, sh}, &g_set.eq[i], -12, 12, "")) { g_set.eqPreset = -1; eqChanged = true; }
+            if (ImGui::IsItemActive() || ImGui::IsItemHovered()) ImGui::SetTooltip("%s Hz: %+.1f dB", kBand[i], g_set.eq[i]);
+            if (ImGui::IsItemHovered() && ImGui::IsMouseDoubleClicked(0)) { g_set.eq[i] = 0; g_set.eqPreset = -1; eqChanged = true; }  // double-clic : 0 dB
+            float tw = ImGui::CalcTextSize(kBand[i]).x;
+            ImGui::SetCursorPosX(ImGui::GetCursorPosX() + (sw - tw) / 2);
+            ImGui::TextDisabled("%s", kBand[i]);
+            ImGui::PopID();
+            ImGui::EndGroup();
+        }
+        ImGui::EndDisabled();
+        ImGui::SameLine(0, 18 * S);
+        ImGui::BeginGroup();
+        ImGui::TextDisabled("+12 dB");
+        ImGui::Dummy({0, sh - 2 * ImGui::GetTextLineHeightWithSpacing() - ImGui::GetStyle().ItemSpacing.y});
+        ImGui::TextDisabled("-12 dB");
+        ImGui::EndGroup();
+        label("");
+        ImGui::TextDisabled("Double-click a slider: back to 0. Boosting lowers the overall volume a bit, so it never distorts.");
+        if (eqChanged) { plat::setEq(g_set.eq, g_set.eqOn); changed = true; }
+    }
+
     section("Window and system");
     label("Always on top");
     if (ImGui::Checkbox("##top", &g_set.topmost)) { setTopmost(); changed = true; }
@@ -4766,6 +4824,7 @@ static void playerBar() {
         ImGui::SetNextItemWidth(200 * S);
         if (ImGui::SliderFloat("##spd2", &g_set.speed, 0.5f, 2.0f, "x%.2f")) { plat::audioRate(g_set.speed); saveSettings(); }
         ImGui::Separator();
+        if (ImGui::MenuItem("Equalizer...")) { g_view = "settings"; g_lyricsOpen = false; g_scrollEq = true; }
         if (ImGui::MenuItem("Mini player", "Ctrl+M")) toggleMini();
         if (g_update.version > GLASS_VERSION) { if (ImGui::MenuItem("Update available...")) g_openUpdate = true; }
         else if (ImGui::MenuItem("Check for updates")) { g_updT = now(); checkUpdate(true); }
@@ -5328,6 +5387,7 @@ void app::init() {
     loadHistory();
     g_accLive = {g_set.accent[0], g_set.accent[1], g_set.accent[2], 1};
     plat::audioVolume(g_set.vol * g_set.vol);
+    plat::setEq(g_set.eq, g_set.eqOn);
     loadSaved();
     for (auto& l : g_lists) if (isApple(l.uri) || isSoundcloud(l.uri) || isYoutube(l.uri)) requestTracks(l);  // pas besoin du compte Spotify
     updateYtdlp();

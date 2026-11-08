@@ -50,6 +50,6 @@ else()
   target_compile_definitions(Glass PRIVATE GL_SILENCE_DEPRECATION)
   target_compile_options(Glass PRIVATE $<$<COMPILE_LANGUAGE:OBJCXX>:-fobjc-arc>)
   target_link_libraries(Glass PRIVATE nlohmann_json::nlohmann_json glfw curl
-    "-framework Cocoa" "-framework OpenGL" "-framework AVFoundation" "-framework CoreMedia" "-framework WebKit"
+    "-framework Cocoa" "-framework OpenGL" "-framework AVFoundation" "-framework CoreMedia" "-framework MediaToolbox" "-framework WebKit"
     "-framework MediaPlayer" "-framework ImageIO" "-framework CoreGraphics" "-framework ServiceManagement" "-framework UniformTypeIdentifiers")
 endif()

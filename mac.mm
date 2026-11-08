@@ -2,6 +2,7 @@
 #define GLFW_INCLUDE_NONE
 #import <Cocoa/Cocoa.h>
 #import <AVFoundation/AVFoundation.h>
+#import <MediaToolbox/MediaToolbox.h>
 #import <WebKit/WebKit.h>
 #import <MediaPlayer/MediaPlayer.h>
 #import <ImageIO/ImageIO.h>
@@ -31,6 +32,7 @@
 #include <set>
 #include <thread>
 #include "platform.h"
+#include "eq.h"
 #include "imgui_impl_glfw.h"
 #include "imgui_impl_opengl3.h"
 
@@ -240,10 +242,48 @@ static std::atomic<bool> g_ended{false}, g_failed{false};
 static float g_rate = 1, g_vol = 1;
 static int g_fadeGen = 0;  // thread principal
 
+// Égaliseur : un « tap » audio sur chaque titre (AVPlayer nous passe le son décodé, on le modifie sur place).
+struct TapCtx { eq::Filter f; int rate = 44100, ch = 2; bool planar = true, ok = false; };
+static void tapInit(MTAudioProcessingTapRef, void*, void** storage) { *storage = new TapCtx; }
+static void tapFinalize(MTAudioProcessingTapRef tap) { delete (TapCtx*)MTAudioProcessingTapGetStorage(tap); }
+static void tapPrepare(MTAudioProcessingTapRef tap, CMItemCount, const AudioStreamBasicDescription* fmt) {
+    TapCtx* c = (TapCtx*)MTAudioProcessingTapGetStorage(tap);
+    c->rate = (int)fmt->mSampleRate; c->ch = (int)fmt->mChannelsPerFrame;
+    c->planar = fmt->mFormatFlags & kAudioFormatFlagIsNonInterleaved;
+    c->ok = (fmt->mFormatFlags & kAudioFormatFlagIsFloat) && fmt->mBitsPerChannel == 32;  // sinon on laisse le son tel quel
+}
+static void tapUnprepare(MTAudioProcessingTapRef) {}
+static void tapProcess(MTAudioProcessingTapRef tap, CMItemCount frames, MTAudioProcessingTapFlags, AudioBufferList* buf, CMItemCount* outFrames, MTAudioProcessingTapFlags* outFlags) {
+    if (MTAudioProcessingTapGetSourceAudio(tap, frames, buf, outFlags, nullptr, outFrames) != noErr) return;
+    TapCtx* c = (TapCtx*)MTAudioProcessingTapGetStorage(tap);
+    if (!c->ok) return;
+    if (c->planar) {
+        float* ptrs[16];
+        int n = std::min((int)buf->mNumberBuffers, 16);
+        for (int i = 0; i < n; i++) ptrs[i] = (float*)buf->mBuffers[i].mData;
+        c->f.processPlanar(ptrs, (size_t)*outFrames, c->rate, n);
+    } else if (buf->mNumberBuffers > 0) c->f.process((float*)buf->mBuffers[0].mData, (size_t)*outFrames, c->rate, c->ch);
+}
+static void attachEq(AVPlayerItem* it) {
+    AVAssetTrack* tr = [[it.asset tracksWithMediaType:AVMediaTypeAudio] firstObject];  // fichier local : pistes connues tout de suite
+    if (!tr) return;
+    MTAudioProcessingTapCallbacks cb = {kMTAudioProcessingTapCallbacksVersion_0, nullptr, tapInit, tapFinalize, tapPrepare, tapUnprepare, tapProcess};
+    MTAudioProcessingTapRef tap = nullptr;
+    if (MTAudioProcessingTapCreate(kCFAllocatorDefault, &cb, kMTAudioProcessingTapCreationFlag_PostEffects, &tap) != noErr || !tap) return;
+    AVMutableAudioMixInputParameters* p = [AVMutableAudioMixInputParameters audioMixInputParametersWithTrack:tr];
+    p.audioTapProcessor = tap;
+    CFRelease(tap);
+    AVMutableAudioMix* mix = [AVMutableAudioMix audioMix];
+    mix.inputParameters = @[p];
+    it.audioMix = mix;
+}
+void plat::setEq(const float* gains, bool on) { eq::set(gains, on); }
+
 void plat::audioPlay(const std::string& p) {
     onMain(^{
         if (!g_player) { g_player = [AVPlayer new]; g_player.volume = g_vol; }
         AVPlayerItem* it = [AVPlayerItem playerItemWithURL:[NSURL fileURLWithPath:ns(p)]];
+        attachEq(it);
         NSNotificationCenter* nc = [NSNotificationCenter defaultCenter];
         if (g_endObs) [nc removeObserver:g_endObs];
         if (g_failObs) [nc removeObserver:g_failObs];
