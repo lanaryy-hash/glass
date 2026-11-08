@@ -45,9 +45,9 @@ struct LyricLine { int t; std::string w; };
 
 struct Settings {
     int bg = 0, prefetch = 2, lyricsSize = 30, source = 0, density = 1;  // source : 0 auto, 1 Spotify uniquement, 2 YouTube uniquement
-    // bg : 0 pochette floutée, 1 fond d'écran flouté, 2 uni, 3 dégradé de la pochette (Apple Music), 4 néon, 5 aurore animée, 6 nuit d'Halloween, 7 Evangelion, 8 Code Geass
+    // bg : 0 pochette floutée, 1 fond d'écran flouté, 2 uni, 3 dégradé de la pochette (Apple Music), 4 néon, 5 aurore animée, 6 nuit d'Halloween, 7 Evangelion, 8 Code Geass, 9 Bleach
     float neon = 0;                     // intensité des lueurs néon (0 = aucune)
-    int particles = 0;                  // 0 aucune, 1 pétales de sakura, 2 neige, 3 lucioles, 4 Halloween (braises, chauves-souris), 5 champ AT (Evangelion), 6 sigle Geass, 7 échecs (Code Geass)
+    int particles = 0;                  // 0 aucune, 1 pétales de sakura, 2 neige, 3 lucioles, 4 Halloween (braises, chauves-souris), 5 champ AT (Evangelion), 6 sigle Geass, 7 échecs (Code Geass), 8 Getsuga Tenshō, 9 Jigokuchō (Bleach)
     int halloween = 0;                  // année où le thème Halloween a été mis tout seul
     float accent[3] = {0.12f, 0.84f, 0.38f}, tint[3] = {0.05f, 0.07f, 0.12f};
     float glass = 0.07f, dim = 0.45f, tintAmt = 0.15f, rounding = 20, textScale = 1, speed = 1, vol = 0.8f;
@@ -88,6 +88,7 @@ static const Theme kThemes[] = {
     {"Northern Lights", {0.30f, 1.00f, 0.70f}, {0.02f, 0.08f, 0.10f}, 5, 0.08f, 0.20f, 0.15f, 22, 0.5f},
     {"Evangelion", {0.62f, 1.00f, 0.24f}, {0.20f, 0.07f, 0.30f}, 7, 0.08f, 0.30f, 0.15f, 6, 0.5f, false, 5},  // EVA-01 : vert néon, violet ; champ AT orange
     {"Code Geass", {1.00f, 0.16f, 0.33f}, {0.16f, 0.04f, 0.20f}, 8, 0.07f, 0.35f, 0.15f, 8, 0.4f, false, 6},  // Zero : rouge Geass, violet-noir
+    {"Bleach", {1.00f, 0.48f, 0.10f}, {0.08f, 0.10f, 0.17f}, 9, 0.07f, 0.35f, 0.20f, 10, 0.3f, false, 8},  // Ichigo : orange, bleu nuit du shihakushō ; Getsuga Tenshō
     {"Halloween", {1.00f, 0.55f, 0.12f}, {0.10f, 0.03f, 0.14f}, 6, 0.07f, 0.10f, 0.00f, 20, 0.3f, false, 4},
 };
 
@@ -2593,9 +2594,13 @@ static void halloweenNight(ImDrawList* dl, ImVec2 a, ImVec2 b) {
 
 static void atField(ImDrawList* dl, ImVec2 a, ImVec2 b);
 static void geassField(ImDrawList* dl, ImVec2 a, ImVec2 b);
+static void getsugaField(ImDrawList* dl, ImVec2 a, ImVec2 b);
+static void jigokuchoField(ImDrawList* dl, ImVec2 a, ImVec2 b);
 static void drawParticles(ImDrawList* dl, ImVec2 a, ImVec2 b) {
     if (!g_set.particles) return;
     if (g_set.particles == 5) { atField(dl, a, b); return; }
+    if (g_set.particles == 8) { getsugaField(dl, a, b); return; }
+    if (g_set.particles == 9) { jigokuchoField(dl, a, b); return; }
     if (g_set.particles == 6) geassField(dl, a, b);  // puis des plumes rouges (ci-dessous)
     static std::vector<Particle> ps;
     static std::mt19937 rng{7};
@@ -2658,7 +2663,12 @@ static const std::vector<std::string> kGeassWalls = {"gj/wallhaven-gjl98q.png", 
                                                      "47/wallhaven-47r99o.jpg", "43/wallhaven-43r333.jpg", "4x/wallhaven-4xoojo.jpg", "qd/wallhaven-qdkl5l.jpg",
                                                      "mp/wallhaven-mp59my.png", "j8/wallhaven-j8m3oy.png", "5d/wallhaven-5d8kw7.png", "od/wallhaven-odper9.jpg",
                                                      "n6/wallhaven-n66opq.jpg"};
-static const std::vector<std::string>& themeWalls() { return g_set.bg == 8 ? kGeassWalls : kEvaWalls; }
+static const std::vector<std::string> kBleachWalls = {"ml/wallhaven-mlye38.jpg", "6k/wallhaven-6kj8zx.png", "3l/wallhaven-3lgo36.png", "lq/wallhaven-lqjyw2.png",
+                                                      "p9/wallhaven-p98go3.jpg", "z8/wallhaven-z8pqkg.png", "rq/wallhaven-rqdvwq.png", "0p/wallhaven-0pq27m.png",
+                                                      "o5/wallhaven-o5pejm.png", "o5/wallhaven-o5o25m.png", "rr/wallhaven-rrxrl1.png", "5d/wallhaven-5dv6v9.jpg",
+                                                      "6d/wallhaven-6dxvoq.jpg", "p9/wallhaven-p9zmd3.jpg", "po/wallhaven-pomzw9.png", "nr/wallhaven-nrw1mj.jpg",
+                                                      "d8/wallhaven-d881rm.png", "m3/wallhaven-m3j731.png", "4l/wallhaven-4lyeey.jpg", "r2/wallhaven-r27ew1.jpg"};
+static const std::vector<std::string>& themeWalls() { return g_set.bg == 9 ? kBleachWalls : g_set.bg == 8 ? kGeassWalls : kEvaWalls; }
 static std::string curWall() {  // image choisie pour le fond actuel ; celle d'une autre galerie = la 1re de celle-ci
     const auto& ws = themeWalls();
     if (g_set.wall.empty() || (g_set.wall.rfind("wh:", 0) == 0 && std::find(ws.begin(), ws.end(), g_set.wall.substr(3)) == ws.end())) return "wh:" + ws[0];
@@ -2806,6 +2816,229 @@ static void geassField(ImDrawList* dl, ImVec2 a, ImVec2 b) {
     }
 }
 
+// ---------- thème Bleach : Getsuga Tenshō et Jigokuchō (mêmes formes que l'aperçu validé) ----------
+static ImU32 c8(float r, float g, float b, float a) { return col(r / 255, g / 255, b / 255, std::clamp(a, 0.f, 1.f)); }
+static ImVec4 v8(float r, float g, float b) { return {r / 255, g / 255, b / 255, 1}; }
+// Bande entre deux polylignes (n points chacune), dégradé du côté A au côté B. Pas d'anticrénelage : bords recouverts par un trait.
+static void vStrip(ImDrawList* dl, const ImVec2* A, const ImVec2* B, int n, ImU32 cA, ImU32 cB) {
+    ImVec2 uv = ImGui::GetFontTexUvWhitePixel();
+    dl->PrimReserve((n - 1) * 6, n * 2);
+    ImDrawIdx k = (ImDrawIdx)dl->_VtxCurrentIdx;
+    for (int i = 0; i < n; i++) { dl->PrimWriteVtx(A[i], uv, cA); dl->PrimWriteVtx(B[i], uv, cB); }
+    for (int i = 0; i < n - 1; i++, k += 2) {
+        dl->PrimWriteIdx(k); dl->PrimWriteIdx(k + 1); dl->PrimWriteIdx(k + 2);
+        dl->PrimWriteIdx(k + 1); dl->PrimWriteIdx(k + 3); dl->PrimWriteIdx(k + 2);
+    }
+}
+static void vFan(ImDrawList* dl, ImVec2 root, const ImVec2* P, int n, ImU32 cRoot, ImU32 cRim) {  // éventail depuis root (forme étoilée autour de root)
+    ImVec2 uv = ImGui::GetFontTexUvWhitePixel();
+    dl->PrimReserve((n - 1) * 3, n + 1);
+    ImDrawIdx k = (ImDrawIdx)dl->_VtxCurrentIdx;
+    dl->PrimWriteVtx(root, uv, cRoot);
+    for (int i = 0; i < n; i++) dl->PrimWriteVtx(P[i], uv, cRim);
+    for (int i = 0; i < n - 1; i++) { dl->PrimWriteIdx(k); dl->PrimWriteIdx(k + 1 + i); dl->PrimWriteIdx(k + 2 + i); }
+}
+
+// Croissant (vol vers +x local) : arc extérieur qui ondule, arc intérieur à lobes de flamme, pointes effilées.
+constexpr int kGN = 44;
+constexpr float kGA = 1.22f;  // demi-ouverture
+static void getsugaEdges(float R, float t, float seed, ImVec2* out, ImVec2* inn) {
+    for (int i = 0; i <= kGN; i++) {
+        float u = -1 + 2.f * i / kGN, a = u * kGA, env = 1 - u * u;
+        float ro = R * (1 + env * (sinf(7 * a + 9 * t + seed) * .02f + sinf(13 * a - 14 * t + seed * 2) * .012f + sinf(3 * a + 5 * t) * .03f));
+        float T = R * .34f * powf(env, .55f), lobe = powf(std::max(0.f, sinf(5 * a + 6 * t + seed)), 2) * .5f + sinf(11 * a - 9 * t) * .12f;
+        float ri = ro - T * (1 + lobe * env);
+        out[i] = {cosf(a) * ro, sinf(a) * ro};
+        inn[i] = {cosf(a) * ri - T * .35f * env, sinf(a) * ri};
+    }
+}
+static void getsuga(ImDrawList* dl, ImVec2 c, float ang, float R, float al, float t, float seed, bool detail) {
+    ImVec2 out[kGN + 1], inn[kGN + 1], O[kGN + 1], I[kGN + 1], M[kGN + 1];
+    getsugaEdges(R, t, seed, out, inn);
+    float ca = cosf(ang), sa = sinf(ang);
+    auto X = [&](ImVec2 p) { return ImVec2{c.x + p.x * ca - p.y * sa, c.y + p.x * sa + p.y * ca}; };
+    for (int i = 0; i <= kGN; i++) { O[i] = X(out[i] * 1.1f); I[i] = X(inn[i]); M[i] = X(inn[i] + (out[i] - inn[i]) * .7f); }
+    for (int i = 0; i <= kGN; i++) out[i] = X(out[i]);
+    vStrip(dl, out, O, kGN + 1, c8(255, 30, 50, .4f * al), c8(255, 30, 50, 0));             // halo rouge
+    vStrip(dl, I, out, kGN + 1, c8(4, 1, 3, .97f * al), c8(4, 1, 3, .97f * al));             // corps noir
+    vStrip(dl, M, out, kGN + 1, c8(40, 0, 8, 0), c8(200, 12, 34, .9f * al));                 // braise sous le bord
+    const float w[4] = {9, 4, 1.6f, .7f}, la[4] = {.18f, .45f, .95f, .6f};                   // bord brûlant : traits en couches
+    const ImU32 lc[4] = {c8(255, 40, 60, la[0] * al), c8(255, 40, 60, la[1] * al), c8(255, 95, 95, la[2] * al), c8(255, 235, 230, la[3] * al)};
+    for (int k = 0; k < 4; k++) dl->AddPolyline(out, kGN + 1, lc[k], 0, w[k] * S);
+    dl->AddPolyline(I, kGN + 1, c8(210, 20, 40, .4f * al), 0, 1.4f * S);
+    if (!detail) return;
+    for (int i = 0; i < 9; i++) {  // volutes noires bordées de rouge qui se détachent du creux
+        float cyc = t * 1.5f + i * .37f + seed, life = fmodf(cyc, 1.f);
+        int k = 4 + ((i * 17 + (int)cyc) * 13) % (kGN - 7);
+        float len = R * (.2f + .4f * life), amp = R * .05f * (.5f + life), curl = (k > kGN / 2 ? 1 : -1) * R * .1f, va = 4 * life * (1 - life);
+        ImVec2 p[9];
+        for (int j = 0; j <= 8; j++) { float s = j / 8.f; p[j] = X({inn[k].x - s * len, inn[k].y + sinf(s * 5 + t * 8 + i) * amp * s + s * s * curl}); }
+        for (int j = 0; j < 8; j++) {
+            float s = j / 8.f, ww = (1 - s) * R * .025f + .5f * S;
+            dl->AddLine(p[j], p[j + 1], c8(255, 30, 50, va * .3f * (1 - s) * al), ww * 1.6f);
+            dl->AddLine(p[j], p[j + 1], c8(5, 1, 4, va * .9f * (1 - s) * al), ww);
+        }
+    }
+}
+
+// Getsuga Tenshō, toutes les 6 s : le reiatsu se concentre, éclair de lame, flash et onde de choc, le croissant traverse, braises.
+static void getsugaField(ImDrawList* dl, ImVec2 a, ImVec2 b) {
+    if (!g_set.animations) return;
+    g_animBg = true;
+    struct Ember { ImVec2 p, v; float l; bool big, hot; };
+    static std::vector<Ember> embers;
+    static std::mt19937 rng{11};
+    static double last = ImGui::GetTime();
+    auto rf = [](float lo, float hi) { return std::uniform_real_distribution<float>(lo, hi)(rng); };
+    double T = ImGui::GetTime();
+    float dt = (float)std::min(0.05, T - last);
+    last = T;
+    const float P = 6;
+    double cyc = floor(T / P);
+    float tc = (float)fmod(T, P), t = (float)fmod(T, 600.0), seed = (float)fmod(cyc * 1.7, 1000.0);  // t replié : précision des sinus
+    auto rnd = [cyc](int n) { double s = sin(cyc * 12.9898 + n * 78.233) * 43758.5453; return (float)(s - floor(s)); };
+    float w = b.x - a.x, h = b.y - a.y, R = h * .5f, dir = rnd(3) < .5f ? 1.f : -1.f;
+    ImVec2 p0{a.x + w * (dir > 0 ? .22f : .78f), a.y + h * (.32f + .36f * rnd(1))};
+    ImVec2 p1{dir > 0 ? b.x + R * 1.5f : a.x - R * 1.5f, a.y + h * (.3f + .4f * rnd(2))};
+    float ang = atan2f(p1.y - p0.y, p1.x - p0.x);
+    auto pos = [&](float e) { return p0 + (p1 - p0) * e; };
+    auto dirv = [](float an) { return ImVec2{cosf(an), sinf(an)}; };
+    if (tc < 1) {  // 1. concentration du reiatsu : halo noir et rouge, particules aspirées
+        float c = std::min(1.f, tc / .95f);
+        glow(dl, p0, h * (.08f + .4f * c * c), v8(4, 0, 3), .8f * c);
+        glow(dl, p0, h * (.1f + .3f * c), v8(255, 30, 50), .45f * c * c);
+        glow(dl, p0, h * .08f * c, v8(255, 150, 150), .7f * c * c);
+        dl->AddCircle(p0, h * .16f * c, c8(255, 40, 60, .35f * c * c * (.6f + .4f * sinf(tc * 18))), 0, 1.2f * S);
+        for (int i = 0; i < 18; i++) {
+            float ph = fmodf(c * 1.4f + i / 18.f, 1.f), an = rnd(10 + i) * 6.283f + tc * .6f * (i % 2 ? 1 : -1);
+            ImVec2 q = p0 + dirv(an) * (h * .42f * (1 - ph * ph));
+            dl->AddLine(q + dirv(an) * (12 * S * ph), q, c8(255, 60, 70, .6f * ph * c), 1.2f * S);
+            dl->AddCircleFilled(q, 1.6f * S, c8(255, 120, 120, .9f * ph * c));
+        }
+    }
+    if (tc > .86f && tc < 1.08f) {  // 2. éclair de lame : arc blanc qui balaie devant le point de départ
+        float s = (tc - .86f) / .22f, a1 = ang - 1.5f + 3 * std::min(1.f, s * 1.4f), a0 = std::max(ang - 1.5f, a1 - 1.2f), al = 1 - std::max(0.f, (s - .5f) / .5f);
+        ImVec2 pts[25];
+        for (int i = 0; i <= 24; i++) pts[i] = p0 + dirv(a0 + (a1 - a0) * i / 24) * (R * .7f);
+        dl->AddPolyline(pts, 25, c8(255, 40, 60, al * .35f), 0, 16 * S);
+        dl->AddPolyline(pts, 25, c8(255, 40, 60, al * .7f), 0, 6 * S);
+        dl->AddPolyline(pts, 25, c8(255, 255, 255, al), 0, 2.5f * S);
+    }
+    if (tc >= 1 && tc < 1.6f) {  // 3. flash (0,15 s, faible) + onde de choc au départ
+        float f = (tc - 1) / .6f, e = 1 - (1 - f) * (1 - f);
+        if (f < .25f) dl->AddRectFilled(a, b, c8(255, 20, 40, .16f * (1 - f / .25f)));
+        dl->AddCircle(p0, h * (.04f + 1.1f * e), c8(255, 40, 60, (1 - f) * .5f), 0, (1 + 8 * (1 - f)) * S);
+        dl->AddCircle(p0, h * (.04f + 1.1f * e) * .92f, c8(255, 235, 235, (1 - f) * .3f), 0, S);
+    }
+    float s = (tc - 1) / 1.6f;  // 4. vol : traînée de fumée, 2 images rémanentes, croissant, braises
+    if (s >= 0) {
+        float e = s < 1 ? 1 - powf(1 - s, 1.7f) : 1, tf = s < 1 ? 1 : std::max(0.f, 1 - (s - 1) / .6f);
+        for (int i = 6; i >= 1 && tf > 0; i--) {
+            float ee = e - i * .08f;
+            if (ee < 0) continue;
+            glow(dl, pos(ee), R * .6f, v8(110, 0, 16), .2f * (1 - i / 7.f) * tf);
+            glow(dl, pos(ee), R * .3f, v8(4, 0, 3), .25f * (1 - i / 7.f) * tf);
+        }
+        if (s < 1) {
+            float sc = .3f + .7f * std::min(1.f, s * 5);
+            for (int i = 2; i >= 1; i--) getsuga(dl, pos(std::max(0.f, e - i * .04f)), ang, R * sc * (1 - .07f * i), .18f + .14f * (2 - i), t, seed + i, false);
+            ImVec2 c = pos(e);
+            getsuga(dl, c, ang, R * sc, 1, t, seed, true);
+            float ca = cosf(ang), sa = sinf(ang);
+            for (int i = 0; i < 3 && dt > 0 && embers.size() < 160; i++) {
+                float u = rf(-.9f, .9f), an = u * kGA, r = R * sc * (1 - .3f * powf(1 - u * u, .55f)), lx = cosf(an) * r - R * sc * .1f, ly = sinf(an) * r;
+                float back = -rf(60, 240) * S, side = rf(-60, 60) * S;
+                embers.push_back({{c.x + ca * lx - sa * ly, c.y + sa * lx + ca * ly}, {ca * back - sa * side, sa * back + ca * side - 25 * S}, rf(.8f, 1.6f), rf(0, 1) < .15f, rf(0, 1) < .3f});
+            }
+        }
+    }
+    for (auto& p : embers) {  // 5. braises : freinées, montent un peu, les grosses ont un halo
+        p.p += p.v * dt; p.v *= 1 - dt * 1.5f; p.l -= dt;
+        float al = std::min(1.f, p.l);
+        if (al <= 0) continue;
+        if (p.big) glow(dl, p.p, 9 * S, v8(255, 40, 50), al * .35f);
+        dl->AddCircleFilled(p.p, (.8f + 1.4f * al) * S, p.hot ? c8(255, 190, 150, al * .9f) : c8(255, 60, 60, al * .9f));
+    }
+    embers.erase(std::remove_if(embers.begin(), embers.end(), [](const Ember& p) { return p.l <= 0; }), embers.end());
+}
+
+// Jigokuchō (papillon de l'enfer) : aile droite, corps sur x=0, tête vers -y ; chaque aile est un éventail depuis sa racine.
+static const ImVec2 kFRoot{0, -2}, kWF[9] = {{5, -12}, {12, -22}, {22, -30}, {34, -30}, {36, -26}, {31, -15}, {22, -6}, {12, -1}, {3, 0}};
+static const ImVec2 kHRoot{0, 2}, kWH[12] = {{12, 3}, {21, 7}, {26, 13}, {24, 19}, {19, 23}, {15, 24}, {13, 27}, {12, 36}, {10, 38}, {7, 30}, {4, 21}, {2, 12}};
+static void butterfly(ImDrawList* dl, ImVec2 c, float sc, float flap, float ang, float bank, float al, bool big) {
+    float ca = cosf(ang) * sc, sa = sinf(ang) * sc, open = cosf(flap);
+    auto X = [&](float x, float y) { return ImVec2{c.x + x * ca - y * sa, c.y + x * sa + y * ca}; };
+    for (int side = -1; side <= 1; side += 2) {
+        float sx = side * open * (1 + bank * side * .22f), sh = .5f + .5f * cosf(flap * 2.2f + side * .8f);  // inclinaison ; reflet irisé
+        ImU32 c0 = c8(3, 2, 5, al), c1 = c8(8, 5, 14, al), c2 = c8(30 + 46 * sh, 12 + 10 * sh, 60 + 80 * sh, al), edge = c8(150, 105, 230, (.28f + .25f * sh) * al);
+        auto wing = [&](ImVec2 root, const ImVec2* P, int n) {  // racine noire -> 70 % sombre -> bord violet
+            ImVec2 r = X(root.x * sx, root.y), mid[12], rim[13];
+            for (int i = 0; i < n; i++) { rim[i] = X(P[i].x * sx, P[i].y); mid[i] = r + (rim[i] - r) * .7f; }
+            vFan(dl, r, mid, n, c0, c1);
+            vStrip(dl, mid, rim, n, c1, c2);
+            if (big) { rim[n] = r; dl->AddPolyline(rim, n + 1, edge, ImDrawFlags_Closed, .6f * sc); }
+        };
+        wing(kFRoot, kWF, 9);
+        wing(kHRoot, kWH, 12);
+        if (big) {
+            for (ImVec2 p : {kWF[1], kWF[3], kWF[5], kWH[2], kWH[4]}) dl->AddLine(X(0, 0), X(p.x * sx, p.y), c8(140, 90, 210, .22f * al), .7f * sc);  // nervures
+            for (ImVec2 p : {ImVec2{30, -25}, ImVec2{32, -18}, ImVec2{22, 16}}) dl->AddCircleFilled(X(p.x * sx, p.y), 1.4f * sc, c8(190, 150, 255, (.3f + .4f * sh) * al));  // ocelles
+        }
+    }
+    dl->AddEllipseFilled(X(0, 3), {1.5f * sc, 9 * sc}, c8(3, 2, 5, al), ang);  // corps, tête, antennes
+    dl->AddCircleFilled(X(0, -7), 1.7f * sc, c8(3, 2, 5, al));
+    dl->AddBezierQuadratic(X(-.5f, -8), X(-4, -14), X(-7, -16), c8(5, 3, 8, .9f * al), .7f * sc);
+    dl->AddBezierQuadratic(X(.5f, -8), X(4, -14), X(7, -16), c8(5, 3, 8, .9f * al), .7f * sc);
+}
+
+// 8 Jigokuchō : rafales de battements puis vol plané, virages inclinés, profondeur (2 proches, 6 lointains), poussière de reishi.
+static void jigokuchoField(ImDrawList* dl, ImVec2 a, ImVec2 b) {
+    if (!g_set.animations) return;
+    g_animBg = true;
+    struct Bf { float x, y, h, z, s, seed, ph, bank; };
+    struct Dust { ImVec2 p, v; float l; bool g; };
+    static std::mt19937 rng{23};
+    auto rf = [](float lo, float hi) { return std::uniform_real_distribution<float>(lo, hi)(rng); };
+    static std::vector<Bf> bfs = [&] {
+        std::vector<Bf> v;
+        for (int i = 0; i < 8; i++) {
+            float z = i < 2 ? .8f + .2f * i : .1f + .5f * fmodf(i * .37f, 1.f);
+            v.push_back({rf(.15f, .85f), rf(.15f, .8f), rf(0, 6.28f), z, .35f + .85f * z, rf(0, 100), rf(0, 6), 0});
+        }
+        std::sort(v.begin(), v.end(), [](const Bf& p, const Bf& q) { return p.z < q.z; });  // loin d'abord
+        return v;
+    }();
+    static std::vector<Dust> dust;
+    static double last = ImGui::GetTime();
+    double T = ImGui::GetTime();
+    float dt = (float)std::min(0.05, T - last), t = (float)fmod(T, 3600.0);
+    last = T;
+    float w = b.x - a.x, h = b.y - a.y, k = std::clamp(h / 420.f, .7f * S, 1.6f * S);
+    for (auto& d : dust) {
+        d.l -= dt * .6f; d.p += d.v * dt;
+        float al = std::max(0.f, d.l);
+        if (d.g) glow(dl, d.p, 7 * k, v8(170, 120, 255), al * .14f);
+        dl->AddCircleFilled(d.p, (.8f + .6f * al) * k, c8(200, 170, 255, al * .55f));
+    }
+    dust.erase(std::remove_if(dust.begin(), dust.end(), [](const Dust& d) { return d.l <= 0; }), dust.end());
+    for (auto& f : bfs) {
+        float fl = std::clamp((sinf(t * (.7f + .3f * fmodf(f.seed, 1.f)) + f.seed) + .3f) * 3, 0.f, 1.f);  // 1 = vol battu, 0 = plané
+        f.ph += dt * (1.5f + 15 * fl) * (1.15f - .3f * f.z);
+        float flap = .3f * (1 - fl) + sinf(f.ph) * (.3f + .85f * fl);
+        float turn = sinf(t * .45f + f.seed) * .5f + sinf(t * 1.3f + f.seed * 2.3f) * .3f;
+        f.h += turn * dt; f.bank += (turn * 1.3f - f.bank) * std::min(1.f, dt * 3);
+        float sp = (.02f + .025f * fl) * (.5f + .7f * f.z);
+        f.x += cosf(f.h) * sp * dt * h / w; f.y += sinf(f.h) * sp * dt + (.012f * (1 - fl) - .008f * fl) * dt;  // plane : descend ; bat : remonte
+        const float m = .06f;
+        if (f.x < -m) f.x = 1 + m; if (f.x > 1 + m) f.x = -m; if (f.y < -m) f.y = 1 + m; if (f.y > 1 + m) f.y = -m;
+        ImVec2 c{a.x + f.x * w, a.y + f.y * h + sinf(f.ph) * 1.5f * f.s * k * fl};
+        bool big = f.z > .6f;
+        if (dt > 0 && fl > .5f && rf(0, 1) < (big ? .3f : .08f) * dt * 60)
+            dust.push_back({c - ImVec2{cosf(f.h), sinf(f.h)} * (12 * f.s * k) + ImVec2{rf(-3, 3), rf(-3, 3)} * k, ImVec2{rf(-4, 4), rf(-10, -3)} * k, rf(.7f, 1.2f), rf(0, 1) < .25f});
+        butterfly(dl, c, f.s * k, flap, f.h + 1.5707963f, f.bank, .3f + .7f * f.z, big);
+    }
+}
+
 static void drawBackground(ImGuiViewport* vp) {
     ImDrawList* dl = ImGui::GetBackgroundDrawList();
     ImVec2 a = vp->Pos, b = vp->Pos + vp->Size;
@@ -2844,7 +3077,7 @@ static void drawBackground(ImGuiViewport* vp) {
     }
     dl->AddRectFilled(a, b, ImGui::GetColorU32(tint));
     Track* t = current();
-    if (bg == 7 || bg == 8) evaWallpaper(dl, a, b);
+    if (bg >= 7) evaWallpaper(dl, a, b);  // 7 Evangelion, 8 Code Geass, 9 Bleach
     else if (bg >= 3) {  // 3 dégradé de la pochette (façon Apple Music), 4 néon, 5 aurore animée
         float W = b.x - a.x, H = b.y - a.y, R = std::max(W, H);
         ImVec4 ac = acc(), c[4] = {ac, {0.10f, 0.85f, 1.00f, 1}, {0.55f, 0.25f, 1.00f, 1}, scale(ac, 0.7f)};  // accent + cyan + violet néon
@@ -3578,7 +3811,7 @@ static bool themeFrom(json& j, MyTheme& m) {  // false : pas un thème Glass
     }
     get("bg", m.t.bg); get("glass", m.t.glass); get("dim", m.t.dim); get("tintAmt", m.t.tintAmt); get("rounding", m.t.rounding);
     get("neon", m.t.neon); get("accentAuto", m.t.accentAuto); get("particles", m.t.particles);
-    m.t.bg = std::clamp(m.t.bg, 0, 8); m.t.particles = std::clamp(m.t.particles, 0, 7);
+    m.t.bg = std::clamp(m.t.bg, 0, 9); m.t.particles = std::clamp(m.t.particles, 0, 9);
     m.t.glass = std::clamp(m.t.glass, 0.f, 0.35f); m.t.dim = std::clamp(m.t.dim, 0.f, 0.9f); m.t.rounding = std::clamp(m.t.rounding, 0.f, 30.f);
     return true;
 }
@@ -3678,6 +3911,7 @@ static void settingsView() {
             dl->AddRectFilled(p + ImVec2{36 * S, 16 * S}, p + ImVec2{cw - 14 * S, 28 * S}, col(1, 1, 1, t.glass + 0.08f), 4 * S);
             if (t.bg == 6) pumpkin(dl, p + ImVec2{cw - 22 * S, chh - 22 * S}, 11 * S, 0.1f, true);
             if (t.bg == 8) geassSigil(dl, p + ImVec2{cw - 26 * S, chh - 22 * S}, 34 * S, col(1.f, 0.16f, 0.32f));
+            if (t.bg == 9) getsuga(dl, p + ImVec2{cw - 30 * S, chh - 22 * S}, -0.5f, 14 * S, 1, 0, 0, false);
             if (t.bg == 7) hexagon(dl, p + ImVec2{cw - 22 * S, chh - 22 * S}, 11 * S, col(1.f, 0.42f, 0.1f, 0.25f), col(1.f, 0.5f, 0.15f), 2 * S);
             dl->AddText(g_bold, 14 * S, p + ImVec2{12 * S, chh - 26 * S}, IM_COL32_WHITE, name);
             ImGui::PopID();
@@ -3728,10 +3962,10 @@ static void settingsView() {
     label("Tint strength");
     changed |= ImGui::SliderFloat("##tamt", &g_set.tintAmt, 0, 0.8f, "%.2f");
     label("Background");
-    changed |= ImGui::Combo("##bg", &g_set.bg, "Blurred cover\0Blurred wallpaper\0Solid (tint)\0Cover gradient (Apple Music)\0Neon\0Animated aurora\0Halloween night\0Evangelion\0Code Geass\0");
+    changed |= ImGui::Combo("##bg", &g_set.bg, "Blurred cover\0Blurred wallpaper\0Solid (tint)\0Cover gradient (Apple Music)\0Neon\0Animated aurora\0Halloween night\0Evangelion\0Code Geass\0Bleach\0");
     if (g_set.bg == 5) { ImGui::SameLine(); ImGui::TextDisabled("(only moves when Glass is in the foreground)"); }
-    if (g_set.bg == 7 || g_set.bg == 8) {  // galerie : clic = ce fond
-        ImGui::AlignTextToFramePadding(); ImGui::TextUnformatted(g_set.bg == 8 ? "Code Geass image" : "Evangelion image"); ImGui::SameLine(lw);
+    if (g_set.bg >= 7) {  // galerie : clic = ce fond
+        ImGui::AlignTextToFramePadding(); ImGui::TextUnformatted(g_set.bg == 9 ? "Bleach image" : g_set.bg == 8 ? "Code Geass image" : "Evangelion image"); ImGui::SameLine(lw);
         float tw = 128 * S, th = 72 * S, x0 = ImGui::GetCursorPosX();
         int perRow = std::max(1, (int)((ImGui::GetContentRegionAvail().x + 8 * S) / (tw + 8 * S)));
         std::string sel = curWall();
@@ -3754,7 +3988,7 @@ static void settingsView() {
         if (sel.rfind("wh:", 0) != 0) { ImGui::SameLine(); ImGui::TextDisabled("%s", ustr(upath(sel).filename()).c_str()); }
     }
     label("Particles");
-    changed |= ImGui::Combo("##part", &g_set.particles, "None\0Sakura petals\0Snow\0Fireflies\0Halloween (embers, bats)\0AT Field (Evangelion)\0Geass sigil\0Chess (Code Geass)\0");
+    changed |= ImGui::Combo("##part", &g_set.particles, "None\0Sakura petals\0Snow\0Fireflies\0Halloween (embers, bats)\0AT Field (Evangelion)\0Geass sigil\0Chess (Code Geass)\0Getsuga Tensho (Bleach)\0Hell butterflies (Bleach)\0");
     if (g_set.particles) { ImGui::SameLine(); ImGui::TextDisabled("(~30 fps while Glass is visible)"); }
     label("Neon glow");
     changed |= ImGui::SliderFloat("##neon", &g_set.neon, 0, 1, g_set.neon > 0 ? "%.2f" : "none");
@@ -5435,8 +5669,7 @@ void app::init() {
     std::error_code ec;
     fs::create_directories(g_dir / "cache", ec);
     g_wall = plat::wallpaper();
-    loadSettings();
-    loadMyThemes();
+    loadSettings();    loadMyThemes();
     g_scToken = readFile(scTokenFile());
     while (!g_scToken.empty() && isspace((unsigned char)g_scToken.back())) g_scToken.pop_back();
     g_scRefresh = !g_scToken.empty();
